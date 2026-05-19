@@ -227,6 +227,9 @@ async fn run_orchestrator(
                 SwarmEvent::AgentOutput { agent_id, text } => {
                     println!("[{agent_id}] {text}");
                 }
+                SwarmEvent::AgentError { agent_id, error } => {
+                    eprintln!("[{agent_id}] ERROR: {error}");
+                }
                 SwarmEvent::AgentSpawned { agent } => {
                     println!("[swarm] spawned: {} ({}, {})", agent.id, agent.harness, agent.role);
                 }

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
-use swarm::db::Db;
-use swarm::harness::HarnessRegistry;
-use swarm::db::LogFilter;
+use swarm::db::{Db, LogFilter};
+use swarm::harness::{CliHarness, CliKind, HarnessRegistry};
 use swarm::orchestrator::{Orchestrator, SwarmEvent};
 
 fn setup() -> (tempfile::TempDir, Arc<Orchestrator>) {
@@ -471,4 +470,75 @@ async fn http_api_agent_log() {
         .unwrap();
     let limited: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(limited.len(), 1);
+}
+
+#[tokio::test]
+async fn harness_error_surfaces_in_events_and_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let mut registry = HarnessRegistry::new();
+    registry.register(
+        CliHarness::new(CliKind::Claude).with_binary("/nonexistent/binary".to_string()),
+    );
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        "http://127.0.0.1:0".to_string(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let mut rx = orch.subscribe();
+
+    let agent = orch
+        .spawn_agent("failbot", "claude", "test", None, "mesh")
+        .unwrap();
+
+    orch.send_message("user", &agent.id, "this will fail")
+        .await
+        .unwrap();
+
+    // Wait for error event
+    let mut saw_error_event = false;
+    let mut saw_error_status = false;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentError { error, .. }) => {
+                    assert!(
+                        error.contains("harness failed") || error.contains("spawn"),
+                        "error should mention spawn failure, got: {error}"
+                    );
+                    saw_error_event = true;
+                }
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "error" => {
+                    saw_error_status = true;
+                    if saw_error_event {
+                        return;
+                    }
+                }
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    assert!(saw_error_event, "should emit AgentError event on spawn failure");
+    assert!(saw_error_status, "agent status should transition to 'error'");
+
+    // Error should appear in agent log
+    let log = orch
+        .get_agent_log(&agent.id, 50, LogFilter::All)
+        .unwrap();
+    let errors: Vec<_> = log.iter().filter(|e| e.kind == "error").collect();
+    assert!(
+        !errors.is_empty(),
+        "error should be recorded in agent log"
+    );
+    assert!(errors[0].content.contains("harness failed") || errors[0].content.contains("spawn"));
 }

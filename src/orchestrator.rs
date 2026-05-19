@@ -36,6 +36,7 @@ pub enum SwarmEvent {
     AgentKilled { agent_id: String },
     AgentStatus { agent_id: String, status: String },
     AgentOutput { agent_id: String, text: String },
+    AgentError { agent_id: String, error: String },
     MessageRouted { from: String, to: String },
 }
 
@@ -260,13 +261,20 @@ impl Orchestrator {
                         let (tx, mut rx) = mpsc::channel(100);
                         let h = harness.clone();
                         let wd = work_dir.clone();
+                        let err_tx = tx.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = h.run(&prompt, &wd, env, tx).await {
                                 tracing::error!("harness error: {e}");
+                                let _ = err_tx
+                                    .send(HarnessOutput::Error(format!(
+                                        "harness failed: {e}"
+                                    )))
+                                    .await;
                             }
                         });
 
+                        let mut had_error = false;
                         while let Some(output) = rx.recv().await {
                             match output {
                                 HarnessOutput::Text(text) => {
@@ -292,9 +300,10 @@ impl Orchestrator {
                                     .ok();
                                 }
                                 HarnessOutput::Error(err) => {
-                                    let _ = event_tx.send(SwarmEvent::AgentOutput {
+                                    had_error = true;
+                                    let _ = event_tx.send(SwarmEvent::AgentError {
                                         agent_id: agent_id.clone(),
-                                        text: format!("[error] {err}"),
+                                        error: err.clone(),
                                     });
                                     db.insert_output_log(&OutputLogRow {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -306,10 +315,11 @@ impl Orchestrator {
                                     .ok();
                                 }
                                 HarnessOutput::Timeout(partial) => {
-                                    let _ = event_tx.send(SwarmEvent::AgentOutput {
+                                    had_error = true;
+                                    let _ = event_tx.send(SwarmEvent::AgentError {
                                         agent_id: agent_id.clone(),
-                                        text: format!(
-                                            "[timeout] partial: {} chars",
+                                        error: format!(
+                                            "timeout, partial output: {} chars",
                                             partial.len()
                                         ),
                                     });
@@ -325,10 +335,11 @@ impl Orchestrator {
                             }
                         }
 
-                        db.update_agent_status(&agent_id, "idle").ok();
+                        let next_status = if had_error { "error" } else { "idle" };
+                        db.update_agent_status(&agent_id, next_status).ok();
                         let _ = event_tx.send(SwarmEvent::AgentStatus {
                             agent_id: agent_id.clone(),
-                            status: "idle".to_string(),
+                            status: next_status.to_string(),
                         });
 
                         // Check for shutdown between messages

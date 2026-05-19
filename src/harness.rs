@@ -233,11 +233,16 @@ impl Harness for CliHarness {
                 .take()
                 .ok_or_else(|| SwarmError::Process("failed to capture stderr".into()))?;
 
+            let stderr_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+            let stderr_buf_clone = stderr_buf.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     if !line.trim().is_empty() {
                         tracing::debug!("stderr: {}", line);
+                        let mut buf = stderr_buf_clone.lock().await;
+                        buf.push_str(&line);
+                        buf.push('\n');
                     }
                 }
             });
@@ -247,6 +252,7 @@ impl Harness for CliHarness {
 
             let process_fut = async {
                 let mut accumulated = String::new();
+                let mut exit_code: Option<i32> = None;
                 loop {
                     tokio::select! {
                         line_result = reader.next_line() => {
@@ -266,27 +272,61 @@ impl Harness for CliHarness {
                             }
                         }
                         status = child.wait() => {
-                            if let Ok(exit) = status {
-                                tracing::debug!("process exited: {exit}");
-                                while let Ok(Some(line)) = reader.next_line().await {
-                                    if !line.trim().is_empty() {
-                                        accumulated.push_str(&line);
-                                        accumulated.push('\n');
-                                        let _ = tx_clone.send(HarnessOutput::Text(line)).await;
+                            match status {
+                                Ok(exit) => {
+                                    tracing::debug!("process exited: {exit}");
+                                    exit_code = exit.code();
+                                    while let Ok(Some(line)) = reader.next_line().await {
+                                        if !line.trim().is_empty() {
+                                            accumulated.push_str(&line);
+                                            accumulated.push('\n');
+                                            let _ = tx_clone.send(HarnessOutput::Text(line)).await;
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    tracing::error!("wait error: {e}");
+                                    exit_code = Some(-1);
                                 }
                             }
                             break;
                         }
                     }
                 }
-                accumulated
+                (accumulated, exit_code)
             };
 
             match tokio::time::timeout(Duration::from_millis(timeout_ms), process_fut).await {
-                Ok(text) => {
-                    let _ = tx.send(HarnessOutput::Complete(text)).await;
-                    Ok(())
+                Ok((text, exit_code)) => {
+                    let failed = exit_code.map_or(false, |c| c != 0);
+                    if failed {
+                        let stderr_text = stderr_buf.lock().await;
+                        let err_detail = if stderr_text.is_empty() {
+                            format!(
+                                "process exited with code {}",
+                                exit_code.unwrap_or(-1)
+                            )
+                        } else {
+                            let truncated = if stderr_text.len() > 500 {
+                                format!("{}... ({} chars)", &stderr_text[..500], stderr_text.len())
+                            } else {
+                                stderr_text.to_string()
+                            };
+                            format!(
+                                "process exited with code {}: {}",
+                                exit_code.unwrap_or(-1),
+                                truncated.trim()
+                            )
+                        };
+                        if !text.is_empty() {
+                            let _ = tx.send(HarnessOutput::Complete(text)).await;
+                        }
+                        let _ = tx.send(HarnessOutput::Error(err_detail.clone())).await;
+                        Err(SwarmError::Process(err_detail))
+                    } else {
+                        let _ = tx.send(HarnessOutput::Complete(text)).await;
+                        Ok(())
+                    }
                 }
                 Err(_) => {
                     let _ = child.kill().await;
