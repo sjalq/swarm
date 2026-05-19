@@ -68,7 +68,6 @@ pub struct Orchestrator {
     workers: Mutex<HashMap<String, AgentWorker>>,
     event_tx: broadcast::Sender<SwarmEvent>,
     addr: String,
-    #[allow(dead_code)]
     project_dir: PathBuf,
     data_dir: PathBuf,
 }
@@ -195,7 +194,7 @@ impl Orchestrator {
         role: &str,
         harness_name: &str,
         model: Option<&str>,
-        system_prompt: &str,
+        prompt: &str,
         parent_id: Option<&str>,
         comms: &str,
     ) -> Result<AgentRow> {
@@ -205,8 +204,8 @@ impl Orchestrator {
 
         let short_id = &uuid::Uuid::new_v4().to_string()[..4];
         let id = format!("{role}-{short_id}");
-        let work_dir = self.data_dir.join("agents").join(&id);
-        std::fs::create_dir_all(&work_dir)?;
+        let topic_dir = self.data_dir.join("agents").join(&id);
+        std::fs::create_dir_all(&topic_dir)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let model_str = model.unwrap_or("").to_string();
@@ -217,8 +216,8 @@ impl Orchestrator {
             model: model_str.clone(),
             status: "idle".to_string(),
             parent_id: parent_id.map(String::from),
-            system_prompt: system_prompt.to_string(),
-            work_dir: work_dir.to_string_lossy().to_string(),
+            system_prompt: prompt.to_string(),
+            work_dir: topic_dir.to_string_lossy().to_string(),
             comms: comms.to_string(),
             created_at: now,
         };
@@ -238,8 +237,8 @@ impl Orchestrator {
             id.clone(),
             role.to_string(),
             model_for_worker,
-            system_prompt.to_string(),
-            work_dir,
+            topic_dir,
+            self.project_dir.clone(),
             self.addr.clone(),
             cmd_rx,
             self.event_tx.clone(),
@@ -256,6 +255,27 @@ impl Orchestrator {
         self.emit_event(SwarmEvent::AgentSpawned {
             agent: agent.clone(),
         });
+
+        // Auto-send prompt as first message if non-empty
+        if !prompt.is_empty() {
+            let from = parent_id.unwrap_or("user").to_string();
+            let msg = MessageRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                from_agent: from.clone(),
+                to_agent: id.clone(),
+                content: prompt.to_string(),
+                delivered: false,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            self.db.enqueue_message(&msg)?;
+            if let Some(worker) = self.workers.lock().unwrap().get(&id) {
+                let _ = worker.cmd_tx.try_send(WorkerCmd::NewMessage);
+            }
+            self.emit_event(SwarmEvent::MessageRouted {
+                from,
+                to: id,
+            });
+        }
 
         Ok(agent)
     }
@@ -350,8 +370,8 @@ impl Orchestrator {
         agent_id: String,
         agent_role: String,
         model: Option<String>,
-        system_prompt: String,
-        work_dir: PathBuf,
+        topic_dir: PathBuf,
+        project_dir: PathBuf,
         swarm_addr: String,
         mut cmd_rx: mpsc::Receiver<WorkerCmd>,
         event_tx: broadcast::Sender<SwarmEvent>,
@@ -374,11 +394,12 @@ impl Orchestrator {
                             status: "working".to_string(),
                         });
 
+                        let is_first = first_message;
                         let prompt = if first_message {
                             first_message = false;
                             format!(
-                                "{SWARM_PREAMBLE}\n\nYour agent ID: {agent_id}\nYour role: {agent_role}\n\n{system_prompt}\n\n[from: {}]\n{}",
-                                msg.from_agent, msg.content
+                                "{SWARM_PREAMBLE}\n\nYour agent ID: {agent_id}\nYour role: {agent_role}\nProject directory: {}\n\n[from: {}]\n{}",
+                                project_dir.display(), msg.from_agent, msg.content
                             )
                         } else {
                             format!("[from: {}]\n{}", msg.from_agent, msg.content)
@@ -387,15 +408,23 @@ impl Orchestrator {
                         let mut env = HashMap::new();
                         env.insert("SWARM_AGENT_ID".to_string(), agent_id.clone());
                         env.insert("SWARM_SOCKET".to_string(), swarm_addr.clone());
+                        env.insert(
+                            "SWARM_PROJECT_DIR".to_string(),
+                            project_dir.to_string_lossy().to_string(),
+                        );
 
                         let (tx, mut rx) = mpsc::channel(100);
                         let h = harness.clone();
-                        let wd = work_dir.clone();
+                        let td = topic_dir.clone();
                         let err_tx = tx.clone();
                         let model_ref = model.clone();
+                        let continue_conv = !is_first;
 
                         tokio::spawn(async move {
-                            if let Err(e) = h.run(&prompt, model_ref.as_deref(), &wd, env, tx).await {
+                            if let Err(e) = h
+                                .run(&prompt, model_ref.as_deref(), continue_conv, &td, env, tx)
+                                .await
+                            {
                                 tracing::error!("harness error: {e}");
                                 let _ = err_tx
                                     .send(HarnessOutput::Error(format!(

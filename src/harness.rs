@@ -23,6 +23,7 @@ pub trait Harness: Send + Sync {
         &self,
         prompt: &str,
         model: Option<&str>,
+        continue_conversation: bool,
         work_dir: &Path,
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
@@ -42,6 +43,7 @@ impl Harness for EchoHarness {
         &self,
         prompt: &str,
         _model: Option<&str>,
+        _continue: bool,
         _work_dir: &Path,
         _env: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
@@ -116,13 +118,22 @@ impl CliKind {
         matches!(self, Self::Codex)
     }
 
-    fn build_args(&self, prompt: &str, model: Option<&str>, work_dir: &Path) -> Vec<String> {
+    fn build_args(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        continue_conversation: bool,
+        work_dir: &Path,
+    ) -> Vec<String> {
         match self {
             Self::Claude => {
                 let mut args = vec![
                     "-p".into(),
                     prompt.into(),
                 ];
+                if continue_conversation {
+                    args.push("-c".into());
+                }
                 if let Some(m) = model {
                     args.extend_from_slice(&["--model".into(), m.into()]);
                 }
@@ -139,6 +150,9 @@ impl CliKind {
                     "-p".into(),
                     prompt.into(),
                 ];
+                if continue_conversation {
+                    args.push("-c".into());
+                }
                 if let Some(m) = model {
                     args.extend_from_slice(&["-m".into(), m.into()]);
                 }
@@ -168,6 +182,9 @@ impl CliKind {
                     "-p".into(),
                     prompt.into(),
                 ];
+                if continue_conversation {
+                    args.push("-c".into());
+                }
                 if let Some(m) = model {
                     args.extend_from_slice(&["-m".into(), m.into()]);
                 }
@@ -230,11 +247,12 @@ impl Harness for CliHarness {
         &self,
         prompt: &str,
         model: Option<&str>,
+        continue_conversation: bool,
         work_dir: &Path,
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let args = self.kind.build_args(prompt, model, work_dir);
+        let args = self.kind.build_args(prompt, model, continue_conversation, work_dir);
         let binary = self.binary.clone();
         let work_dir = work_dir.to_path_buf();
         let timeout_ms = self.timeout_ms;
@@ -441,7 +459,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let dir = std::env::temp_dir();
         harness
-            .run("hello world", None, &dir, HashMap::new(), tx)
+            .run("hello world", None, false, &dir, HashMap::new(), tx)
             .await
             .unwrap();
         let output = rx.recv().await.unwrap();

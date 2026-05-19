@@ -228,14 +228,9 @@ async fn run_orchestrator(
         }
     });
 
-    // Spawn parent agent
+    // Spawn parent agent (prompt auto-sent if non-empty)
     let parent = orch.spawn_agent(&role, &harness, &prompt, None, "mesh")?;
     tracing::info!("parent agent: {} ({})", parent.id, parent.harness);
-
-    // Send initial prompt if provided
-    if !prompt.is_empty() {
-        orch.send_message("user", &parent.id, &prompt).await?;
-    }
 
     // Stream events to stdout
     let mut rx = orch.subscribe();
