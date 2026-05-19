@@ -39,7 +39,11 @@ enum Commands {
     },
 
     /// List all agents in the swarm
-    Peers,
+    Peers {
+        /// Include dead agents
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Send a message to an agent
     Send {
@@ -66,7 +70,14 @@ enum Commands {
         /// Communication mode: mesh or parent-only
         #[arg(long, default_value = "mesh")]
         comms: String,
+
+        /// Model override (e.g. claude-sonnet-4-6, gemini-2.5-flash)
+        #[arg(long)]
+        model: Option<String>,
     },
+
+    /// List available models for each harness
+    Models,
 
     /// Show own agent status
     Status,
@@ -113,8 +124,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Peers => {
-            if let Err(e) = cmd_peers().await {
+        Commands::Peers { all } => {
+            if let Err(e) = cmd_peers(all).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -130,8 +141,15 @@ async fn main() {
             harness,
             prompt,
             comms,
+            model,
         } => {
-            if let Err(e) = cmd_spawn(&role, &harness, &prompt, &comms).await {
+            if let Err(e) = cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref()).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Models => {
+            if let Err(e) = cmd_models().await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -265,25 +283,45 @@ fn swarm_agent_id() -> Option<String> {
     std::env::var("SWARM_AGENT_ID").ok()
 }
 
-async fn cmd_peers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_peers(include_all: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
-    let resp: Vec<serde_json::Value> = reqwest::get(format!("{socket}/api/agents"))
-        .await?
-        .json()
-        .await?;
+    let mut url = format!("{socket}/api/agents");
+    if let Some(agent_id) = swarm_agent_id() {
+        url.push_str(&format!("?perspective={agent_id}"));
+    }
+
+    let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
 
     if resp.is_empty() {
         println!("no agents");
         return Ok(());
     }
 
+    let has_perspective = swarm_agent_id().is_some();
     for agent in &resp {
+        let status = agent["status"].as_str().unwrap_or("?");
+        if !include_all && status == "dead" {
+            continue;
+        }
         let id = agent["id"].as_str().unwrap_or("?");
         let harness = agent["harness"].as_str().unwrap_or("?");
-        let status = agent["status"].as_str().unwrap_or("?");
         let role = agent["role"].as_str().unwrap_or("?");
-        let parent = agent["parent_id"].as_str().unwrap_or("-");
-        println!("{:<24} {:<10} {:<10} {:<16} parent={}", id, harness, status, role, parent);
+        let model = agent["model"].as_str().unwrap_or("");
+        let model_display = if model.is_empty() { "(default)" } else { model };
+
+        if has_perspective {
+            let relation = agent["relation"].as_str().unwrap_or("?");
+            println!(
+                "{:<24} {:<10} {:<10} {:<16} {:<12} {}",
+                id, harness, status, role, relation, model_display
+            );
+        } else {
+            let parent = agent["parent_id"].as_str().unwrap_or("-");
+            println!(
+                "{:<24} {:<10} {:<10} {:<16} parent={:<20} {}",
+                id, harness, status, role, parent, model_display
+            );
+        }
     }
     Ok(())
 }
@@ -316,6 +354,7 @@ async fn cmd_spawn(
     harness: &str,
     prompt: &str,
     comms: &str,
+    model: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let parent_id = swarm_agent_id();
@@ -328,6 +367,7 @@ async fn cmd_spawn(
             "system_prompt": prompt,
             "parent_id": parent_id,
             "comms": comms,
+            "model": model,
         }))
         .send()
         .await?;
@@ -352,12 +392,46 @@ async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .json()
             .await?;
 
+    let model = resp["model"].as_str().unwrap_or("");
+    let model_display = if model.is_empty() { "(default)" } else { model };
     println!("id:      {}", resp["id"].as_str().unwrap_or("?"));
     println!("role:    {}", resp["role"].as_str().unwrap_or("?"));
     println!("harness: {}", resp["harness"].as_str().unwrap_or("?"));
+    println!("model:   {}", model_display);
     println!("status:  {}", resp["status"].as_str().unwrap_or("?"));
     println!("parent:  {}", resp["parent_id"].as_str().unwrap_or("-"));
     println!("comms:   {}", resp["comms"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+async fn cmd_models() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let resp: Vec<serde_json::Value> = reqwest::get(format!("{socket}/api/models"))
+        .await?
+        .json()
+        .await?;
+
+    for harness in &resp {
+        let name = harness["harness"].as_str().unwrap_or("?");
+        let default = harness["default_model"].as_str().unwrap_or("?");
+        let models = harness["models"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        println!("{}:", name);
+        for m in &models {
+            if *m == default {
+                println!("  {} (default)", m);
+            } else {
+                println!("  {}", m);
+            }
+        }
+    }
     Ok(())
 }
 

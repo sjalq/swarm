@@ -22,6 +22,7 @@ pub trait Harness: Send + Sync {
     fn run(
         &self,
         prompt: &str,
+        model: Option<&str>,
         work_dir: &Path,
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
@@ -40,6 +41,7 @@ impl Harness for EchoHarness {
     fn run(
         &self,
         prompt: &str,
+        _model: Option<&str>,
         _work_dir: &Path,
         _env: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
@@ -80,6 +82,33 @@ impl CliKind {
             Self::Gemini => "gemini-3.1-pro-preview",
             Self::Codex => "gpt-5.5",
             Self::Grok => "grok-3",
+        }
+    }
+
+    pub fn known_models(&self) -> &[&str] {
+        match self {
+            Self::Claude => &[
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
+            ],
+            Self::Gemini => &[
+                "gemini-3.1-pro-preview",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+            ],
+            Self::Codex => &["gpt-5.5", "o3", "o4-mini"],
+            Self::Grok => &["grok-3", "grok-build"],
+        }
+    }
+
+    pub fn from_harness_name(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::Claude),
+            "gemini" => Some(Self::Gemini),
+            "codex" => Some(Self::Codex),
+            "grok" => Some(Self::Grok),
+            _ => None,
         }
     }
 
@@ -181,11 +210,13 @@ impl Harness for CliHarness {
     fn run(
         &self,
         prompt: &str,
+        model: Option<&str>,
         work_dir: &Path,
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let args = self.kind.build_args(prompt, &self.model, work_dir);
+        let effective_model = model.unwrap_or(&self.model);
+        let args = self.kind.build_args(prompt, effective_model, work_dir);
         let binary = self.binary.clone();
         let work_dir = work_dir.to_path_buf();
         let timeout_ms = self.timeout_ms;
@@ -392,7 +423,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let dir = std::env::temp_dir();
         harness
-            .run("hello world", &dir, HashMap::new(), tx)
+            .run("hello world", None, &dir, HashMap::new(), tx)
             .await
             .unwrap();
         let output = rx.recv().await.unwrap();

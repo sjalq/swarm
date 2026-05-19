@@ -1,11 +1,12 @@
 use crate::db::LogFilter;
+use crate::harness::CliKind;
 use crate::orchestrator::Orchestrator;
 use axum::extract::ws;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 type AppState = Arc<Orchestrator>;
@@ -19,6 +20,7 @@ pub struct SpawnRequest {
     pub parent_id: Option<String>,
     #[serde(default = "default_comms")]
     pub comms: String,
+    pub model: Option<String>,
 }
 
 fn default_comms() -> String {
@@ -33,6 +35,11 @@ pub struct SendRequest {
 }
 
 #[derive(Deserialize)]
+pub struct ListQuery {
+    pub perspective: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct LogQuery {
     #[serde(default = "default_log_limit")]
     pub n: usize,
@@ -44,6 +51,25 @@ fn default_log_limit() -> usize {
     20
 }
 
+#[derive(Deserialize)]
+pub struct EventQuery {
+    pub since: Option<String>,
+    pub agent_id: Option<String>,
+    #[serde(default = "default_event_limit")]
+    pub limit: usize,
+}
+
+fn default_event_limit() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+struct ModelsResponse {
+    harness: String,
+    default_model: String,
+    models: Vec<String>,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/agents", get(list_agents).post(spawn_agent))
@@ -53,15 +79,29 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/agents/{id}/log", get(get_agent_log))
         .route("/api/messages", post(send_message))
+        .route("/api/events", get(list_events))
+        .route("/api/models", get(list_models))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
-async fn list_agents(State(orch): State<AppState>) -> impl IntoResponse {
-    match orch.list_agents() {
-        Ok(agents) => Json(agents).into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+async fn list_agents(
+    State(orch): State<AppState>,
+    Query(params): Query<ListQuery>,
+) -> impl IntoResponse {
+    if let Some(perspective) = params.perspective {
+        match orch.list_agents_with_perspective(&perspective) {
+            Ok(views) => Json(views).into_response(),
+            Err(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        }
+    } else {
+        match orch.list_agents() {
+            Ok(agents) => Json(agents).into_response(),
+            Err(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
         }
     }
 }
@@ -80,9 +120,10 @@ async fn spawn_agent(
     State(orch): State<AppState>,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
-    match orch.spawn_agent(
+    match orch.spawn_agent_with_model(
         &req.role,
         &req.harness,
+        req.model.as_deref(),
         &req.system_prompt,
         req.parent_id.as_deref(),
         &req.comms,
@@ -131,6 +172,35 @@ async fn kill_agent(State(orch): State<AppState>, Path(id): Path<String>) -> imp
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
+}
+
+async fn list_events(
+    State(orch): State<AppState>,
+    Query(params): Query<EventQuery>,
+) -> impl IntoResponse {
+    match orch.list_events(
+        params.since.as_deref(),
+        params.agent_id.as_deref(),
+        params.limit,
+    ) {
+        Ok(events) => Json(events).into_response(),
+        Err(e) => {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn list_models() -> impl IntoResponse {
+    let harnesses = [CliKind::Claude, CliKind::Gemini, CliKind::Codex, CliKind::Grok];
+    let models: Vec<ModelsResponse> = harnesses
+        .iter()
+        .map(|kind| ModelsResponse {
+            harness: kind.default_binary().to_string(),
+            default_model: kind.default_model().to_string(),
+            models: kind.known_models().iter().map(|s| s.to_string()).collect(),
+        })
+        .collect();
+    Json(models)
 }
 
 async fn ws_handler(State(orch): State<AppState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {

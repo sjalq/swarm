@@ -9,11 +9,21 @@ pub struct AgentRow {
     pub id: String,
     pub role: String,
     pub harness: String,
+    pub model: String,
     pub status: String,
     pub parent_id: Option<String>,
     pub system_prompt: String,
     pub work_dir: String,
     pub comms: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRow {
+    pub id: String,
+    pub event_type: String,
+    pub agent_id: Option<String>,
+    pub payload: String,
     pub created_at: String,
 }
 
@@ -72,6 +82,7 @@ impl Db {
                 id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
                 harness TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'idle',
                 parent_id TEXT,
                 system_prompt TEXT NOT NULL DEFAULT '',
@@ -101,7 +112,18 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_from
                 ON messages(from_agent, created_at);
             CREATE INDEX IF NOT EXISTS idx_messages_to
-                ON messages(to_agent, created_at);",
+                ON messages(to_agent, created_at);
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                agent_id TEXT,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_time
+                ON events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_agent
+                ON events(agent_id, created_at);",
         )?;
         Ok(())
     }
@@ -109,12 +131,13 @@ impl Db {
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO agents (id, role, harness, status, parent_id, system_prompt, work_dir, comms, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 agent.id,
                 agent.role,
                 agent.harness,
+                agent.model,
                 agent.status,
                 agent.parent_id,
                 agent.system_prompt,
@@ -129,7 +152,7 @@ impl Db {
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, status, parent_id, system_prompt, work_dir, comms, created_at
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
              FROM agents WHERE id = ?1",
         )?;
         let result = stmt.query_row([id], |row| {
@@ -137,12 +160,13 @@ impl Db {
                 id: row.get(0)?,
                 role: row.get(1)?,
                 harness: row.get(2)?,
-                status: row.get(3)?,
-                parent_id: row.get(4)?,
-                system_prompt: row.get(5)?,
-                work_dir: row.get(6)?,
-                comms: row.get(7)?,
-                created_at: row.get(8)?,
+                model: row.get(3)?,
+                status: row.get(4)?,
+                parent_id: row.get(5)?,
+                system_prompt: row.get(6)?,
+                work_dir: row.get(7)?,
+                comms: row.get(8)?,
+                created_at: row.get(9)?,
             })
         });
         match result {
@@ -155,7 +179,7 @@ impl Db {
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, status, parent_id, system_prompt, work_dir, comms, created_at
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
              FROM agents WHERE status != 'dead' ORDER BY created_at",
         )?;
         let agents = stmt
@@ -164,16 +188,107 @@ impl Db {
                     id: row.get(0)?,
                     role: row.get(1)?,
                     harness: row.get(2)?,
-                    status: row.get(3)?,
-                    parent_id: row.get(4)?,
-                    system_prompt: row.get(5)?,
-                    work_dir: row.get(6)?,
-                    comms: row.get(7)?,
-                    created_at: row.get(8)?,
+                    model: row.get(3)?,
+                    status: row.get(4)?,
+                    parent_id: row.get(5)?,
+                    system_prompt: row.get(6)?,
+                    work_dir: row.get(7)?,
+                    comms: row.get(8)?,
+                    created_at: row.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(agents)
+    }
+
+    pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
+             FROM agents ORDER BY created_at",
+        )?;
+        let agents = stmt
+            .query_map([], |row| {
+                Ok(AgentRow {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    harness: row.get(2)?,
+                    model: row.get(3)?,
+                    status: row.get(4)?,
+                    parent_id: row.get(5)?,
+                    system_prompt: row.get(6)?,
+                    work_dir: row.get(7)?,
+                    comms: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(agents)
+    }
+
+    pub fn insert_event(&self, event: &EventRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (id, event_type, agent_id, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                event.id,
+                event.event_type,
+                event.agent_id,
+                event.payload,
+                event.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_events(
+        &self,
+        since: Option<&str>,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRow>> {
+        let conn = self.conn.lock().unwrap();
+        let (sql, params) = match (since, agent_id) {
+            (Some(since), Some(aid)) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events WHERE created_at >= ?1 AND agent_id = ?2
+                 ORDER BY created_at ASC LIMIT ?3",
+                vec![since.to_string(), aid.to_string(), limit.to_string()],
+            ),
+            (Some(since), None) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events WHERE created_at >= ?1
+                 ORDER BY created_at ASC LIMIT ?2",
+                vec![since.to_string(), limit.to_string()],
+            ),
+            (None, Some(aid)) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events WHERE agent_id = ?1
+                 ORDER BY created_at ASC LIMIT ?2",
+                vec![aid.to_string(), limit.to_string()],
+            ),
+            (None, None) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events ORDER BY created_at ASC LIMIT ?1",
+                vec![limit.to_string()],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let events = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    payload: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(events)
     }
 
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
@@ -350,6 +465,7 @@ mod tests {
             id: "test-1234".into(),
             role: "tester".into(),
             harness: "echo".into(),
+            model: String::new(),
             status: "idle".into(),
             parent_id: None,
             system_prompt: "you are a tester".into(),
@@ -483,6 +599,7 @@ mod tests {
             id: "dead-agent".into(),
             role: "ghost".into(),
             harness: "echo".into(),
+            model: String::new(),
             status: "dead".into(),
             parent_id: None,
             system_prompt: String::new(),

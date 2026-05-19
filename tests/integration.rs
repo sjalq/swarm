@@ -542,3 +542,383 @@ async fn harness_error_surfaces_in_events_and_log() {
     );
     assert!(errors[0].content.contains("harness failed") || errors[0].content.contains("spawn"));
 }
+
+#[tokio::test]
+async fn spawn_with_model_override() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .spawn_agent_with_model(
+            "modeler",
+            "echo",
+            Some("claude-sonnet-4-6"),
+            "test model",
+            None,
+            "mesh",
+        )
+        .unwrap();
+    assert_eq!(agent.model, "claude-sonnet-4-6");
+
+    let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(fetched.model, "claude-sonnet-4-6");
+
+    let default_agent = orch
+        .spawn_agent("defaulter", "echo", "no model", None, "mesh")
+        .unwrap();
+    assert_eq!(default_agent.model, "");
+}
+
+#[tokio::test]
+async fn perspective_shows_family_relations() {
+    let (_dir, orch) = setup();
+
+    let grandparent = orch
+        .spawn_agent("grandparent", "echo", "", None, "mesh")
+        .unwrap();
+    let parent = orch
+        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .unwrap();
+    let child_a = orch
+        .spawn_agent("child-a", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let child_b = orch
+        .spawn_agent("child-b", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let grandchild = orch
+        .spawn_agent("grandchild", "echo", "", Some(&child_a.id), "mesh")
+        .unwrap();
+    let unrelated = orch
+        .spawn_agent("unrelated", "echo", "", None, "mesh")
+        .unwrap();
+
+    let views = orch
+        .list_agents_with_perspective(&child_a.id)
+        .unwrap();
+
+    let find_relation = |id: &str| -> String {
+        views
+            .iter()
+            .find(|v| v.agent.id == id)
+            .map(|v| v.relation.clone())
+            .unwrap_or_else(|| "not found".to_string())
+    };
+
+    assert_eq!(find_relation(&child_a.id), "self");
+    assert_eq!(find_relation(&parent.id), "parent");
+    assert_eq!(find_relation(&child_b.id), "sibling");
+    assert_eq!(find_relation(&grandchild.id), "child");
+    assert_eq!(find_relation(&grandparent.id), "ancestor");
+    assert_eq!(find_relation(&unrelated.id), "other");
+}
+
+#[tokio::test]
+async fn perspective_hides_dead_agents() {
+    let (_dir, orch) = setup();
+
+    let alive = orch
+        .spawn_agent("alive", "echo", "", None, "mesh")
+        .unwrap();
+    let doomed = orch
+        .spawn_agent("doomed", "echo", "", None, "mesh")
+        .unwrap();
+    orch.kill_agent(&doomed.id).await.unwrap();
+
+    let views = orch
+        .list_agents_with_perspective(&alive.id)
+        .unwrap();
+    assert!(
+        views.iter().all(|v| v.agent.status != "dead"),
+        "perspective should not include dead agents"
+    );
+    assert_eq!(views.len(), 1);
+}
+
+#[tokio::test]
+async fn events_are_persisted_and_queryable() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .spawn_agent("eventer", "echo", "", None, "mesh")
+        .unwrap();
+
+    orch.send_message("user", &agent.id, "event test")
+        .await
+        .unwrap();
+
+    // Wait for processing
+    let mut rx = orch.subscribe();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    let all_events = orch.list_events(None, None, 1000).unwrap();
+    assert!(
+        all_events.len() >= 2,
+        "should have at least spawn + status events, got {}",
+        all_events.len()
+    );
+
+    let spawn_events: Vec<_> = all_events
+        .iter()
+        .filter(|e| e.event_type == "agent_spawned")
+        .collect();
+    assert_eq!(spawn_events.len(), 1);
+
+    let agent_events = orch
+        .list_events(None, Some(&agent.id), 1000)
+        .unwrap();
+    assert!(
+        agent_events.iter().all(|e| e.agent_id.as_deref() == Some(&agent.id)),
+        "agent_id filter should only return events for that agent"
+    );
+
+    if let Some(first_event) = all_events.first() {
+        let since_events = orch
+            .list_events(Some(&first_event.created_at), None, 1000)
+            .unwrap();
+        assert!(!since_events.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn http_api_models_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{addr}/api/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let models: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(models.len(), 4);
+
+    let claude = models.iter().find(|m| m["harness"] == "claude").unwrap();
+    assert_eq!(claude["default_model"], "claude-opus-4-6");
+    assert!(claude["models"].as_array().unwrap().len() >= 3);
+}
+
+#[tokio::test]
+async fn http_api_events_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Spawn an agent to generate events
+    client
+        .post(format!("{addr}/api/agents"))
+        .json(&serde_json::json!({
+            "role": "evt-test",
+            "harness": "echo",
+            "system_prompt": "",
+            "comms": "mesh"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{addr}/api/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let events: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(!events.is_empty());
+    assert!(events[0]["event_type"].as_str().is_some());
+    assert!(events[0]["payload"].as_str().is_some());
+
+    let resp = client
+        .get(format!("{addr}/api/events?limit=1"))
+        .send()
+        .await
+        .unwrap();
+    let limited: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(limited.len(), 1);
+}
+
+#[tokio::test]
+async fn http_api_spawn_with_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{addr}/api/agents"))
+        .json(&serde_json::json!({
+            "role": "model-test",
+            "harness": "echo",
+            "system_prompt": "",
+            "comms": "mesh",
+            "model": "claude-sonnet-4-6"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let agent: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(agent["model"], "claude-sonnet-4-6");
+}
+
+#[tokio::test]
+async fn http_api_perspective_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Spawn parent and child
+    let resp = client
+        .post(format!("{addr}/api/agents"))
+        .json(&serde_json::json!({
+            "role": "parent",
+            "harness": "echo",
+            "system_prompt": "",
+            "comms": "mesh"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let parent: serde_json::Value = resp.json().await.unwrap();
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{addr}/api/agents"))
+        .json(&serde_json::json!({
+            "role": "child",
+            "harness": "echo",
+            "system_prompt": "",
+            "parent_id": parent_id,
+            "comms": "mesh"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let child: serde_json::Value = resp.json().await.unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+
+    // Without perspective - returns flat AgentRow
+    let resp = client
+        .get(format!("{addr}/api/agents"))
+        .send()
+        .await
+        .unwrap();
+    let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(agents.len(), 2);
+    assert!(agents[0].get("relation").is_none());
+
+    // With perspective - returns AgentView with relation
+    let resp = client
+        .get(format!("{addr}/api/agents?perspective={child_id}"))
+        .send()
+        .await
+        .unwrap();
+    let views: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(views.len(), 2);
+
+    let child_view = views.iter().find(|v| v["id"] == child_id).unwrap();
+    assert_eq!(child_view["relation"], "self");
+
+    let parent_view = views.iter().find(|v| v["id"] == parent_id).unwrap();
+    assert_eq!(parent_view["relation"], "parent");
+}
