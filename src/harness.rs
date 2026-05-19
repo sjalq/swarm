@@ -167,13 +167,17 @@ impl CliKind {
             Self::Codex => {
                 let mut args = vec![
                     "exec".into(),
-                    "--cd".into(),
+                    "-C".into(),
                     work_dir.to_string_lossy().into(),
                     "--skip-git-repo-check".into(),
                     "--dangerously-bypass-approvals-and-sandbox".into(),
+                    "--json".into(),
                     "--color".into(),
                     "never".into(),
                 ];
+                if let Some(m) = model {
+                    args.extend_from_slice(&["-m".into(), m.into()]);
+                }
                 args.push("-".into());
                 args
             }
