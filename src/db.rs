@@ -291,6 +291,15 @@ impl Db {
         Ok(events)
     }
 
+    pub fn reparent_children(&self, old_parent: &str, new_parent: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status != 'dead'",
+            rusqlite::params![new_parent, old_parent],
+        )?;
+        Ok(count)
+    }
+
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

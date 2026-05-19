@@ -74,6 +74,10 @@ enum Commands {
         /// Model override (e.g. claude-sonnet-4-6, gemini-2.5-flash)
         #[arg(long)]
         model: Option<String>,
+
+        /// Give the agent its own git worktree (isolated branch)
+        #[arg(long)]
+        worktree: bool,
     },
 
     /// List available models for each harness
@@ -98,6 +102,22 @@ enum Commands {
         /// Show only harness output
         #[arg(long, conflicts_with = "messages")]
         output: bool,
+    },
+
+    /// Clean up an agent's worktree and optionally its branch
+    Cleanup {
+        /// Agent ID to clean up
+        target: String,
+
+        /// Also delete the git branch
+        #[arg(long)]
+        delete_branch: bool,
+    },
+
+    /// Signal that you have finished your task (self-termination)
+    Done {
+        /// Optional final message to send to your parent
+        message: Option<String>,
     },
 
     /// Kill an agent
@@ -142,8 +162,9 @@ async fn main() {
             prompt,
             comms,
             model,
+            worktree,
         } => {
-            if let Err(e) = cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref()).await {
+            if let Err(e) = cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref(), worktree).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -178,6 +199,18 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Cleanup { target, delete_branch } => {
+            if let Err(e) = cmd_cleanup(&target, delete_branch).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Done { message } => {
+            if let Err(e) = cmd_done(message.as_deref()).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::Kill { target } => {
             if let Err(e) = cmd_kill(&target).await {
                 eprintln!("error: {e}");
@@ -205,6 +238,24 @@ async fn run_orchestrator(
     let data_dir = project_dir.join(".swarm");
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("agents"))?;
+
+    // Ensure .swarm is gitignored (worktrees live inside it)
+    let gitignore = project_dir.join(".gitignore");
+    let needs_entry = if gitignore.exists() {
+        let content = std::fs::read_to_string(&gitignore)?;
+        !content.lines().any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
+    } else {
+        true
+    };
+    if needs_entry {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore)?;
+        writeln!(f, "\n.swarm/")?;
+        tracing::info!("added .swarm/ to .gitignore");
+    }
 
     let db = Arc::new(Db::open(&data_dir.join("swarm.db"))?);
     let registry = HarnessRegistry::new();
@@ -245,6 +296,13 @@ async fn run_orchestrator(
                 }
                 SwarmEvent::AgentSpawned { agent } => {
                     println!("[swarm] spawned: {} ({}, {})", agent.id, agent.harness, agent.role);
+                }
+                SwarmEvent::AgentDone { agent_id, message } => {
+                    if let Some(msg) = message {
+                        println!("[swarm] done: {agent_id} - {msg}");
+                    } else {
+                        println!("[swarm] done: {agent_id}");
+                    }
                 }
                 SwarmEvent::AgentKilled { agent_id } => {
                     println!("[swarm] killed: {agent_id}");
@@ -350,6 +408,7 @@ async fn cmd_spawn(
     prompt: &str,
     comms: &str,
     model: Option<&str>,
+    worktree: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let parent_id = swarm_agent_id();
@@ -363,6 +422,7 @@ async fn cmd_spawn(
             "parent_id": parent_id,
             "comms": comms,
             "model": model,
+            "worktree": worktree,
         }))
         .send()
         .await?;
@@ -473,6 +533,45 @@ async fn cmd_log(
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_cleanup(target: &str, delete_branch: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let client = reqwest::Client::new();
+    let mut url = format!("{socket}/api/agents/{target}/cleanup");
+    if delete_branch {
+        url.push_str("?delete_branch=true");
+    }
+    let resp = client.post(&url).send().await?;
+
+    if resp.status().is_success() {
+        println!("cleaned up {target}");
+    } else {
+        let body = resp.text().await?;
+        eprintln!("failed: {body}");
+    }
+    Ok(())
+}
+
+async fn cmd_done(message: Option<&str>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{socket}/api/agents/{agent_id}/done"))
+        .json(&serde_json::json!({
+            "message": message,
+        }))
+        .send()
+        .await?;
+
+    if resp.status().is_success() {
+        println!("done");
+    } else {
+        let body = resp.text().await?;
+        eprintln!("failed: {body}");
+    }
     Ok(())
 }
 

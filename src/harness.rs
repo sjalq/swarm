@@ -165,16 +165,29 @@ impl CliKind {
                 args
             }
             Self::Codex => {
-                let mut args = vec![
-                    "exec".into(),
-                    "-C".into(),
-                    work_dir.to_string_lossy().into(),
-                    "--skip-git-repo-check".into(),
-                    "--dangerously-bypass-approvals-and-sandbox".into(),
-                    "--json".into(),
-                    "--color".into(),
-                    "never".into(),
-                ];
+                let mut args = if continue_conversation {
+                    vec![
+                        "exec".into(),
+                        "resume".into(),
+                        "--last".into(),
+                        "--skip-git-repo-check".into(),
+                        "--dangerously-bypass-approvals-and-sandbox".into(),
+                        "--json".into(),
+                        "--color".into(),
+                        "never".into(),
+                    ]
+                } else {
+                    vec![
+                        "exec".into(),
+                        "-C".into(),
+                        work_dir.to_string_lossy().into(),
+                        "--skip-git-repo-check".into(),
+                        "--dangerously-bypass-approvals-and-sandbox".into(),
+                        "--json".into(),
+                        "--color".into(),
+                        "never".into(),
+                    ]
+                };
                 if let Some(m) = model {
                     args.extend_from_slice(&["-m".into(), m.into()]);
                 }

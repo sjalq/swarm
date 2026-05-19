@@ -22,6 +22,54 @@ fn setup() -> (tempfile::TempDir, Arc<Orchestrator>) {
     (dir, orch)
 }
 
+fn setup_with_git() -> (tempfile::TempDir, Arc<Orchestrator>) {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Initialize a git repo with an initial commit
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+    std::fs::write(project_dir.join("README.md"), "# test project\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+
+    let data_dir = project_dir.join(".swarm");
+    std::fs::create_dir_all(data_dir.join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&data_dir.join("swarm.db")).unwrap());
+    let registry = HarnessRegistry::new();
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        "http://127.0.0.1:0".to_string(),
+        project_dir,
+        data_dir,
+    ));
+    (dir, orch)
+}
+
 #[tokio::test]
 async fn spawn_and_list_agents() {
     let (_dir, orch) = setup();
@@ -555,6 +603,7 @@ async fn spawn_with_model_override() {
             "test model",
             None,
             "mesh",
+            false,
         )
         .unwrap();
     assert_eq!(agent.model, "claude-sonnet-4-6");
@@ -921,4 +970,216 @@ async fn http_api_perspective_query() {
 
     let parent_view = views.iter().find(|v| v["id"] == parent_id).unwrap();
     assert_eq!(parent_view["relation"], "parent");
+}
+
+#[tokio::test]
+async fn done_agent_sends_message_to_parent() {
+    let (_dir, orch) = setup();
+
+    let parent = orch
+        .spawn_agent("boss", "echo", "", None, "mesh")
+        .unwrap();
+    let child = orch
+        .spawn_agent("worker", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.done_agent(&child.id, Some("task complete")).await.unwrap();
+
+    let fetched = orch.get_agent(&child.id).unwrap().unwrap();
+    assert_eq!(fetched.status, "done");
+
+    let log = orch
+        .get_agent_log(&parent.id, 50, LogFilter::All)
+        .unwrap();
+    let recv: Vec<_> = log.iter().filter(|e| e.kind == "recv" && e.content == "task complete").collect();
+    assert_eq!(recv.len(), 1, "parent should receive the done message");
+}
+
+#[tokio::test]
+async fn done_agent_without_parent_still_works() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .spawn_agent("orphan", "echo", "", None, "mesh")
+        .unwrap();
+
+    orch.done_agent(&agent.id, Some("finished")).await.unwrap();
+
+    let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(fetched.status, "done");
+}
+
+#[tokio::test]
+async fn kill_reparents_children() {
+    let (_dir, orch) = setup();
+
+    let grandparent = orch
+        .spawn_agent("gp", "echo", "", None, "mesh")
+        .unwrap();
+    let parent = orch
+        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .unwrap();
+    let child_a = orch
+        .spawn_agent("child-a", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let child_b = orch
+        .spawn_agent("child-b", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.kill_agent(&parent.id).await.unwrap();
+
+    let a = orch.get_agent(&child_a.id).unwrap().unwrap();
+    assert_eq!(a.parent_id.as_deref(), Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent");
+
+    let b = orch.get_agent(&child_b.id).unwrap().unwrap();
+    assert_eq!(b.parent_id.as_deref(), Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent");
+}
+
+#[tokio::test]
+async fn done_reparents_children() {
+    let (_dir, orch) = setup();
+
+    let grandparent = orch
+        .spawn_agent("gp", "echo", "", None, "mesh")
+        .unwrap();
+    let parent = orch
+        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .unwrap();
+    let child = orch
+        .spawn_agent("child", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.done_agent(&parent.id, None).await.unwrap();
+
+    let c = orch.get_agent(&child.id).unwrap().unwrap();
+    assert_eq!(c.parent_id.as_deref(), Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent after parent done");
+
+    let p = orch.get_agent(&parent.id).unwrap().unwrap();
+    assert_eq!(p.status, "done");
+}
+
+#[tokio::test]
+async fn kill_root_agent_orphans_children() {
+    let (_dir, orch) = setup();
+
+    let root = orch
+        .spawn_agent("root", "echo", "", None, "mesh")
+        .unwrap();
+    let child = orch
+        .spawn_agent("child", "echo", "", Some(&root.id), "mesh")
+        .unwrap();
+
+    orch.kill_agent(&root.id).await.unwrap();
+
+    let c = orch.get_agent(&child.id).unwrap().unwrap();
+    assert_eq!(c.parent_id, None,
+        "child of root should become a root agent when root is killed");
+}
+
+#[tokio::test]
+async fn done_agent_visible_in_perspective() {
+    let (_dir, orch) = setup();
+
+    let parent = orch
+        .spawn_agent("parent", "echo", "", None, "mesh")
+        .unwrap();
+    let child = orch
+        .spawn_agent("child", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.done_agent(&child.id, None).await.unwrap();
+
+    let views = orch.list_agents_with_perspective(&parent.id).unwrap();
+    let child_view = views.iter().find(|v| v.agent.id == child.id);
+    assert!(child_view.is_some(), "done agents should still be visible in perspective");
+    assert_eq!(child_view.unwrap().agent.status, "done");
+}
+
+#[tokio::test]
+async fn worktree_creates_isolated_branch() {
+    let (_dir, orch) = setup_with_git();
+
+    let agent = orch
+        .spawn_agent_with_model("editor", "echo", None, "edit files", None, "mesh", true)
+        .unwrap();
+
+    let worktree = orch.worktree_dir(&agent.id);
+    assert!(worktree.is_some(), "worktree dir should exist after spawn");
+    let wt = worktree.unwrap();
+    assert!(wt.join("README.md").exists(), "worktree should have project files");
+
+    // Check the branch was created
+    let output = std::process::Command::new("git")
+        .args(["branch", "--list", &format!("swarm/{}", agent.id)])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let branches = String::from_utf8_lossy(&output.stdout);
+    assert!(branches.contains(&format!("swarm/{}", agent.id)),
+        "branch swarm/{} should exist", agent.id);
+}
+
+#[tokio::test]
+async fn no_worktree_by_default() {
+    let (_dir, orch) = setup_with_git();
+
+    let agent = orch
+        .spawn_agent("reviewer", "echo", "review code", None, "mesh")
+        .unwrap();
+
+    let worktree = orch.worktree_dir(&agent.id);
+    assert!(worktree.is_none(), "no worktree should exist for default spawn");
+}
+
+#[tokio::test]
+async fn cleanup_removes_worktree() {
+    let (_dir, orch) = setup_with_git();
+
+    let agent = orch
+        .spawn_agent_with_model("cleaner", "echo", None, "edit", None, "mesh", true)
+        .unwrap();
+
+    assert!(orch.worktree_dir(&agent.id).is_some());
+
+    orch.cleanup_agent(&agent.id, false).unwrap();
+    assert!(orch.worktree_dir(&agent.id).is_none(),
+        "worktree should be gone after cleanup");
+}
+
+#[tokio::test]
+async fn cleanup_with_branch_delete() {
+    let (_dir, orch) = setup_with_git();
+
+    let agent = orch
+        .spawn_agent_with_model("brancher", "echo", None, "edit", None, "mesh", true)
+        .unwrap();
+
+    let branch_name = format!("swarm/{}", agent.id);
+
+    orch.cleanup_agent(&agent.id, true).unwrap();
+
+    // Verify branch is gone too
+    let output = std::process::Command::new("git")
+        .args(["branch", "--list", &branch_name])
+        .current_dir(_dir.path().join("project"))
+        .output()
+        .unwrap();
+    let branches = String::from_utf8_lossy(&output.stdout);
+    assert!(!branches.contains(&branch_name),
+        "branch should be deleted with --delete-branch");
+}
+
+#[tokio::test]
+async fn cleanup_noop_without_worktree() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .spawn_agent("plain", "echo", "", None, "mesh")
+        .unwrap();
+
+    // Should not error even though there's no worktree
+    orch.cleanup_agent(&agent.id, false).unwrap();
 }

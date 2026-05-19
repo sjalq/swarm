@@ -21,10 +21,17 @@ pub struct SpawnRequest {
     #[serde(default = "default_comms")]
     pub comms: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 fn default_comms() -> String {
     "mesh".to_string()
+}
+
+#[derive(Deserialize)]
+pub struct DoneRequest {
+    pub message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +56,12 @@ pub struct LogQuery {
 
 fn default_log_limit() -> usize {
     20
+}
+
+#[derive(Deserialize)]
+pub struct CleanupQuery {
+    #[serde(default)]
+    pub delete_branch: bool,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +90,8 @@ pub fn router(state: AppState) -> Router {
             "/api/agents/{id}",
             get(get_agent).delete(kill_agent),
         )
+        .route("/api/agents/{id}/done", post(done_agent))
+        .route("/api/agents/{id}/cleanup", post(cleanup_agent))
         .route("/api/agents/{id}/log", get(get_agent_log))
         .route("/api/messages", post(send_message))
         .route("/api/events", get(list_events))
@@ -127,6 +142,7 @@ async fn spawn_agent(
         &req.system_prompt,
         req.parent_id.as_deref(),
         &req.comms,
+        req.worktree,
     ) {
         Ok(agent) => (axum::http::StatusCode::CREATED, Json(agent)).into_response(),
         Err(e) => {
@@ -159,6 +175,32 @@ async fn get_agent_log(
     };
     match orch.get_agent_log(&id, params.n, filter) {
         Ok(entries) => Json(entries).into_response(),
+        Err(e) => {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn done_agent(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DoneRequest>,
+) -> impl IntoResponse {
+    match orch.done_agent(&id, req.message.as_deref()).await {
+        Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn cleanup_agent(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<CleanupQuery>,
+) -> impl IntoResponse {
+    match orch.cleanup_agent(&id, params.delete_branch) {
+        Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
