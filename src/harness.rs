@@ -161,6 +161,8 @@ impl CliKind {
                     "stream-json".into(),
                     "-y".into(),
                     "--skip-trust".into(),
+                    "--sandbox".into(),
+                    "false".into(),
                 ]);
                 args
             }
@@ -173,8 +175,6 @@ impl CliKind {
                         "--skip-git-repo-check".into(),
                         "--dangerously-bypass-approvals-and-sandbox".into(),
                         "--json".into(),
-                        "--color".into(),
-                        "never".into(),
                     ]
                 } else {
                     vec![
@@ -184,8 +184,6 @@ impl CliKind {
                         "--skip-git-repo-check".into(),
                         "--dangerously-bypass-approvals-and-sandbox".into(),
                         "--json".into(),
-                        "--color".into(),
-                        "never".into(),
                     ]
                 };
                 if let Some(m) = model {
