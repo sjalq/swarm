@@ -77,7 +77,7 @@ impl CliKind {
     pub fn default_model(&self) -> &'static str {
         match self {
             Self::Claude => "claude-opus-4-6",
-            Self::Gemini => "gemini-2.5-pro",
+            Self::Gemini => "gemini-3.1-pro-preview",
             Self::Codex => "gpt-5.5",
             Self::Grok => "grok-3",
         }
