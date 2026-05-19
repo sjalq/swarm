@@ -71,6 +71,24 @@ enum Commands {
     /// Show own agent status
     Status,
 
+    /// View an agent's recent activity (messages and output)
+    Log {
+        /// Agent ID to inspect
+        target: String,
+
+        /// Number of entries to show
+        #[arg(short = 'n', long = "last", default_value = "20")]
+        last: usize,
+
+        /// Show only messages (sent and received)
+        #[arg(long, conflicts_with = "output")]
+        messages: bool,
+
+        /// Show only harness output
+        #[arg(long, conflicts_with = "messages")]
+        output: bool,
+    },
+
     /// Kill an agent
     Kill {
         /// Agent ID to terminate
@@ -120,6 +138,24 @@ async fn main() {
         }
         Commands::Status => {
             if let Err(e) = cmd_status().await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Log {
+            target,
+            last,
+            messages,
+            output,
+        } => {
+            let filter = if messages {
+                "messages"
+            } else if output {
+                "output"
+            } else {
+                "all"
+            };
+            if let Err(e) = cmd_log(&target, last, filter).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -319,6 +355,52 @@ async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("status:  {}", resp["status"].as_str().unwrap_or("?"));
     println!("parent:  {}", resp["parent_id"].as_str().unwrap_or("-"));
     println!("comms:   {}", resp["comms"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+async fn cmd_log(
+    target: &str,
+    limit: usize,
+    filter: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let mut url = format!("{socket}/api/agents/{target}/log?n={limit}");
+    if filter != "all" {
+        url.push_str(&format!("&type={filter}"));
+    }
+    let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
+
+    if resp.is_empty() {
+        println!("no log entries for {target}");
+        return Ok(());
+    }
+
+    for entry in &resp {
+        let ts = entry["timestamp"].as_str().unwrap_or("?");
+        let short_ts = if ts.len() > 19 { &ts[..19] } else { ts };
+        let kind = entry["kind"].as_str().unwrap_or("?");
+        let peer = entry["peer"].as_str().unwrap_or("");
+        let content = entry["content"].as_str().unwrap_or("");
+
+        let display_content = if content.len() > 200 {
+            format!("{}... ({} chars total)", &content[..200], content.len())
+        } else {
+            content.to_string()
+        };
+
+        match kind {
+            "recv" => {
+                println!("{} recv  from:{:<20} {}", short_ts, peer, display_content);
+            }
+            "sent" => {
+                println!("{} sent  to:{:<22} {}", short_ts, peer, display_content);
+            }
+            _ => {
+                println!("{} {:<5} {}", short_ts, kind, display_content);
+            }
+        }
+    }
+
     Ok(())
 }
 

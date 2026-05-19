@@ -27,6 +27,29 @@ pub struct MessageRow {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputLogRow {
+    pub id: String,
+    pub agent_id: String,
+    pub content: String,
+    pub kind: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub kind: String,
+    pub peer: String,
+    pub content: String,
+}
+
+pub enum LogFilter {
+    All,
+    Messages,
+    Output,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -65,7 +88,20 @@ impl Db {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_pending
-                ON messages(to_agent, delivered, created_at);",
+                ON messages(to_agent, delivered, created_at);
+            CREATE TABLE IF NOT EXISTS output_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'output',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_output_log_agent
+                ON output_log(agent_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_from
+                ON messages(from_agent, created_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_to
+                ON messages(to_agent, created_at);",
         )?;
         Ok(())
     }
@@ -170,6 +206,101 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn insert_output_log(&self, entry: &OutputLogRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO output_log (id, agent_id, content, kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                entry.id,
+                entry.agent_id,
+                entry.content,
+                entry.kind,
+                entry.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_agent_log(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        filter: LogFilter,
+    ) -> Result<Vec<LogEntry>> {
+        let conn = self.conn.lock().unwrap();
+
+        let entries = match filter {
+            LogFilter::All => {
+                let mut stmt = conn.prepare(
+                    "SELECT timestamp, kind, peer, content FROM (
+                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
+                        FROM messages WHERE to_agent = ?1
+                        UNION ALL
+                        SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
+                        FROM messages WHERE from_agent = ?1
+                        UNION ALL
+                        SELECT created_at AS timestamp, kind, '' AS peer, content
+                        FROM output_log WHERE agent_id = ?1
+                    ) ORDER BY timestamp ASC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![agent_id, limit], |row| {
+                        Ok(LogEntry {
+                            timestamp: row.get(0)?,
+                            kind: row.get(1)?,
+                            peer: row.get(2)?,
+                            content: row.get(3)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            }
+            LogFilter::Messages => {
+                let mut stmt = conn.prepare(
+                    "SELECT timestamp, kind, peer, content FROM (
+                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
+                        FROM messages WHERE to_agent = ?1
+                        UNION ALL
+                        SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
+                        FROM messages WHERE from_agent = ?1
+                    ) ORDER BY timestamp ASC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![agent_id, limit], |row| {
+                        Ok(LogEntry {
+                            timestamp: row.get(0)?,
+                            kind: row.get(1)?,
+                            peer: row.get(2)?,
+                            content: row.get(3)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            }
+            LogFilter::Output => {
+                let mut stmt = conn.prepare(
+                    "SELECT created_at, kind, '' AS peer, content
+                     FROM output_log WHERE agent_id = ?1
+                     ORDER BY created_at ASC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![agent_id, limit], |row| {
+                        Ok(LogEntry {
+                            timestamp: row.get(0)?,
+                            kind: row.get(1)?,
+                            peer: row.get(2)?,
+                            content: row.get(3)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            }
+        };
+
+        Ok(entries)
     }
 
     pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {
@@ -284,6 +415,65 @@ mod tests {
             assert_eq!(msg.content, format!("message {i}"));
         }
         assert!(db.dequeue_message("agent-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_log_interleaves_messages_and_output() {
+        let db = test_db();
+
+        db.enqueue_message(&MessageRow {
+            id: "m1".into(),
+            from_agent: "user".into(),
+            to_agent: "agent-1".into(),
+            content: "do something".into(),
+            delivered: false,
+            created_at: "2026-01-01T00:00:01Z".into(),
+        })
+        .unwrap();
+
+        db.insert_output_log(&OutputLogRow {
+            id: "o1".into(),
+            agent_id: "agent-1".into(),
+            content: "working on it".into(),
+            kind: "output".into(),
+            created_at: "2026-01-01T00:00:02Z".into(),
+        })
+        .unwrap();
+
+        db.enqueue_message(&MessageRow {
+            id: "m2".into(),
+            from_agent: "agent-1".into(),
+            to_agent: "user".into(),
+            content: "done".into(),
+            delivered: false,
+            created_at: "2026-01-01T00:00:03Z".into(),
+        })
+        .unwrap();
+
+        let all = db.get_agent_log("agent-1", 50, LogFilter::All).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].kind, "recv");
+        assert_eq!(all[0].content, "do something");
+        assert_eq!(all[1].kind, "output");
+        assert_eq!(all[1].content, "working on it");
+        assert_eq!(all[2].kind, "sent");
+        assert_eq!(all[2].content, "done");
+
+        let msgs = db
+            .get_agent_log("agent-1", 50, LogFilter::Messages)
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].kind, "recv");
+        assert_eq!(msgs[1].kind, "sent");
+
+        let output = db
+            .get_agent_log("agent-1", 50, LogFilter::Output)
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].kind, "output");
+
+        let limited = db.get_agent_log("agent-1", 2, LogFilter::All).unwrap();
+        assert_eq!(limited.len(), 2);
     }
 
     #[test]

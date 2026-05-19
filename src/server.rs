@@ -1,6 +1,7 @@
+use crate::db::LogFilter;
 use crate::orchestrator::Orchestrator;
 use axum::extract::ws;
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,6 +32,18 @@ pub struct SendRequest {
     pub content: String,
 }
 
+#[derive(Deserialize)]
+pub struct LogQuery {
+    #[serde(default = "default_log_limit")]
+    pub n: usize,
+    #[serde(rename = "type", default)]
+    pub filter_type: Option<String>,
+}
+
+fn default_log_limit() -> usize {
+    20
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/agents", get(list_agents).post(spawn_agent))
@@ -38,6 +51,7 @@ pub fn router(state: AppState) -> Router {
             "/api/agents/{id}",
             get(get_agent).delete(kill_agent),
         )
+        .route("/api/agents/{id}/log", get(get_agent_log))
         .route("/api/messages", post(send_message))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -86,6 +100,24 @@ async fn send_message(
 ) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
+        Err(e) => {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn get_agent_log(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<LogQuery>,
+) -> impl IntoResponse {
+    let filter = match params.filter_type.as_deref() {
+        Some("messages") => LogFilter::Messages,
+        Some("output") => LogFilter::Output,
+        _ => LogFilter::All,
+    };
+    match orch.get_agent_log(&id, params.n, filter) {
+        Ok(entries) => Json(entries).into_response(),
         Err(e) => {
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }

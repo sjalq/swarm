@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use swarm::db::Db;
 use swarm::harness::HarnessRegistry;
+use swarm::db::LogFilter;
 use swarm::orchestrator::{Orchestrator, SwarmEvent};
 
 fn setup() -> (tempfile::TempDir, Arc<Orchestrator>) {
@@ -316,4 +317,158 @@ async fn unknown_harness_rejected() {
     let (_dir, orch) = setup();
     let result = orch.spawn_agent("test", "nonexistent-harness", "", None, "mesh");
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn echo_agent_log_captures_messages_and_output() {
+    let (_dir, orch) = setup();
+
+    let mut rx = orch.subscribe();
+
+    let agent = orch
+        .spawn_agent("logger", "echo", "", None, "mesh")
+        .unwrap();
+
+    orch.send_message("user", &agent.id, "test message")
+        .await
+        .unwrap();
+
+    // Wait for processing to complete
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    // Check all log entries
+    let all = orch
+        .get_agent_log(&agent.id, 50, LogFilter::All)
+        .unwrap();
+    assert!(all.len() >= 2, "should have at least a recv message and output, got {}", all.len());
+
+    let recv_entries: Vec<_> = all.iter().filter(|e| e.kind == "recv").collect();
+    assert_eq!(recv_entries.len(), 1);
+    assert_eq!(recv_entries[0].content, "test message");
+    assert_eq!(recv_entries[0].peer, "user");
+
+    let output_entries: Vec<_> = all.iter().filter(|e| e.kind == "output").collect();
+    assert_eq!(output_entries.len(), 1);
+    assert!(output_entries[0].content.contains("test message"));
+
+    // Check messages-only filter
+    let msgs = orch
+        .get_agent_log(&agent.id, 50, LogFilter::Messages)
+        .unwrap();
+    assert!(msgs.iter().all(|e| e.kind == "recv" || e.kind == "sent"));
+
+    // Check output-only filter
+    let outs = orch
+        .get_agent_log(&agent.id, 50, LogFilter::Output)
+        .unwrap();
+    assert!(outs.iter().all(|e| e.kind == "output" || e.kind == "error" || e.kind == "timeout"));
+}
+
+#[tokio::test]
+async fn http_api_agent_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    let agents_dir = dir.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let mut rx = orch.subscribe();
+    let router = swarm::server::router(orch);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Spawn agent
+    let resp = client
+        .post(format!("{addr}/api/agents"))
+        .json(&serde_json::json!({
+            "role": "logtest",
+            "harness": "echo",
+            "system_prompt": "",
+            "comms": "mesh"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let agent: serde_json::Value = resp.json().await.unwrap();
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    // Send message and wait for processing
+    client
+        .post(format!("{addr}/api/messages"))
+        .json(&serde_json::json!({
+            "from": "user",
+            "to": agent_id,
+            "content": "log test"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    // Fetch log via HTTP
+    let resp = client
+        .get(format!("{addr}/api/agents/{agent_id}/log"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let entries: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(entries.len() >= 2);
+
+    // Test messages-only filter
+    let resp = client
+        .get(format!("{addr}/api/agents/{agent_id}/log?type=messages"))
+        .send()
+        .await
+        .unwrap();
+    let msgs: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(msgs
+        .iter()
+        .all(|e| e["kind"] == "recv" || e["kind"] == "sent"));
+
+    // Test limit param
+    let resp = client
+        .get(format!("{addr}/api/agents/{agent_id}/log?n=1"))
+        .send()
+        .await
+        .unwrap();
+    let limited: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(limited.len(), 1);
 }

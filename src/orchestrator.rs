@@ -1,4 +1,4 @@
-use crate::db::{AgentRow, Db, MessageRow};
+use crate::db::{AgentRow, Db, LogEntry, LogFilter, MessageRow, OutputLogRow};
 use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use serde::{Deserialize, Serialize};
@@ -10,11 +10,24 @@ use tokio::task::JoinHandle;
 
 const SWARM_PREAMBLE: &str = "\
 You have access to the `swarm` CLI for multi-agent coordination:
-- `swarm peers` - list all agents in the swarm
-- `swarm send <agent-id> \"message\"` - send a message to another agent
-- `swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"` - create a child agent
-- `swarm status` - show your own status
-- `swarm kill <agent-id>` - terminate an agent";
+
+Commands:
+  swarm peers                          List all agents in the swarm (id, role, status, harness, parent).
+  swarm send <agent-id> \"message\"      Send a message to another agent.
+  swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
+                                       Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
+  swarm log <agent-id>                 View an agent's recent activity (messages sent/received and output).
+  swarm log <agent-id> -n <count>      Show the last N entries (default: 20).
+  swarm log <agent-id> --messages      Show only messages (sent and received).
+  swarm log <agent-id> --output        Show only harness output.
+  swarm status                         Show your own agent status.
+  swarm kill <agent-id>                Terminate an agent.
+
+Communication guidelines:
+- When you receive a message, reply to the sender with your result via `swarm send` if a response is expected.
+- For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
+- Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
+- Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -77,6 +90,15 @@ impl Orchestrator {
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         self.db.get_agent(id)
+    }
+
+    pub fn get_agent_log(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        filter: LogFilter,
+    ) -> Result<Vec<LogEntry>> {
+        self.db.get_agent_log(agent_id, limit, filter)
     }
 
     pub fn spawn_agent(
@@ -257,15 +279,31 @@ impl Orchestrator {
                                     if !text.is_empty() {
                                         let _ = event_tx.send(SwarmEvent::AgentOutput {
                                             agent_id: agent_id.clone(),
-                                            text,
+                                            text: text.clone(),
                                         });
                                     }
+                                    db.insert_output_log(&OutputLogRow {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        agent_id: agent_id.clone(),
+                                        content: text,
+                                        kind: "output".to_string(),
+                                        created_at: chrono::Utc::now().to_rfc3339(),
+                                    })
+                                    .ok();
                                 }
                                 HarnessOutput::Error(err) => {
                                     let _ = event_tx.send(SwarmEvent::AgentOutput {
                                         agent_id: agent_id.clone(),
                                         text: format!("[error] {err}"),
                                     });
+                                    db.insert_output_log(&OutputLogRow {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        agent_id: agent_id.clone(),
+                                        content: err,
+                                        kind: "error".to_string(),
+                                        created_at: chrono::Utc::now().to_rfc3339(),
+                                    })
+                                    .ok();
                                 }
                                 HarnessOutput::Timeout(partial) => {
                                     let _ = event_tx.send(SwarmEvent::AgentOutput {
@@ -275,6 +313,14 @@ impl Orchestrator {
                                             partial.len()
                                         ),
                                     });
+                                    db.insert_output_log(&OutputLogRow {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        agent_id: agent_id.clone(),
+                                        content: partial,
+                                        kind: "timeout".to_string(),
+                                        created_at: chrono::Utc::now().to_rfc3339(),
+                                    })
+                                    .ok();
                                 }
                             }
                         }
