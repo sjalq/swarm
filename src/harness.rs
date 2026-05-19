@@ -116,28 +116,40 @@ impl CliKind {
         matches!(self, Self::Codex)
     }
 
-    fn build_args(&self, prompt: &str, model: &str, work_dir: &Path) -> Vec<String> {
+    fn build_args(&self, prompt: &str, model: Option<&str>, work_dir: &Path) -> Vec<String> {
         match self {
-            Self::Claude => vec![
-                "-p".into(),
-                prompt.into(),
-                "--model".into(),
-                model.into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--verbose".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-            Self::Gemini => vec![
-                "-p".into(),
-                prompt.into(),
-                "-m".into(),
-                model.into(),
-                "-o".into(),
-                "stream-json".into(),
-                "-y".into(),
-                "--skip-trust".into(),
-            ],
+            Self::Claude => {
+                let mut args = vec![
+                    "-p".into(),
+                    prompt.into(),
+                ];
+                if let Some(m) = model {
+                    args.extend_from_slice(&["--model".into(), m.into()]);
+                }
+                args.extend_from_slice(&[
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                    "--dangerously-skip-permissions".into(),
+                ]);
+                args
+            }
+            Self::Gemini => {
+                let mut args = vec![
+                    "-p".into(),
+                    prompt.into(),
+                ];
+                if let Some(m) = model {
+                    args.extend_from_slice(&["-m".into(), m.into()]);
+                }
+                args.extend_from_slice(&[
+                    "-o".into(),
+                    "stream-json".into(),
+                    "-y".into(),
+                    "--skip-trust".into(),
+                ]);
+                args
+            }
             Self::Codex => {
                 let mut args = vec![
                     "exec".into(),
@@ -151,15 +163,21 @@ impl CliKind {
                 args.push("-".into());
                 args
             }
-            Self::Grok => vec![
-                "-p".into(),
-                prompt.into(),
-                "-m".into(),
-                model.into(),
-                "--output-format".into(),
-                "streaming-json".into(),
-                "--always-approve".into(),
-            ],
+            Self::Grok => {
+                let mut args = vec![
+                    "-p".into(),
+                    prompt.into(),
+                ];
+                if let Some(m) = model {
+                    args.extend_from_slice(&["-m".into(), m.into()]);
+                }
+                args.extend_from_slice(&[
+                    "--output-format".into(),
+                    "streaming-json".into(),
+                    "--always-approve".into(),
+                ]);
+                args
+            }
         }
     }
 }
@@ -167,6 +185,7 @@ impl CliKind {
 pub struct CliHarness {
     kind: CliKind,
     binary: String,
+    #[allow(dead_code)]
     model: String,
     timeout_ms: u64,
 }
@@ -215,8 +234,7 @@ impl Harness for CliHarness {
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let effective_model = model.unwrap_or(&self.model);
-        let args = self.kind.build_args(prompt, effective_model, work_dir);
+        let args = self.kind.build_args(prompt, model, work_dir);
         let binary = self.binary.clone();
         let work_dir = work_dir.to_path_buf();
         let timeout_ms = self.timeout_ms;

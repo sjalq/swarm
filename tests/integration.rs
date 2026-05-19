@@ -607,8 +607,8 @@ async fn perspective_shows_family_relations() {
     assert_eq!(find_relation(&parent.id), "parent");
     assert_eq!(find_relation(&child_b.id), "sibling");
     assert_eq!(find_relation(&grandchild.id), "child");
-    assert_eq!(find_relation(&grandparent.id), "ancestor");
-    assert_eq!(find_relation(&unrelated.id), "other");
+    assert_eq!(find_relation(&grandparent.id), "not found");
+    assert_eq!(find_relation(&unrelated.id), "not found");
 }
 
 #[tokio::test]

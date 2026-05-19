@@ -12,7 +12,7 @@ const SWARM_PREAMBLE: &str = "\
 You have access to the `swarm` CLI for multi-agent coordination:
 
 Commands:
-  swarm peers                          List all agents (shows your relation to each: self, parent, child, sibling, ancestor, descendant, other).
+  swarm peers                          List visible agents (your parent, siblings, and all descendants) with relation labels.
   swarm peers --all                    Include dead agents.
   swarm send <agent-id> \"message\"      Send a message to another agent.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
@@ -32,7 +32,7 @@ Communication guidelines:
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
 - Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
 - Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.
-- Use `swarm peers` to see how agents relate to you before messaging. Prefer communicating with your parent, children, and siblings over unrelated agents.";
+- `swarm peers` shows only your parent, siblings, and descendants. Agents outside your family tree are not visible to you.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -133,19 +133,6 @@ impl Orchestrator {
             .find(|a| a.id == perspective_id)
             .and_then(|a| a.parent_id.clone());
 
-        let ancestors = {
-            let mut set = std::collections::HashSet::new();
-            let mut current = self_parent.clone();
-            while let Some(pid) = current {
-                set.insert(pid.clone());
-                current = all
-                    .iter()
-                    .find(|a| a.id == pid)
-                    .and_then(|a| a.parent_id.clone());
-            }
-            set
-        };
-
         fn collect_descendants(
             root: &str,
             agents: &[AgentRow],
@@ -167,7 +154,7 @@ impl Orchestrator {
         let views = all
             .into_iter()
             .filter(|a| a.status != "dead")
-            .map(|a| {
+            .filter_map(|a| {
                 let relation = if a.id == perspective_id {
                     "self"
                 } else if self_parent.as_deref() == Some(a.id.as_str()) {
@@ -178,17 +165,15 @@ impl Orchestrator {
                     && a.parent_id == self_parent
                 {
                     "sibling"
-                } else if ancestors.contains(&a.id) {
-                    "ancestor"
                 } else if descendants.contains(&a.id) {
                     "descendant"
                 } else {
-                    "other"
+                    return None;
                 };
-                AgentView {
+                Some(AgentView {
                     agent: a,
                     relation: relation.to_string(),
-                }
+                })
             })
             .collect();
         Ok(views)
