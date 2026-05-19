@@ -107,6 +107,7 @@ impl CliKind {
                 "-o".into(),
                 "stream-json".into(),
                 "-y".into(),
+                "--skip-trust".into(),
             ],
             Self::Codex => {
                 let mut args = vec![
@@ -124,8 +125,11 @@ impl CliKind {
             Self::Grok => vec![
                 "-p".into(),
                 prompt.into(),
-                "--model".into(),
+                "-m".into(),
                 model.into(),
+                "--output-format".into(),
+                "streaming-json".into(),
+                "--always-approve".into(),
             ],
         }
     }
