@@ -164,7 +164,9 @@ async fn main() {
             model,
             worktree,
         } => {
-            if let Err(e) = cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref(), worktree).await {
+            if let Err(e) =
+                cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref(), worktree).await
+            {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -199,7 +201,10 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Cleanup { target, delete_branch } => {
+        Commands::Cleanup {
+            target,
+            delete_branch,
+        } => {
             if let Err(e) = cmd_cleanup(&target, delete_branch).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -230,7 +235,7 @@ async fn run_orchestrator(
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "swarm=info".parse().unwrap()),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("swarm=info")),
         )
         .init();
 
@@ -243,7 +248,9 @@ async fn run_orchestrator(
     let gitignore = project_dir.join(".gitignore");
     let needs_entry = if gitignore.exists() {
         let content = std::fs::read_to_string(&gitignore)?;
-        !content.lines().any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
+        !content
+            .lines()
+            .any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
     } else {
         true
     };
@@ -267,6 +274,10 @@ async fn run_orchestrator(
         project_dir,
         data_dir,
     ));
+    let resumed = orch.resume_existing_workers()?;
+    if resumed > 0 {
+        tracing::info!("resumed {resumed} existing agent worker(s)");
+    }
 
     // Start HTTP server
     let router = server::router(orch.clone());
@@ -286,32 +297,43 @@ async fn run_orchestrator(
     // Stream events to stdout
     let mut rx = orch.subscribe();
     let event_loop = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            match &event {
-                SwarmEvent::AgentOutput { agent_id, text } => {
-                    println!("[{agent_id}] {text}");
-                }
-                SwarmEvent::AgentError { agent_id, error } => {
-                    eprintln!("[{agent_id}] ERROR: {error}");
-                }
-                SwarmEvent::AgentSpawned { agent } => {
-                    println!("[swarm] spawned: {} ({}, {})", agent.id, agent.harness, agent.role);
-                }
-                SwarmEvent::AgentDone { agent_id, message } => {
-                    if let Some(msg) = message {
-                        println!("[swarm] done: {agent_id} - {msg}");
-                    } else {
-                        println!("[swarm] done: {agent_id}");
+        loop {
+            match rx.recv().await {
+                Ok(event) => match &event {
+                    SwarmEvent::AgentOutput { agent_id, text } => {
+                        println!("[{agent_id}] {text}");
                     }
+                    SwarmEvent::AgentError { agent_id, error } => {
+                        eprintln!("[{agent_id}] ERROR: {error}");
+                    }
+                    SwarmEvent::AgentSpawned { agent } => {
+                        println!(
+                            "[swarm] spawned: {} ({}, {})",
+                            agent.id, agent.harness, agent.role
+                        );
+                    }
+                    SwarmEvent::AgentDone { agent_id, message } => {
+                        if let Some(msg) = message {
+                            println!("[swarm] done: {agent_id} - {msg}");
+                        } else {
+                            println!("[swarm] done: {agent_id}");
+                        }
+                    }
+                    SwarmEvent::AgentKilled { agent_id } => {
+                        println!("[swarm] killed: {agent_id}");
+                    }
+                    SwarmEvent::AgentStatus { agent_id, status } => {
+                        println!("[swarm] {agent_id} -> {status}");
+                    }
+                    SwarmEvent::MessageRouted { from, to } => {
+                        println!("[swarm] message: {from} -> {to}");
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("[swarm] warning: skipped {skipped} lagged event(s)");
                 }
-                SwarmEvent::AgentKilled { agent_id } => {
-                    println!("[swarm] killed: {agent_id}");
-                }
-                SwarmEvent::AgentStatus { agent_id, status } => {
-                    println!("[swarm] {agent_id} -> {status}");
-                }
-                SwarmEvent::MessageRouted { from, to } => {
-                    println!("[swarm] message: {from} -> {to}");
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
                 }
             }
         }
@@ -324,6 +346,8 @@ async fn run_orchestrator(
             tracing::info!("shutting down");
         }
     }
+
+    orch.shutdown_all().await?;
 
     Ok(())
 }
@@ -379,7 +403,10 @@ async fn cmd_peers(include_all: bool) -> std::result::Result<(), Box<dyn std::er
     Ok(())
 }
 
-async fn cmd_send(target: &str, message: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_send(
+    target: &str,
+    message: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let from = swarm_agent_id().unwrap_or_else(|| "user".to_string());
     let client = reqwest::Client::new();
@@ -441,11 +468,10 @@ async fn cmd_spawn(
 async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
-    let resp: serde_json::Value =
-        reqwest::get(format!("{socket}/api/agents/{agent_id}"))
-            .await?
-            .json()
-            .await?;
+    let resp: serde_json::Value = reqwest::get(format!("{socket}/api/agents/{agent_id}"))
+        .await?
+        .json()
+        .await?;
 
     let model = resp["model"].as_str().unwrap_or("");
     let model_display = if model.is_empty() { "(default)" } else { model };
@@ -536,7 +562,10 @@ async fn cmd_log(
     Ok(())
 }
 
-async fn cmd_cleanup(target: &str, delete_branch: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_cleanup(
+    target: &str,
+    delete_branch: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let client = reqwest::Client::new();
     let mut url = format!("{socket}/api/agents/{target}/cleanup");

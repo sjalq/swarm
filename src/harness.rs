@@ -128,10 +128,7 @@ impl CliKind {
     ) -> Vec<String> {
         match self {
             Self::Claude => {
-                let mut args = vec![
-                    "-p".into(),
-                    prompt.into(),
-                ];
+                let mut args = vec!["-p".into(), prompt.into()];
                 if continue_conversation {
                     args.push("-c".into());
                 }
@@ -147,10 +144,7 @@ impl CliKind {
                 args
             }
             Self::Gemini => {
-                let mut args = vec![
-                    "-p".into(),
-                    prompt.into(),
-                ];
+                let mut args = vec!["-p".into(), prompt.into()];
                 if continue_conversation {
                     args.push("-c".into());
                 }
@@ -165,10 +159,7 @@ impl CliKind {
                     "--no-sandbox".into(),
                 ]);
                 if let Some(project_dir) = env.get("SWARM_PROJECT_DIR") {
-                    args.extend_from_slice(&[
-                        "--include-directories".into(),
-                        project_dir.clone(),
-                    ]);
+                    args.extend_from_slice(&["--include-directories".into(), project_dir.clone()]);
                 }
                 args
             }
@@ -199,10 +190,7 @@ impl CliKind {
                 args
             }
             Self::Grok => {
-                let mut args = vec![
-                    "-p".into(),
-                    prompt.into(),
-                ];
+                let mut args = vec!["-p".into(), prompt.into()];
                 if continue_conversation {
                     args.push("-c".into());
                 }
@@ -273,7 +261,9 @@ impl Harness for CliHarness {
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let args = self.kind.build_args(prompt, model, continue_conversation, work_dir, &env_extra);
+        let args = self
+            .kind
+            .build_args(prompt, model, continue_conversation, work_dir, &env_extra);
         let binary = self.binary.clone();
         let work_dir = work_dir.to_path_buf();
         let timeout_ms = self.timeout_ms;
@@ -386,14 +376,11 @@ impl Harness for CliHarness {
 
             match tokio::time::timeout(Duration::from_millis(timeout_ms), process_fut).await {
                 Ok((text, exit_code)) => {
-                    let failed = exit_code.map_or(false, |c| c != 0);
+                    let failed = exit_code.is_some_and(|c| c != 0);
                     if failed {
                         let stderr_text = stderr_buf.lock().await;
                         let err_detail = if stderr_text.is_empty() {
-                            format!(
-                                "process exited with code {}",
-                                exit_code.unwrap_or(-1)
-                            )
+                            format!("process exited with code {}", exit_code.unwrap_or(-1))
                         } else {
                             let truncated = if stderr_text.len() > 500 {
                                 format!("{}... ({} chars)", &stderr_text[..500], stderr_text.len())
@@ -421,9 +408,7 @@ impl Harness for CliHarness {
                     let _ = tx
                         .send(HarnessOutput::Timeout("timed out".to_string()))
                         .await;
-                    Err(SwarmError::Timeout(format!(
-                        "timeout after {timeout_ms}ms"
-                    )))
+                    Err(SwarmError::Timeout(format!("timeout after {timeout_ms}ms")))
                 }
             }
         })
@@ -456,6 +441,12 @@ impl HarnessRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Harness>> {
         self.harnesses.get(name).cloned()
+    }
+}
+
+impl Default for HarnessRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

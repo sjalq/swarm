@@ -1,8 +1,8 @@
-use crate::error::Result;
+use crate::error::{Result, SwarmError};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRow {
@@ -75,8 +75,14 @@ impl Db {
         Ok(db)
     }
 
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| SwarmError::Internal("database mutex poisoned".to_string()))
+    }
+
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
@@ -129,7 +135,7 @@ impl Db {
     }
 
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -150,7 +156,7 @@ impl Db {
     }
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
              FROM agents WHERE id = ?1",
@@ -177,10 +183,10 @@ impl Db {
     }
 
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
-             FROM agents WHERE status != 'dead' ORDER BY created_at",
+             FROM agents WHERE status NOT IN ('dead', 'done') ORDER BY created_at",
         )?;
         let agents = stmt
             .query_map([], |row| {
@@ -202,7 +208,7 @@ impl Db {
     }
 
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
              FROM agents ORDER BY created_at",
@@ -227,7 +233,7 @@ impl Db {
     }
 
     pub fn insert_event(&self, event: &EventRow) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO events (id, event_type, agent_id, payload, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -248,7 +254,7 @@ impl Db {
         agent_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let (sql, params) = match (since, agent_id) {
             (Some(since), Some(aid)) => (
                 "SELECT id, event_type, agent_id, payload, created_at
@@ -275,8 +281,10 @@ impl Db {
             ),
         };
         let mut stmt = conn.prepare(sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let events = stmt
             .query_map(params_refs.as_slice(), |row| {
                 Ok(EventRow {
@@ -292,16 +300,16 @@ impl Db {
     }
 
     pub fn reparent_children(&self, old_parent: &str, new_parent: Option<&str>) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         let count = conn.execute(
-            "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status != 'dead'",
+            "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status NOT IN ('dead', 'done')",
             rusqlite::params![new_parent, old_parent],
         )?;
         Ok(count)
     }
 
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE agents SET status = ?1 WHERE id = ?2",
             rusqlite::params![status, id],
@@ -310,13 +318,13 @@ impl Db {
     }
 
     pub fn delete_agent(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;
         Ok(())
     }
 
     pub fn enqueue_message(&self, msg: &MessageRow) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -333,7 +341,7 @@ impl Db {
     }
 
     pub fn insert_output_log(&self, entry: &OutputLogRow) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO output_log (id, agent_id, content, kind, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -354,7 +362,7 @@ impl Db {
         limit: usize,
         filter: LogFilter,
     ) -> Result<Vec<LogEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn()?;
 
         let entries = match filter {
             LogFilter::All => {
@@ -428,13 +436,15 @@ impl Db {
     }
 
     pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {
-        let conn = self.conn.lock().unwrap();
-        let result = conn.query_row(
-            "SELECT id, from_agent, to_agent, content, delivered, created_at
-             FROM messages WHERE to_agent = ?1 AND delivered = 0
-             ORDER BY created_at LIMIT 1",
-            [agent_id],
-            |row| {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let result = {
+            let mut stmt = tx.prepare(
+                "SELECT id, from_agent, to_agent, content, delivered, created_at
+                 FROM messages WHERE to_agent = ?1 AND delivered = 0
+                 ORDER BY created_at LIMIT 1",
+            )?;
+            stmt.query_row([agent_id], |row| {
                 Ok(MessageRow {
                     id: row.get(0)?,
                     from_agent: row.get(1)?,
@@ -443,19 +453,36 @@ impl Db {
                     delivered: row.get::<_, i32>(4)? != 0,
                     created_at: row.get(5)?,
                 })
-            },
-        );
+            })
+        };
         match result {
             Ok(msg) => {
-                conn.execute(
-                    "UPDATE messages SET delivered = 1 WHERE id = ?1",
-                    [&msg.id],
-                )?;
+                tx.execute("UPDATE messages SET delivered = 1 WHERE id = ?1", [&msg.id])?;
+                tx.commit()?;
                 Ok(Some(msg))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn has_pending_messages(&self, agent_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE to_agent = ?1 AND delivered = 0",
+            [agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn mark_unfinished_agents_dead(&self) -> Result<usize> {
+        let conn = self.conn()?;
+        let count = conn.execute(
+            "UPDATE agents SET status = 'dead' WHERE status NOT IN ('dead', 'done')",
+            [],
+        )?;
+        Ok(count)
     }
 }
 
@@ -591,9 +618,7 @@ mod tests {
         assert_eq!(msgs[0].kind, "recv");
         assert_eq!(msgs[1].kind, "sent");
 
-        let output = db
-            .get_agent_log("agent-1", 50, LogFilter::Output)
-            .unwrap();
+        let output = db.get_agent_log("agent-1", 50, LogFilter::Output).unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].kind, "output");
 
@@ -619,5 +644,25 @@ mod tests {
         db.insert_agent(&agent).unwrap();
         assert!(db.list_agents().unwrap().is_empty());
         assert!(db.get_agent("dead-agent").unwrap().is_some());
+    }
+
+    #[test]
+    fn done_agents_hidden_from_list() {
+        let db = test_db();
+        let agent = AgentRow {
+            id: "done-agent".into(),
+            role: "finished".into(),
+            harness: "echo".into(),
+            model: String::new(),
+            status: "done".into(),
+            parent_id: None,
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            comms: "mesh".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        db.insert_agent(&agent).unwrap();
+        assert!(db.list_agents().unwrap().is_empty());
+        assert!(db.get_agent("done-agent").unwrap().is_some());
     }
 }

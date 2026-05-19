@@ -4,7 +4,7 @@ use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -50,13 +50,32 @@ Communication guidelines:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SwarmEvent {
-    AgentSpawned { agent: AgentRow },
-    AgentDone { agent_id: String, message: Option<String> },
-    AgentKilled { agent_id: String },
-    AgentStatus { agent_id: String, status: String },
-    AgentOutput { agent_id: String, text: String },
-    AgentError { agent_id: String, error: String },
-    MessageRouted { from: String, to: String },
+    AgentSpawned {
+        agent: AgentRow,
+    },
+    AgentDone {
+        agent_id: String,
+        message: Option<String>,
+    },
+    AgentKilled {
+        agent_id: String,
+    },
+    AgentStatus {
+        agent_id: String,
+        status: String,
+    },
+    AgentOutput {
+        agent_id: String,
+        text: String,
+    },
+    AgentError {
+        agent_id: String,
+        error: String,
+    },
+    MessageRouted {
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +91,20 @@ enum WorkerCmd {
 }
 
 struct AgentWorker {
-    cmd_tx: mpsc::Sender<WorkerCmd>,
+    cmd_tx: mpsc::UnboundedSender<WorkerCmd>,
     _handle: JoinHandle<()>,
+}
+
+struct WorkerConfig {
+    db: Arc<Db>,
+    harness: Arc<dyn Harness>,
+    agent_id: String,
+    agent_role: String,
+    model: Option<String>,
+    topic_dir: PathBuf,
+    project_dir: PathBuf,
+    swarm_addr: String,
+    event_tx: broadcast::Sender<SwarmEvent>,
 }
 
 pub struct Orchestrator {
@@ -110,6 +141,38 @@ impl Orchestrator {
         self.event_tx.subscribe()
     }
 
+    fn workers(&self) -> Result<MutexGuard<'_, HashMap<String, AgentWorker>>> {
+        self.workers
+            .lock()
+            .map_err(|_| SwarmError::Internal("worker registry mutex poisoned".to_string()))
+    }
+
+    fn active_status(status: &str) -> bool {
+        !matches!(status, "dead" | "done")
+    }
+
+    fn notify_worker(&self, agent_id: &str, cmd: WorkerCmd) -> Result<bool> {
+        let workers = self.workers()?;
+        if let Some(worker) = workers.get(agent_id) {
+            worker.cmd_tx.send(cmd).map_err(|_| {
+                SwarmError::Internal(format!("agent worker is stopped: {agent_id}"))
+            })?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn has_worker(&self, agent_id: &str) -> Result<bool> {
+        Ok(self.workers()?.contains_key(agent_id))
+    }
+
+    fn log_result<T>(context: &str, result: Result<T>) {
+        if let Err(e) = result {
+            tracing::error!("{context}: {e}");
+        }
+    }
+
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
         self.db.list_agents()
     }
@@ -136,10 +199,7 @@ impl Orchestrator {
         self.db.list_events(since, agent_id, limit)
     }
 
-    pub fn list_agents_with_perspective(
-        &self,
-        perspective_id: &str,
-    ) -> Result<Vec<AgentView>> {
+    pub fn list_agents_with_perspective(&self, perspective_id: &str) -> Result<Vec<AgentView>> {
         let all = self.db.list_all_agents()?;
         let self_parent: Option<String> = all
             .iter()
@@ -166,7 +226,7 @@ impl Orchestrator {
 
         let views = all
             .into_iter()
-            .filter(|a| a.status != "dead")
+            .filter(|a| Self::active_status(&a.status))
             .filter_map(|a| {
                 let relation = if a.id == perspective_id {
                     "self"
@@ -174,9 +234,7 @@ impl Orchestrator {
                     "parent"
                 } else if a.parent_id.as_deref() == Some(perspective_id) {
                     "child"
-                } else if self_parent.is_some()
-                    && a.parent_id == self_parent
-                {
+                } else if self_parent.is_some() && a.parent_id == self_parent {
                     "sibling"
                 } else if descendants.contains(&a.id) {
                     "descendant"
@@ -200,9 +258,18 @@ impl Orchestrator {
         parent_id: Option<&str>,
         comms: &str,
     ) -> Result<AgentRow> {
-        self.spawn_agent_with_model(role, harness_name, None, system_prompt, parent_id, comms, false)
+        self.spawn_agent_with_model(
+            role,
+            harness_name,
+            None,
+            system_prompt,
+            parent_id,
+            comms,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_agent_with_model(
         &self,
         role: &str,
@@ -213,11 +280,13 @@ impl Orchestrator {
         comms: &str,
         use_worktree: bool,
     ) -> Result<AgentRow> {
-        let harness = self.registry.get(harness_name).ok_or_else(|| {
-            SwarmError::Internal(format!("unknown harness: {harness_name}"))
-        })?;
+        let harness = self
+            .registry
+            .get(harness_name)
+            .ok_or_else(|| SwarmError::Internal(format!("unknown harness: {harness_name}")))?;
 
-        let short_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let short_id = &uuid[..8];
         let id = format!("{role}-{short_id}");
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
@@ -243,7 +312,16 @@ impl Orchestrator {
             created_at: now,
         };
 
-        self.db.insert_agent(&agent)?;
+        if let Err(e) = self.db.insert_agent(&agent) {
+            if use_worktree {
+                if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
+                    tracing::error!(
+                        "failed to clean up worktree after spawn failure: {cleanup_err}"
+                    );
+                }
+            }
+            return Err(e);
+        }
 
         let model_for_worker = if model_str.is_empty() {
             None
@@ -251,21 +329,23 @@ impl Orchestrator {
             Some(model_str)
         };
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(Self::agent_worker_loop(
-            self.db.clone(),
-            harness,
-            id.clone(),
-            role.to_string(),
-            model_for_worker,
-            topic_dir,
-            agent_project_dir,
-            self.addr.clone(),
+            WorkerConfig {
+                db: self.db.clone(),
+                harness,
+                agent_id: id.clone(),
+                agent_role: role.to_string(),
+                model: model_for_worker,
+                topic_dir,
+                project_dir: agent_project_dir,
+                swarm_addr: self.addr.clone(),
+                event_tx: self.event_tx.clone(),
+            },
             cmd_rx,
-            self.event_tx.clone(),
         ));
 
-        self.workers.lock().unwrap().insert(
+        self.workers()?.insert(
             id.clone(),
             AgentWorker {
                 cmd_tx,
@@ -289,13 +369,8 @@ impl Orchestrator {
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
             self.db.enqueue_message(&msg)?;
-            if let Some(worker) = self.workers.lock().unwrap().get(&id) {
-                let _ = worker.cmd_tx.try_send(WorkerCmd::NewMessage);
-            }
-            self.emit_event(SwarmEvent::MessageRouted {
-                from,
-                to: id,
-            });
+            self.notify_worker(&id, WorkerCmd::NewMessage)?;
+            self.emit_event(SwarmEvent::MessageRouted { from, to: id });
         }
 
         Ok(agent)
@@ -339,6 +414,68 @@ impl Orchestrator {
         }
     }
 
+    pub fn resume_existing_workers(&self) -> Result<usize> {
+        let agents = self.db.list_agents()?;
+        let mut resumed = 0;
+
+        for agent in agents {
+            if self.workers()?.contains_key(&agent.id) {
+                continue;
+            }
+
+            let Some(harness) = self.registry.get(&agent.harness) else {
+                self.db.update_agent_status(&agent.id, "error")?;
+                tracing::error!(
+                    "cannot resume agent {}: unknown harness {}",
+                    agent.id,
+                    agent.harness
+                );
+                continue;
+            };
+
+            let topic_dir = PathBuf::from(&agent.work_dir);
+            let agent_project_dir = self
+                .worktree_dir(&agent.id)
+                .unwrap_or_else(|| self.project_dir.clone());
+            let model = if agent.model.is_empty() {
+                None
+            } else {
+                Some(agent.model.clone())
+            };
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(Self::agent_worker_loop(
+                WorkerConfig {
+                    db: self.db.clone(),
+                    harness,
+                    agent_id: agent.id.clone(),
+                    agent_role: agent.role.clone(),
+                    model,
+                    topic_dir,
+                    project_dir: agent_project_dir,
+                    swarm_addr: self.addr.clone(),
+                    event_tx: self.event_tx.clone(),
+                },
+                cmd_rx,
+            ));
+
+            self.workers()?.insert(
+                agent.id.clone(),
+                AgentWorker {
+                    cmd_tx,
+                    _handle: handle,
+                },
+            );
+
+            if self.db.has_pending_messages(&agent.id)? {
+                self.notify_worker(&agent.id, WorkerCmd::NewMessage)?;
+            }
+
+            resumed += 1;
+        }
+
+        Ok(resumed)
+    }
+
     pub fn cleanup_agent(&self, agent_id: &str, delete_branch: bool) -> Result<()> {
         let worktree_dir = self.data_dir.join("worktrees").join(agent_id);
         if !worktree_dir.exists() {
@@ -366,11 +503,19 @@ impl Orchestrator {
 
         if delete_branch {
             let branch_name = format!("swarm/{agent_id}");
-            std::process::Command::new("git")
+            let output = std::process::Command::new("git")
                 .args(["branch", "-D", &branch_name])
                 .current_dir(&self.project_dir)
                 .output()
-                .ok();
+                .map_err(|e| SwarmError::Process(format!("git branch delete failed: {e}")))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SwarmError::Process(format!(
+                    "git branch delete failed: {}",
+                    stderr.trim()
+                )));
+            }
         }
 
         Ok(())
@@ -396,15 +541,15 @@ impl Orchestrator {
             SwarmEvent::MessageRouted { .. } => "message_routed",
         };
         if let Ok(payload) = serde_json::to_string(&event) {
-            self.db
-                .insert_event(&EventRow {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    event_type: event_type.to_string(),
-                    agent_id,
-                    payload,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                })
-                .ok();
+            if let Err(e) = self.db.insert_event(&EventRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: event_type.to_string(),
+                agent_id,
+                payload,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }) {
+                tracing::error!("failed to persist event: {e}");
+            }
         }
         let _ = self.event_tx.send(event);
     }
@@ -415,14 +560,34 @@ impl Orchestrator {
             .get_agent(to)?
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
+        if !Self::active_status(&agent.status) {
+            return Err(SwarmError::Internal(format!(
+                "agent {to} is not accepting messages; status is {}",
+                agent.status
+            )));
+        }
+
         if agent.comms == "parent-only" {
-            if let Some(ref parent) = agent.parent_id {
-                if from != parent && from != "user" && from != "system" {
+            match agent.parent_id.as_deref() {
+                Some(parent) if from == parent || from == "user" || from == "system" => {}
+                Some(parent) => {
                     return Err(SwarmError::Internal(format!(
                         "agent {to} only accepts messages from its parent ({parent})"
                     )));
                 }
+                None if from == "user" || from == "system" => {}
+                None => {
+                    return Err(SwarmError::Internal(format!(
+                        "agent {to} has parent-only comms but no parent"
+                    )));
+                }
             }
+        }
+
+        if !self.has_worker(to)? {
+            return Err(SwarmError::Internal(format!(
+                "agent {to} has no running worker"
+            )));
         }
 
         let msg = MessageRow {
@@ -435,11 +600,7 @@ impl Orchestrator {
         };
 
         self.db.enqueue_message(&msg)?;
-
-        let workers = self.workers.lock().unwrap();
-        if let Some(worker) = workers.get(to) {
-            let _ = worker.cmd_tx.try_send(WorkerCmd::NewMessage);
-        }
+        self.notify_worker(to, WorkerCmd::NewMessage)?;
 
         self.emit_event(SwarmEvent::MessageRouted {
             from: from.to_string(),
@@ -466,8 +627,8 @@ impl Orchestrator {
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
                 self.db.enqueue_message(&msg)?;
-                if let Some(worker) = self.workers.lock().unwrap().get(parent_id) {
-                    let _ = worker.cmd_tx.try_send(WorkerCmd::NewMessage);
+                if let Err(e) = self.notify_worker(parent_id, WorkerCmd::NewMessage) {
+                    tracing::error!("failed to notify parent agent {parent_id}: {e}");
                 }
                 self.emit_event(SwarmEvent::MessageRouted {
                     from: id.to_string(),
@@ -478,10 +639,11 @@ impl Orchestrator {
 
         self.db.reparent_children(id, agent.parent_id.as_deref())?;
 
-        let worker = self.workers.lock().unwrap().remove(id);
+        let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
-            let _ = worker.cmd_tx.send(WorkerCmd::Shutdown).await;
-            worker._handle.abort();
+            if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
+                tracing::debug!("agent worker already stopped: {id}");
+            }
         }
         self.db.update_agent_status(id, "done")?;
         self.emit_event(SwarmEvent::AgentDone {
@@ -492,14 +654,18 @@ impl Orchestrator {
     }
 
     pub async fn kill_agent(&self, id: &str) -> Result<()> {
-        let agent = self.db.get_agent(id)?;
-        let new_parent = agent.and_then(|a| a.parent_id);
+        let agent = self
+            .db
+            .get_agent(id)?
+            .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
+        let new_parent = agent.parent_id;
         self.db.reparent_children(id, new_parent.as_deref())?;
 
-        let worker = self.workers.lock().unwrap().remove(id);
+        let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
-            let _ = worker.cmd_tx.send(WorkerCmd::Shutdown).await;
-            worker._handle.abort();
+            if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
+                tracing::debug!("agent worker already stopped: {id}");
+            }
         }
         self.db.update_agent_status(id, "dead")?;
         self.emit_event(SwarmEvent::AgentKilled {
@@ -508,153 +674,260 @@ impl Orchestrator {
         Ok(())
     }
 
+    pub async fn shutdown_all(&self) -> Result<()> {
+        let workers = {
+            let mut workers = self.workers()?;
+            workers.drain().collect::<Vec<_>>()
+        };
+
+        for (agent_id, worker) in workers {
+            if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
+                tracing::debug!("agent worker already stopped: {agent_id}");
+            }
+            self.db.update_agent_status(&agent_id, "dead")?;
+            self.emit_event(SwarmEvent::AgentKilled { agent_id });
+        }
+
+        Ok(())
+    }
+
     async fn agent_worker_loop(
-        db: Arc<Db>,
-        harness: Arc<dyn Harness>,
-        agent_id: String,
-        agent_role: String,
-        model: Option<String>,
-        topic_dir: PathBuf,
-        project_dir: PathBuf,
-        swarm_addr: String,
-        mut cmd_rx: mpsc::Receiver<WorkerCmd>,
-        event_tx: broadcast::Sender<SwarmEvent>,
+        config: WorkerConfig,
+        mut cmd_rx: mpsc::UnboundedReceiver<WorkerCmd>,
     ) {
+        let WorkerConfig {
+            db,
+            harness,
+            agent_id,
+            agent_role,
+            model,
+            topic_dir,
+            project_dir,
+            swarm_addr,
+            event_tx,
+        } = config;
         let mut first_message = true;
+        let mut has_pending = false;
+        let mut was_interrupted = false;
 
         loop {
-            let cmd = match cmd_rx.recv().await {
-                Some(cmd) => cmd,
-                None => break,
+            if !has_pending {
+                let cmd = match cmd_rx.recv().await {
+                    Some(cmd) => cmd,
+                    None => break,
+                };
+                match cmd {
+                    WorkerCmd::Shutdown => return,
+                    WorkerCmd::NewMessage => {}
+                }
+            }
+            has_pending = false;
+
+            let mut messages = Vec::new();
+            while let Ok(Some(msg)) = db.dequeue_message(&agent_id) {
+                messages.push(msg);
+            }
+            if messages.is_empty() {
+                continue;
+            }
+
+            // Drain stale NewMessage notifications for messages we just batch-dequeued
+            loop {
+                match cmd_rx.try_recv() {
+                    Ok(WorkerCmd::NewMessage) => continue,
+                    Ok(WorkerCmd::Shutdown) => return,
+                    Err(_) => break,
+                }
+            }
+
+            Self::log_result(
+                "failed to mark agent working",
+                db.update_agent_status(&agent_id, "working"),
+            );
+            let _ = event_tx.send(SwarmEvent::AgentStatus {
+                agent_id: agent_id.clone(),
+                status: "working".to_string(),
+            });
+
+            let is_first = first_message;
+            let msg_parts: Vec<String> = messages
+                .iter()
+                .map(|m| format!("[from: {}]\n{}", m.from_agent, m.content))
+                .collect();
+            let msg_block = msg_parts.join("\n\n");
+
+            let prompt = if first_message {
+                first_message = false;
+                format!(
+                    "{SWARM_PREAMBLE}\n\nYour agent ID: {agent_id}\nYour role: {agent_role}\nProject directory: {}\n\n{}",
+                    project_dir.display(), msg_block
+                )
+            } else if was_interrupted {
+                format!(
+                    "[system: your previous response was interrupted by incoming messages]\n\n{}",
+                    msg_block
+                )
+            } else {
+                msg_block
             };
+            was_interrupted = false;
 
-            match cmd {
-                WorkerCmd::Shutdown => break,
-                WorkerCmd::NewMessage => {
-                    while let Ok(Some(msg)) = db.dequeue_message(&agent_id) {
-                        db.update_agent_status(&agent_id, "working").ok();
-                        let _ = event_tx.send(SwarmEvent::AgentStatus {
-                            agent_id: agent_id.clone(),
-                            status: "working".to_string(),
-                        });
+            let mut env = HashMap::new();
+            env.insert("SWARM_AGENT_ID".to_string(), agent_id.clone());
+            env.insert("SWARM_SOCKET".to_string(), swarm_addr.clone());
+            env.insert(
+                "SWARM_PROJECT_DIR".to_string(),
+                project_dir.to_string_lossy().to_string(),
+            );
 
-                        let is_first = first_message;
-                        let prompt = if first_message {
-                            first_message = false;
-                            format!(
-                                "{SWARM_PREAMBLE}\n\nYour agent ID: {agent_id}\nYour role: {agent_role}\nProject directory: {}\n\n[from: {}]\n{}",
-                                project_dir.display(), msg.from_agent, msg.content
-                            )
-                        } else {
-                            format!("[from: {}]\n{}", msg.from_agent, msg.content)
-                        };
+            let (tx, mut rx) = mpsc::channel(100);
+            let h = harness.clone();
+            let td = topic_dir.clone();
+            let err_tx = tx.clone();
+            let model_ref = model.clone();
+            let continue_conv = !is_first;
 
-                        let mut env = HashMap::new();
-                        env.insert("SWARM_AGENT_ID".to_string(), agent_id.clone());
-                        env.insert("SWARM_SOCKET".to_string(), swarm_addr.clone());
-                        env.insert(
-                            "SWARM_PROJECT_DIR".to_string(),
-                            project_dir.to_string_lossy().to_string(),
-                        );
+            let harness_handle = tokio::spawn(async move {
+                if let Err(e) = h
+                    .run(&prompt, model_ref.as_deref(), continue_conv, &td, env, tx)
+                    .await
+                {
+                    tracing::error!("harness error: {e}");
+                    let _ = err_tx
+                        .send(HarnessOutput::Error(format!("harness failed: {e}")))
+                        .await;
+                }
+            });
 
-                        let (tx, mut rx) = mpsc::channel(100);
-                        let h = harness.clone();
-                        let td = topic_dir.clone();
-                        let err_tx = tx.clone();
-                        let model_ref = model.clone();
-                        let continue_conv = !is_first;
+            let mut had_error = false;
+            let mut accumulated_output = String::new();
+            let mut interrupted = false;
 
-                        tokio::spawn(async move {
-                            if let Err(e) = h
-                                .run(&prompt, model_ref.as_deref(), continue_conv, &td, env, tx)
-                                .await
-                            {
-                                tracing::error!("harness error: {e}");
-                                let _ = err_tx
-                                    .send(HarnessOutput::Error(format!(
-                                        "harness failed: {e}"
-                                    )))
-                                    .await;
+            loop {
+                tokio::select! {
+                    biased;
+                    output = rx.recv() => {
+                        match output {
+                            Some(HarnessOutput::Text(text)) => {
+                                accumulated_output.push_str(&text);
+                                accumulated_output.push('\n');
+                                let _ = event_tx.send(SwarmEvent::AgentOutput {
+                                    agent_id: agent_id.clone(),
+                                    text,
+                                });
                             }
-                        });
-
-                        let mut had_error = false;
-                        while let Some(output) = rx.recv().await {
-                            match output {
-                                HarnessOutput::Text(text) => {
+                            Some(HarnessOutput::Complete(text)) => {
+                                if !text.is_empty() {
                                     let _ = event_tx.send(SwarmEvent::AgentOutput {
                                         agent_id: agent_id.clone(),
-                                        text,
+                                        text: text.clone(),
                                     });
                                 }
-                                HarnessOutput::Complete(text) => {
-                                    if !text.is_empty() {
-                                        let _ = event_tx.send(SwarmEvent::AgentOutput {
-                                            agent_id: agent_id.clone(),
-                                            text: text.clone(),
-                                        });
-                                    }
-                                    db.insert_output_log(&OutputLogRow {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        agent_id: agent_id.clone(),
-                                        content: text,
-                                        kind: "output".to_string(),
-                                        created_at: chrono::Utc::now().to_rfc3339(),
-                                    })
-                                    .ok();
-                                }
-                                HarnessOutput::Error(err) => {
-                                    had_error = true;
-                                    let _ = event_tx.send(SwarmEvent::AgentError {
-                                        agent_id: agent_id.clone(),
-                                        error: err.clone(),
-                                    });
-                                    db.insert_output_log(&OutputLogRow {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        agent_id: agent_id.clone(),
-                                        content: err,
-                                        kind: "error".to_string(),
-                                        created_at: chrono::Utc::now().to_rfc3339(),
-                                    })
-                                    .ok();
-                                }
-                                HarnessOutput::Timeout(partial) => {
-                                    had_error = true;
-                                    let _ = event_tx.send(SwarmEvent::AgentError {
-                                        agent_id: agent_id.clone(),
-                                        error: format!(
-                                            "timeout, partial output: {} chars",
-                                            partial.len()
-                                        ),
-                                    });
-                                    db.insert_output_log(&OutputLogRow {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        agent_id: agent_id.clone(),
-                                        content: partial,
-                                        kind: "timeout".to_string(),
-                                        created_at: chrono::Utc::now().to_rfc3339(),
-                                    })
-                                    .ok();
-                                }
+                                Self::log_result("failed to persist output log", db.insert_output_log(&OutputLogRow {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    agent_id: agent_id.clone(),
+                                    content: text,
+                                    kind: "output".to_string(),
+                                    created_at: chrono::Utc::now().to_rfc3339(),
+                                }));
                             }
+                            Some(HarnessOutput::Error(err)) => {
+                                had_error = true;
+                                let _ = event_tx.send(SwarmEvent::AgentError {
+                                    agent_id: agent_id.clone(),
+                                    error: err.clone(),
+                                });
+                                Self::log_result("failed to persist error log", db.insert_output_log(&OutputLogRow {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    agent_id: agent_id.clone(),
+                                    content: err,
+                                    kind: "error".to_string(),
+                                    created_at: chrono::Utc::now().to_rfc3339(),
+                                }));
+                            }
+                            Some(HarnessOutput::Timeout(partial)) => {
+                                had_error = true;
+                                let _ = event_tx.send(SwarmEvent::AgentError {
+                                    agent_id: agent_id.clone(),
+                                    error: format!(
+                                        "timeout, partial output: {} chars",
+                                        partial.len()
+                                    ),
+                                });
+                                Self::log_result("failed to persist timeout log", db.insert_output_log(&OutputLogRow {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    agent_id: agent_id.clone(),
+                                    content: partial,
+                                    kind: "timeout".to_string(),
+                                    created_at: chrono::Utc::now().to_rfc3339(),
+                                }));
+                            }
+                            None => break,
                         }
-
-                        let next_status = if had_error { "error" } else { "idle" };
-                        db.update_agent_status(&agent_id, next_status).ok();
-                        let _ = event_tx.send(SwarmEvent::AgentStatus {
-                            agent_id: agent_id.clone(),
-                            status: next_status.to_string(),
-                        });
-
-                        // Check for shutdown between messages
-                        if let Ok(WorkerCmd::Shutdown) = cmd_rx.try_recv() {
-                            return;
+                    }
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(WorkerCmd::NewMessage) => {
+                                tracing::info!("agent {} interrupted by new message", agent_id);
+                                harness_handle.abort();
+                                interrupted = true;
+                                has_pending = true;
+                                break;
+                            }
+                            Some(WorkerCmd::Shutdown) => {
+                                harness_handle.abort();
+                                return;
+                            }
+                            None => {
+                                harness_handle.abort();
+                                Self::log_result(
+                                    "failed to mark agent dead",
+                                    db.update_agent_status(&agent_id, "dead"),
+                                );
+                                return;
+                            }
                         }
                     }
                 }
             }
+
+            if interrupted {
+                if !accumulated_output.is_empty() {
+                    Self::log_result(
+                        "failed to persist interrupted log",
+                        db.insert_output_log(&OutputLogRow {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            agent_id: agent_id.clone(),
+                            content: accumulated_output,
+                            kind: "interrupted".to_string(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        }),
+                    );
+                }
+                was_interrupted = true;
+                continue;
+            }
+
+            let next_status = if had_error { "error" } else { "idle" };
+            Self::log_result(
+                "failed to update agent status",
+                db.update_agent_status(&agent_id, next_status),
+            );
+            let _ = event_tx.send(SwarmEvent::AgentStatus {
+                agent_id: agent_id.clone(),
+                status: next_status.to_string(),
+            });
+
+            match db.has_pending_messages(&agent_id) {
+                Ok(true) => has_pending = true,
+                Ok(false) => {}
+                Err(e) => tracing::error!("failed to check pending messages: {e}"),
+            }
         }
 
-        db.update_agent_status(&agent_id, "dead").ok();
+        Self::log_result(
+            "failed to mark agent dead",
+            db.update_agent_status(&agent_id, "dead"),
+        );
     }
 }

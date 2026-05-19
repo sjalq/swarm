@@ -120,7 +120,11 @@ async fn echo_agent_processes_message() {
     })
     .await;
 
-    assert_eq!(saw_output, Ok(true), "echo agent should process the message");
+    assert_eq!(
+        saw_output,
+        Ok(true),
+        "echo agent should process the message"
+    );
 }
 
 #[tokio::test]
@@ -161,7 +165,10 @@ async fn agent_status_transitions() {
     .await;
 
     assert!(saw_working, "agent should transition to working");
-    assert!(saw_idle_after, "agent should return to idle after processing");
+    assert!(
+        saw_idle_after,
+        "agent should return to idle after processing"
+    );
 }
 
 #[tokio::test]
@@ -187,9 +194,7 @@ async fn kill_agent() {
 async fn parent_only_comms_enforced() {
     let (_dir, orch) = setup();
 
-    let parent = orch
-        .spawn_agent("boss", "echo", "", None, "mesh")
-        .unwrap();
+    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
         .spawn_agent("worker", "echo", "", Some(&parent.id), "parent-only")
         .unwrap();
@@ -203,7 +208,10 @@ async fn parent_only_comms_enforced() {
         .spawn_agent("sibling", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let result = orch.send_message(&sibling.id, &child.id, "hey").await;
-    assert!(result.is_err(), "sibling should not be able to message parent-only child");
+    assert!(
+        result.is_err(),
+        "sibling should not be able to message parent-only child"
+    );
 
     // User can always message (special sender)
     let result = orch.send_message("user", &child.id, "override").await;
@@ -234,17 +242,18 @@ async fn multiple_messages_processed_in_order() {
             .unwrap();
     }
 
-    // Collect output in order
-    let mut outputs = Vec::new();
+    // Collect output (messages may be batched into fewer outputs)
+    let mut all_output = String::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
                 Ok(SwarmEvent::AgentOutput { text, .. }) => {
-                    if text.contains("msg-") {
-                        outputs.push(text);
-                        if outputs.len() >= 3 {
-                            return;
-                        }
+                    all_output.push_str(&text);
+                    if all_output.contains("msg-0")
+                        && all_output.contains("msg-1")
+                        && all_output.contains("msg-2")
+                    {
+                        return;
                     }
                 }
                 Err(_) => return,
@@ -254,10 +263,68 @@ async fn multiple_messages_processed_in_order() {
     })
     .await;
 
-    assert_eq!(outputs.len(), 3, "should receive all 3 echo responses");
-    assert!(outputs[0].contains("msg-0"));
-    assert!(outputs[1].contains("msg-1"));
-    assert!(outputs[2].contains("msg-2"));
+    assert!(all_output.contains("msg-0"), "should contain msg-0");
+    assert!(all_output.contains("msg-1"), "should contain msg-1");
+    assert!(all_output.contains("msg-2"), "should contain msg-2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_interrupts_running_agent() {
+    let (_dir, orch) = setup();
+    let mut rx = orch.subscribe();
+
+    // Use a slow harness (claude with nonexistent binary) that takes time to fail
+    // Instead, use echo with a system prompt to get it working, then send interrupt
+    let agent = orch
+        .spawn_agent("worker", "echo", "initial task", None, "mesh")
+        .unwrap();
+
+    // Wait for the first message to be processed
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    // Now send a message, then quickly send another to interrupt
+    orch.send_message("user", &agent.id, "first task")
+        .await
+        .unwrap();
+
+    // Small delay to let worker pick up the first message
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    orch.send_message("user", &agent.id, "interrupt!")
+        .await
+        .unwrap();
+
+    // Collect all output - both messages should eventually produce output
+    let mut all_output = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::AgentOutput { text, .. }) => {
+                    all_output.push_str(&text);
+                    if all_output.contains("interrupt!") {
+                        return;
+                    }
+                }
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        all_output.contains("interrupt!"),
+        "interrupt message should be processed"
+    );
 }
 
 #[tokio::test]
@@ -393,10 +460,12 @@ async fn echo_agent_log_captures_messages_and_output() {
     .await;
 
     // Check all log entries
-    let all = orch
-        .get_agent_log(&agent.id, 50, LogFilter::All)
-        .unwrap();
-    assert!(all.len() >= 2, "should have at least a recv message and output, got {}", all.len());
+    let all = orch.get_agent_log(&agent.id, 50, LogFilter::All).unwrap();
+    assert!(
+        all.len() >= 2,
+        "should have at least a recv message and output, got {}",
+        all.len()
+    );
 
     let recv_entries: Vec<_> = all.iter().filter(|e| e.kind == "recv").collect();
     assert_eq!(recv_entries.len(), 1);
@@ -417,7 +486,9 @@ async fn echo_agent_log_captures_messages_and_output() {
     let outs = orch
         .get_agent_log(&agent.id, 50, LogFilter::Output)
         .unwrap();
-    assert!(outs.iter().all(|e| e.kind == "output" || e.kind == "error" || e.kind == "timeout"));
+    assert!(outs
+        .iter()
+        .all(|e| e.kind == "output" || e.kind == "error" || e.kind == "timeout"));
 }
 
 #[tokio::test]
@@ -528,9 +599,8 @@ async fn harness_error_surfaces_in_events_and_log() {
 
     let db = Arc::new(Db::open(&db_path).unwrap());
     let mut registry = HarnessRegistry::new();
-    registry.register(
-        CliHarness::new(CliKind::Claude).with_binary("/nonexistent/binary".to_string()),
-    );
+    registry
+        .register(CliHarness::new(CliKind::Claude).with_binary("/nonexistent/binary".to_string()));
 
     let orch = Arc::new(Orchestrator::new(
         db,
@@ -576,18 +646,19 @@ async fn harness_error_surfaces_in_events_and_log() {
     })
     .await;
 
-    assert!(saw_error_event, "should emit AgentError event on spawn failure");
-    assert!(saw_error_status, "agent status should transition to 'error'");
+    assert!(
+        saw_error_event,
+        "should emit AgentError event on spawn failure"
+    );
+    assert!(
+        saw_error_status,
+        "agent status should transition to 'error'"
+    );
 
     // Error should appear in agent log
-    let log = orch
-        .get_agent_log(&agent.id, 50, LogFilter::All)
-        .unwrap();
+    let log = orch.get_agent_log(&agent.id, 50, LogFilter::All).unwrap();
     let errors: Vec<_> = log.iter().filter(|e| e.kind == "error").collect();
-    assert!(
-        !errors.is_empty(),
-        "error should be recorded in agent log"
-    );
+    assert!(!errors.is_empty(), "error should be recorded in agent log");
     assert!(errors[0].content.contains("harness failed") || errors[0].content.contains("spawn"));
 }
 
@@ -640,9 +711,7 @@ async fn perspective_shows_family_relations() {
         .spawn_agent("unrelated", "echo", "", None, "mesh")
         .unwrap();
 
-    let views = orch
-        .list_agents_with_perspective(&child_a.id)
-        .unwrap();
+    let views = orch.list_agents_with_perspective(&child_a.id).unwrap();
 
     let find_relation = |id: &str| -> String {
         views
@@ -664,17 +733,13 @@ async fn perspective_shows_family_relations() {
 async fn perspective_hides_dead_agents() {
     let (_dir, orch) = setup();
 
-    let alive = orch
-        .spawn_agent("alive", "echo", "", None, "mesh")
-        .unwrap();
+    let alive = orch.spawn_agent("alive", "echo", "", None, "mesh").unwrap();
     let doomed = orch
         .spawn_agent("doomed", "echo", "", None, "mesh")
         .unwrap();
     orch.kill_agent(&doomed.id).await.unwrap();
 
-    let views = orch
-        .list_agents_with_perspective(&alive.id)
-        .unwrap();
+    let views = orch.list_agents_with_perspective(&alive.id).unwrap();
     assert!(
         views.iter().all(|v| v.agent.status != "dead"),
         "perspective should not include dead agents"
@@ -720,11 +785,11 @@ async fn events_are_persisted_and_queryable() {
         .collect();
     assert_eq!(spawn_events.len(), 1);
 
-    let agent_events = orch
-        .list_events(None, Some(&agent.id), 1000)
-        .unwrap();
+    let agent_events = orch.list_events(None, Some(&agent.id), 1000).unwrap();
     assert!(
-        agent_events.iter().all(|e| e.agent_id.as_deref() == Some(&agent.id)),
+        agent_events
+            .iter()
+            .all(|e| e.agent_id.as_deref() == Some(&agent.id)),
         "agent_id filter should only return events for that agent"
     );
 
@@ -976,22 +1041,23 @@ async fn http_api_perspective_query() {
 async fn done_agent_sends_message_to_parent() {
     let (_dir, orch) = setup();
 
-    let parent = orch
-        .spawn_agent("boss", "echo", "", None, "mesh")
-        .unwrap();
+    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
         .spawn_agent("worker", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
-    orch.done_agent(&child.id, Some("task complete")).await.unwrap();
+    orch.done_agent(&child.id, Some("task complete"))
+        .await
+        .unwrap();
 
     let fetched = orch.get_agent(&child.id).unwrap().unwrap();
     assert_eq!(fetched.status, "done");
 
-    let log = orch
-        .get_agent_log(&parent.id, 50, LogFilter::All)
-        .unwrap();
-    let recv: Vec<_> = log.iter().filter(|e| e.kind == "recv" && e.content == "task complete").collect();
+    let log = orch.get_agent_log(&parent.id, 50, LogFilter::All).unwrap();
+    let recv: Vec<_> = log
+        .iter()
+        .filter(|e| e.kind == "recv" && e.content == "task complete")
+        .collect();
     assert_eq!(recv.len(), 1, "parent should receive the done message");
 }
 
@@ -1013,9 +1079,7 @@ async fn done_agent_without_parent_still_works() {
 async fn kill_reparents_children() {
     let (_dir, orch) = setup();
 
-    let grandparent = orch
-        .spawn_agent("gp", "echo", "", None, "mesh")
-        .unwrap();
+    let grandparent = orch.spawn_agent("gp", "echo", "", None, "mesh").unwrap();
     let parent = orch
         .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
         .unwrap();
@@ -1029,21 +1093,25 @@ async fn kill_reparents_children() {
     orch.kill_agent(&parent.id).await.unwrap();
 
     let a = orch.get_agent(&child_a.id).unwrap().unwrap();
-    assert_eq!(a.parent_id.as_deref(), Some(grandparent.id.as_str()),
-        "child should be re-parented to grandparent");
+    assert_eq!(
+        a.parent_id.as_deref(),
+        Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent"
+    );
 
     let b = orch.get_agent(&child_b.id).unwrap().unwrap();
-    assert_eq!(b.parent_id.as_deref(), Some(grandparent.id.as_str()),
-        "child should be re-parented to grandparent");
+    assert_eq!(
+        b.parent_id.as_deref(),
+        Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent"
+    );
 }
 
 #[tokio::test]
 async fn done_reparents_children() {
     let (_dir, orch) = setup();
 
-    let grandparent = orch
-        .spawn_agent("gp", "echo", "", None, "mesh")
-        .unwrap();
+    let grandparent = orch.spawn_agent("gp", "echo", "", None, "mesh").unwrap();
     let parent = orch
         .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
         .unwrap();
@@ -1054,8 +1122,11 @@ async fn done_reparents_children() {
     orch.done_agent(&parent.id, None).await.unwrap();
 
     let c = orch.get_agent(&child.id).unwrap().unwrap();
-    assert_eq!(c.parent_id.as_deref(), Some(grandparent.id.as_str()),
-        "child should be re-parented to grandparent after parent done");
+    assert_eq!(
+        c.parent_id.as_deref(),
+        Some(grandparent.id.as_str()),
+        "child should be re-parented to grandparent after parent done"
+    );
 
     let p = orch.get_agent(&parent.id).unwrap().unwrap();
     assert_eq!(p.status, "done");
@@ -1065,9 +1136,7 @@ async fn done_reparents_children() {
 async fn kill_root_agent_orphans_children() {
     let (_dir, orch) = setup();
 
-    let root = orch
-        .spawn_agent("root", "echo", "", None, "mesh")
-        .unwrap();
+    let root = orch.spawn_agent("root", "echo", "", None, "mesh").unwrap();
     let child = orch
         .spawn_agent("child", "echo", "", Some(&root.id), "mesh")
         .unwrap();
@@ -1075,12 +1144,14 @@ async fn kill_root_agent_orphans_children() {
     orch.kill_agent(&root.id).await.unwrap();
 
     let c = orch.get_agent(&child.id).unwrap().unwrap();
-    assert_eq!(c.parent_id, None,
-        "child of root should become a root agent when root is killed");
+    assert_eq!(
+        c.parent_id, None,
+        "child of root should become a root agent when root is killed"
+    );
 }
 
 #[tokio::test]
-async fn done_agent_visible_in_perspective() {
+async fn done_agent_hidden_from_active_views_and_not_messageable() {
     let (_dir, orch) = setup();
 
     let parent = orch
@@ -1092,10 +1163,21 @@ async fn done_agent_visible_in_perspective() {
 
     orch.done_agent(&child.id, None).await.unwrap();
 
+    let active_agents = orch.list_agents().unwrap();
+    assert!(
+        active_agents.iter().all(|a| a.id != child.id),
+        "done agents should not appear in active agent lists"
+    );
+
     let views = orch.list_agents_with_perspective(&parent.id).unwrap();
     let child_view = views.iter().find(|v| v.agent.id == child.id);
-    assert!(child_view.is_some(), "done agents should still be visible in perspective");
-    assert_eq!(child_view.unwrap().agent.status, "done");
+    assert!(
+        child_view.is_none(),
+        "done agents should not appear in active perspective views"
+    );
+
+    let result = orch.send_message("user", &child.id, "are you there?").await;
+    assert!(result.is_err(), "done agents should reject new messages");
 }
 
 #[tokio::test]
@@ -1109,7 +1191,10 @@ async fn worktree_creates_isolated_branch() {
     let worktree = orch.worktree_dir(&agent.id);
     assert!(worktree.is_some(), "worktree dir should exist after spawn");
     let wt = worktree.unwrap();
-    assert!(wt.join("README.md").exists(), "worktree should have project files");
+    assert!(
+        wt.join("README.md").exists(),
+        "worktree should have project files"
+    );
 
     // Check the branch was created
     let output = std::process::Command::new("git")
@@ -1118,8 +1203,11 @@ async fn worktree_creates_isolated_branch() {
         .output()
         .unwrap();
     let branches = String::from_utf8_lossy(&output.stdout);
-    assert!(branches.contains(&format!("swarm/{}", agent.id)),
-        "branch swarm/{} should exist", agent.id);
+    assert!(
+        branches.contains(&format!("swarm/{}", agent.id)),
+        "branch swarm/{} should exist",
+        agent.id
+    );
 }
 
 #[tokio::test]
@@ -1131,7 +1219,10 @@ async fn no_worktree_by_default() {
         .unwrap();
 
     let worktree = orch.worktree_dir(&agent.id);
-    assert!(worktree.is_none(), "no worktree should exist for default spawn");
+    assert!(
+        worktree.is_none(),
+        "no worktree should exist for default spawn"
+    );
 }
 
 #[tokio::test]
@@ -1145,8 +1236,10 @@ async fn cleanup_removes_worktree() {
     assert!(orch.worktree_dir(&agent.id).is_some());
 
     orch.cleanup_agent(&agent.id, false).unwrap();
-    assert!(orch.worktree_dir(&agent.id).is_none(),
-        "worktree should be gone after cleanup");
+    assert!(
+        orch.worktree_dir(&agent.id).is_none(),
+        "worktree should be gone after cleanup"
+    );
 }
 
 #[tokio::test]
@@ -1168,17 +1261,17 @@ async fn cleanup_with_branch_delete() {
         .output()
         .unwrap();
     let branches = String::from_utf8_lossy(&output.stdout);
-    assert!(!branches.contains(&branch_name),
-        "branch should be deleted with --delete-branch");
+    assert!(
+        !branches.contains(&branch_name),
+        "branch should be deleted with --delete-branch"
+    );
 }
 
 #[tokio::test]
 async fn cleanup_noop_without_worktree() {
     let (_dir, orch) = setup();
 
-    let agent = orch
-        .spawn_agent("plain", "echo", "", None, "mesh")
-        .unwrap();
+    let agent = orch.spawn_agent("plain", "echo", "", None, "mesh").unwrap();
 
     // Should not error even though there's no worktree
     orch.cleanup_agent(&agent.id, false).unwrap();

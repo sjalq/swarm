@@ -86,10 +86,7 @@ struct ModelsResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/agents", get(list_agents).post(spawn_agent))
-        .route(
-            "/api/agents/{id}",
-            get(get_agent).delete(kill_agent),
-        )
+        .route("/api/agents/{id}", get(get_agent).delete(kill_agent))
         .route("/api/agents/{id}/done", post(done_agent))
         .route("/api/agents/{id}/cleanup", post(cleanup_agent))
         .route("/api/agents/{id}/log", get(get_agent_log))
@@ -125,9 +122,7 @@ async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl
     match orch.get_agent(&id) {
         Ok(Some(agent)) => Json(agent).into_response(),
         Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -135,19 +130,29 @@ async fn spawn_agent(
     State(orch): State<AppState>,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
-    match orch.spawn_agent_with_model(
-        &req.role,
-        &req.harness,
-        req.model.as_deref(),
-        &req.system_prompt,
-        req.parent_id.as_deref(),
-        &req.comms,
-        req.worktree,
-    ) {
-        Ok(agent) => (axum::http::StatusCode::CREATED, Json(agent)).into_response(),
-        Err(e) => {
+    let result = tokio::task::spawn_blocking(move || {
+        orch.spawn_agent_with_model(
+            &req.role,
+            &req.harness,
+            req.model.as_deref(),
+            &req.system_prompt,
+            req.parent_id.as_deref(),
+            &req.comms,
+            req.worktree,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(agent)) => (axum::http::StatusCode::CREATED, Json(agent)).into_response(),
+        Ok(Err(e)) => {
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("spawn task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -157,9 +162,7 @@ async fn send_message(
 ) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -175,9 +178,7 @@ async fn get_agent_log(
     };
     match orch.get_agent_log(&id, params.n, filter) {
         Ok(entries) => Json(entries).into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -188,9 +189,7 @@ async fn done_agent(
 ) -> impl IntoResponse {
     match orch.done_agent(&id, req.message.as_deref()).await {
         Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -199,20 +198,26 @@ async fn cleanup_agent(
     Path(id): Path<String>,
     Query(params): Query<CleanupQuery>,
 ) -> impl IntoResponse {
-    match orch.cleanup_agent(&id, params.delete_branch) {
-        Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
+    let result =
+        tokio::task::spawn_blocking(move || orch.cleanup_agent(&id, params.delete_branch)).await;
+
+    match result {
+        Ok(Ok(())) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => {
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cleanup task failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
 async fn kill_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match orch.kill_agent(&id).await {
         Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -226,14 +231,17 @@ async fn list_events(
         params.limit,
     ) {
         Ok(events) => Json(events).into_response(),
-        Err(e) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn list_models() -> impl IntoResponse {
-    let harnesses = [CliKind::Claude, CliKind::Gemini, CliKind::Codex, CliKind::Grok];
+    let harnesses = [
+        CliKind::Claude,
+        CliKind::Gemini,
+        CliKind::Codex,
+        CliKind::Grok,
+    ];
     let models: Vec<ModelsResponse> = harnesses
         .iter()
         .map(|kind| ModelsResponse {
@@ -251,15 +259,20 @@ async fn ws_handler(State(orch): State<AppState>, upgrade: WebSocketUpgrade) -> 
 
 async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
     let mut rx = orch.subscribe();
-    while let Ok(event) = rx.recv().await {
-        if let Ok(json) = serde_json::to_string(&event) {
-            if socket
-                .send(ws::Message::Text(json.into()))
-                .await
-                .is_err()
-            {
-                break;
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if let Ok(json) = serde_json::to_string(&event) {
+                    if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!("websocket skipped {skipped} lagged event(s)");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
