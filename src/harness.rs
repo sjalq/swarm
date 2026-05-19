@@ -124,6 +124,7 @@ impl CliKind {
         model: Option<&str>,
         continue_conversation: bool,
         work_dir: &Path,
+        env: &HashMap<String, String>,
     ) -> Vec<String> {
         match self {
             Self::Claude => {
@@ -161,9 +162,14 @@ impl CliKind {
                     "stream-json".into(),
                     "-y".into(),
                     "--skip-trust".into(),
-                    "--sandbox".into(),
-                    "false".into(),
+                    "--no-sandbox".into(),
                 ]);
+                if let Some(project_dir) = env.get("SWARM_PROJECT_DIR") {
+                    args.extend_from_slice(&[
+                        "--include-directories".into(),
+                        project_dir.clone(),
+                    ]);
+                }
                 args
             }
             Self::Codex => {
@@ -267,7 +273,7 @@ impl Harness for CliHarness {
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let args = self.kind.build_args(prompt, model, continue_conversation, work_dir);
+        let args = self.kind.build_args(prompt, model, continue_conversation, work_dir, &env_extra);
         let binary = self.binary.clone();
         let work_dir = work_dir.to_path_buf();
         let timeout_ms = self.timeout_ms;
