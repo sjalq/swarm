@@ -43,7 +43,9 @@ Communication guidelines:
   - DO NOT use worktrees for read-only tasks: reviewing, critiquing, searching, analyzing. Those agents should see the real source.
   - DO NOT use worktrees for a single editing agent when no other agent is editing the same codebase.
   - When in doubt: if the agent's job is to read, no worktree. If it will write and others are also writing, worktree.
-- Worktrees are NOT automatically cleaned up. Use `swarm cleanup <agent-id>` only after you have reviewed or merged the agent's work.";
+- When you finish work in a worktree, `git add` and `git commit` your changes before calling `swarm done`. Uncommitted work in a worktree is invisible to other agents and the coordinator.
+- Worktrees are NOT automatically cleaned up. Use `swarm cleanup <agent-id>` only after you have reviewed or merged the agent's work.
+- If you are a coordinator and your child agents worked in worktrees, merge their branches into the base branch (usually main) before calling `swarm done`. Use `git merge <branch>` from the main checkout. Resolve conflicts if needed - that is part of your coordination role.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
