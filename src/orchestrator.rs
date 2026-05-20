@@ -1,10 +1,11 @@
-use crate::db::{AgentRow, Db, EventRow, LogEntry, LogFilter, MessageRow, OutputLogRow};
+use crate::db::{AgentRow, Db, DbStats, EventRow, LogEntry, LogFilter, MessageRow, OutputLogRow};
 use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -32,7 +33,10 @@ Commands:
   swarm kill <agent-id>                Stop an agent and mark it done.
 
 Communication guidelines:
-- When you receive a message, reply to the sender with your result via `swarm send` if a response is expected.
+- Always reply via `swarm send` when the sender asks a question or directly requests a result.
+- Never reply to status broadcasts or FYI progress updates unless they ask for action.
+- Keep swarm messages under 300 words unless the requester explicitly asks for more.
+- All swarm commands are idempotent and safe to retry.
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
 - Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
 - Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.
@@ -86,6 +90,14 @@ pub struct AgentView {
     pub relation: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub branch: String,
+    pub head: String,
+    pub dirty: bool,
+    pub path: String,
+}
+
 enum WorkerCmd {
     NewMessage,
     Shutdown,
@@ -117,6 +129,7 @@ pub struct Orchestrator {
     addr: String,
     project_dir: PathBuf,
     data_dir: PathBuf,
+    start_time: Instant,
 }
 
 impl Orchestrator {
@@ -136,6 +149,7 @@ impl Orchestrator {
             addr,
             project_dir,
             data_dir,
+            start_time: Instant::now(),
         }
     }
 
@@ -194,6 +208,25 @@ impl Orchestrator {
 
     fn has_worker(&self, agent_id: &str) -> Result<bool> {
         Ok(self.workers()?.contains_key(agent_id))
+    }
+
+    fn git_output(current_dir: &Path, args: &[&str]) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(current_dir)
+            .output()
+            .map_err(|e| SwarmError::Process(format!("git {} failed: {e}", args.join(" "))))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SwarmError::Process(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn log_result<T>(context: &str, result: Result<T>) {
@@ -306,6 +339,14 @@ impl Orchestrator {
         limit: usize,
     ) -> Result<Vec<EventRow>> {
         self.db.list_events(since, agent_id, limit)
+    }
+
+    pub fn stats(&self) -> Result<DbStats> {
+        self.db.stats()
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
     }
 
     pub fn list_agents_with_perspective(&self, perspective_id: &str) -> Result<Vec<AgentView>> {
@@ -518,6 +559,29 @@ impl Orchestrator {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn worktree_info(&self, agent_id: &str) -> Result<Option<WorktreeInfo>> {
+        Self::validate_agent_id(agent_id)?;
+
+        if self.db.get_agent(agent_id)?.is_none() {
+            return Err(SwarmError::AgentNotFound(agent_id.to_string()));
+        }
+
+        let Some(dir) = self.worktree_dir(agent_id)? else {
+            return Ok(None);
+        };
+
+        let branch = Self::git_output(&dir, &["branch", "--show-current"])?;
+        let head = Self::git_output(&dir, &["rev-parse", "HEAD"])?;
+        let status = Self::git_output(&dir, &["status", "--porcelain"])?;
+
+        Ok(Some(WorktreeInfo {
+            branch,
+            head,
+            dirty: !status.is_empty(),
+            path: dir.to_string_lossy().to_string(),
+        }))
     }
 
     pub fn resume_existing_workers(&self) -> Result<usize> {

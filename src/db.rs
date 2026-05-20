@@ -60,6 +60,15 @@ pub enum LogFilter {
     Output,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbStats {
+    pub total: u64,
+    pub alive: u64,
+    pub done: u64,
+    pub messages: u64,
+    pub errors: u64,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -525,6 +534,36 @@ impl Db {
             [],
         )?;
         Ok(count)
+    }
+
+    pub fn stats(&self) -> Result<DbStats> {
+        let conn = self.conn()?;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))?;
+        let alive: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE status != 'done'",
+            [],
+            |row| row.get(0),
+        )?;
+        let done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE status = 'done'",
+            [],
+            |row| row.get(0),
+        )?;
+        let messages: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        let errors: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM output_log WHERE kind IN ('error', 'timeout')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(DbStats {
+            total: total as u64,
+            alive: alive as u64,
+            done: done as u64,
+            messages: messages as u64,
+            errors: errors as u64,
+        })
     }
 }
 
