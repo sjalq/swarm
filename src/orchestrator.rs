@@ -13,13 +13,13 @@ You have access to the `swarm` CLI for multi-agent coordination:
 
 Commands:
   swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
-  swarm peers --all [--json]           Include dead agents.
+  swarm peers --all [--json]           Include done agents.
   swarm send <agent-id> \"message\"      Send a message to another agent.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
                                        Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
   swarm spawn --role <name> --harness claude --model claude-sonnet-4-6 --worktree --prompt \"...\"
                                        Spawn with a specific model and an isolated git worktree.
-  swarm cleanup <agent-id>             Remove a done/dead agent's git worktree.
+  swarm cleanup <agent-id>             Remove a done agent's git worktree.
   swarm cleanup <agent-id> --delete-branch  Also delete the agent's branch.
   swarm models [--json]                List available models for each harness.
   swarm log <agent-id> [--json]        View an agent's recent activity (messages sent/received and output).
@@ -29,7 +29,7 @@ Commands:
   swarm log <agent-id> --output        Show only harness output.
   swarm status [--json]                Show your own agent status (includes model info).
   swarm done \"optional final message\"   Signal that you have finished your task. Sends a message to your parent and exits gracefully.
-  swarm kill <agent-id>                Terminate an agent. Its children are re-parented to the killed agent's parent.
+  swarm kill <agent-id>                Stop an agent and mark it done.
 
 Communication guidelines:
 - When you receive a message, reply to the sender with your result via `swarm send` if a response is expected.
@@ -38,7 +38,7 @@ Communication guidelines:
 - Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.
 - `swarm peers` shows only your parent, siblings, and descendants. Agents outside your family tree are not visible to you.
 - When your assigned task is complete, call `swarm done \"summary of what you did\"` to signal completion and report back to your parent. Do not stay idle - finish and exit.
-- If you spawn child agents, they will be re-parented to your parent when you finish. You do not need to clean them up unless they are stuck or no longer useful.
+- If you spawn child agents, their relationship to you is preserved when you finish. You do not need to clean them up unless they are stuck or no longer useful.
 - Git worktrees (`--worktree` on spawn) give an agent its own branch and file checkout. Use your judgment:
   - DO use worktrees when multiple agents will edit files in the same compiled project (Rust, Elm, etc.) - the compiler will fail if two agents edit concurrently.
   - DO NOT use worktrees for read-only tasks: reviewing, critiquing, searching, analyzing. Those agents should see the real source.
@@ -106,6 +106,7 @@ struct WorkerConfig {
     project_dir: PathBuf,
     swarm_addr: String,
     event_tx: broadcast::Sender<SwarmEvent>,
+    resume_conversation: bool,
 }
 
 pub struct Orchestrator {
@@ -149,7 +150,7 @@ impl Orchestrator {
     }
 
     fn active_status(status: &str) -> bool {
-        !matches!(status, "dead" | "done")
+        status != "done"
     }
 
     fn validate_identifier(kind: &str, value: &str) -> Result<()> {
@@ -206,6 +207,75 @@ impl Orchestrator {
             Ok(_) => {}
             Err(e) => tracing::error!("failed to update agent status: {e}"),
         }
+    }
+
+    fn start_worker_for_agent(&self, agent: &AgentRow, resume_conversation: bool) -> Result<bool> {
+        if self.workers()?.contains_key(&agent.id) {
+            return Ok(false);
+        }
+
+        let harness = self
+            .registry
+            .get(&agent.harness)
+            .ok_or_else(|| SwarmError::Internal(format!("unknown harness: {}", agent.harness)))?;
+
+        let topic_dir = PathBuf::from(&agent.work_dir);
+        let agent_project_dir = self
+            .worktree_dir(&agent.id)?
+            .unwrap_or_else(|| self.project_dir.clone());
+        let model = if agent.model.is_empty() {
+            None
+        } else {
+            Some(agent.model.clone())
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(Self::agent_worker_loop(
+            WorkerConfig {
+                db: self.db.clone(),
+                harness,
+                agent_id: agent.id.clone(),
+                agent_role: agent.role.clone(),
+                model,
+                topic_dir,
+                project_dir: agent_project_dir,
+                swarm_addr: self.addr.clone(),
+                event_tx: self.event_tx.clone(),
+                resume_conversation,
+            },
+            cmd_rx,
+        ));
+
+        let mut workers = self.workers()?;
+        if workers.contains_key(&agent.id) {
+            if cmd_tx.send(WorkerCmd::Shutdown).is_err() {
+                tracing::debug!("duplicate worker already stopped: {}", agent.id);
+            }
+            return Ok(false);
+        }
+
+        workers.insert(
+            agent.id.clone(),
+            AgentWorker {
+                cmd_tx,
+                _handle: handle,
+            },
+        );
+        Ok(true)
+    }
+
+    fn reactivate_agent(&self, agent: &AgentRow) -> Result<()> {
+        if Self::active_status(&agent.status) {
+            return Ok(());
+        }
+
+        self.start_worker_for_agent(agent, true)?;
+        self.db.update_agent_status(&agent.id, "idle")?;
+        self.emit_event(SwarmEvent::AgentStatus {
+            agent_id: agent.id.clone(),
+            status: "idle".to_string(),
+        });
+        Ok(())
     }
 
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
@@ -329,7 +399,7 @@ impl Orchestrator {
     ) -> Result<AgentRow> {
         Self::validate_role(role)?;
 
-        let harness = self
+        let _harness = self
             .registry
             .get(harness_name)
             .ok_or_else(|| SwarmError::Internal(format!("unknown harness: {harness_name}")))?;
@@ -341,11 +411,9 @@ impl Orchestrator {
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
 
-        let agent_project_dir = if use_worktree {
-            self.create_worktree(&id)?
-        } else {
-            self.project_dir.clone()
-        };
+        if use_worktree {
+            self.create_worktree(&id)?;
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
         let model_str = model.unwrap_or("").to_string();
@@ -373,35 +441,19 @@ impl Orchestrator {
             return Err(e);
         }
 
-        let model_for_worker = if model_str.is_empty() {
-            None
-        } else {
-            Some(model_str)
-        };
-
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(Self::agent_worker_loop(
-            WorkerConfig {
-                db: self.db.clone(),
-                harness,
-                agent_id: id.clone(),
-                agent_role: role.to_string(),
-                model: model_for_worker,
-                topic_dir,
-                project_dir: agent_project_dir,
-                swarm_addr: self.addr.clone(),
-                event_tx: self.event_tx.clone(),
-            },
-            cmd_rx,
-        ));
-
-        self.workers()?.insert(
-            id.clone(),
-            AgentWorker {
-                cmd_tx,
-                _handle: handle,
-            },
-        );
+        if let Err(e) = self.start_worker_for_agent(&agent, false) {
+            if use_worktree {
+                if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
+                    tracing::error!(
+                        "failed to clean up worktree after worker start failure: {cleanup_err}"
+                    );
+                }
+            }
+            if let Err(delete_err) = self.db.delete_agent(&id) {
+                tracing::error!("failed to delete agent after worker start failure: {delete_err}");
+            }
+            return Err(e);
+        }
 
         self.emit_event(SwarmEvent::AgentSpawned {
             agent: agent.clone(),
@@ -477,7 +529,7 @@ impl Orchestrator {
                 continue;
             }
 
-            let Some(harness) = self.registry.get(&agent.harness) else {
+            if self.registry.get(&agent.harness).is_none() {
                 self.db.update_agent_status(&agent.id, "error")?;
                 tracing::error!(
                     "cannot resume agent {}: unknown harness {}",
@@ -485,40 +537,11 @@ impl Orchestrator {
                     agent.harness
                 );
                 continue;
-            };
+            }
 
-            let topic_dir = PathBuf::from(&agent.work_dir);
-            let agent_project_dir = self
-                .worktree_dir(&agent.id)?
-                .unwrap_or_else(|| self.project_dir.clone());
-            let model = if agent.model.is_empty() {
-                None
-            } else {
-                Some(agent.model.clone())
-            };
-            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-            let handle = tokio::spawn(Self::agent_worker_loop(
-                WorkerConfig {
-                    db: self.db.clone(),
-                    harness,
-                    agent_id: agent.id.clone(),
-                    agent_role: agent.role.clone(),
-                    model,
-                    topic_dir,
-                    project_dir: agent_project_dir,
-                    swarm_addr: self.addr.clone(),
-                    event_tx: self.event_tx.clone(),
-                },
-                cmd_rx,
-            ));
-
-            self.workers()?.insert(
-                agent.id.clone(),
-                AgentWorker {
-                    cmd_tx,
-                    _handle: handle,
-                },
-            );
+            if !self.start_worker_for_agent(&agent, true)? {
+                continue;
+            }
 
             if self.db.has_pending_messages(&agent.id)? {
                 self.notify_worker(&agent.id, WorkerCmd::NewMessage)?;
@@ -616,13 +639,6 @@ impl Orchestrator {
             .get_agent(to)?
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
-        if !Self::active_status(&agent.status) {
-            return Err(SwarmError::AgentInactive {
-                id: to.to_string(),
-                status: agent.status,
-            });
-        }
-
         if agent.comms == "parent-only" {
             match agent.parent_id.as_deref() {
                 Some(parent) if from == parent || from == "user" || from == "system" => {}
@@ -638,6 +654,10 @@ impl Orchestrator {
                     )));
                 }
             }
+        }
+
+        if !Self::active_status(&agent.status) {
+            self.reactivate_agent(&agent)?;
         }
 
         if !self.has_worker(to)? {
@@ -701,7 +721,6 @@ impl Orchestrator {
             }
         }
 
-        self.db.reparent_children(id, agent.parent_id.as_deref())?;
         self.db.update_agent_status(id, "done")?;
 
         let worker = self.workers()?.remove(id);
@@ -722,9 +741,11 @@ impl Orchestrator {
             .db
             .get_agent(id)?
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
-        let new_parent = agent.parent_id;
-        self.db.reparent_children(id, new_parent.as_deref())?;
-        self.db.update_agent_status(id, "dead")?;
+        if !Self::active_status(&agent.status) {
+            return Ok(());
+        }
+
+        self.db.update_agent_status(id, "done")?;
 
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
@@ -745,11 +766,14 @@ impl Orchestrator {
         };
 
         for (agent_id, worker) in workers {
-            self.db.update_agent_status(&agent_id, "dead")?;
+            self.db.update_agent_status(&agent_id, "done")?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
                 tracing::debug!("agent worker already stopped: {agent_id}");
             }
-            self.emit_event(SwarmEvent::AgentKilled { agent_id });
+            self.emit_event(SwarmEvent::AgentDone {
+                agent_id,
+                message: None,
+            });
         }
 
         Ok(())
@@ -769,8 +793,9 @@ impl Orchestrator {
             project_dir,
             swarm_addr,
             event_tx,
+            resume_conversation,
         } = config;
-        let mut first_message = true;
+        let mut first_message = !resume_conversation;
         let mut has_pending = false;
         let mut was_interrupted = false;
 
@@ -942,8 +967,8 @@ impl Orchestrator {
                             None => {
                                 harness_handle.abort();
                                 Self::log_result(
-                                    "failed to mark agent dead",
-                                    db.update_agent_status(&agent_id, "dead"),
+                                    "failed to mark agent done",
+                                    db.update_agent_status(&agent_id, "done"),
                                 );
                                 return;
                             }
@@ -984,8 +1009,8 @@ impl Orchestrator {
         }
 
         Self::log_result(
-            "failed to mark agent dead",
-            db.update_agent_status(&agent_id, "dead"),
+            "failed to mark agent done",
+            db.update_agent_status(&agent_id, "done"),
         );
     }
 }

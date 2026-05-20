@@ -152,6 +152,6 @@ async fn peers_status_and_log_piped_output_is_json_without_flag() {
 
     let peers = run_swarm_json(&["peers", "--all", "--json"], &addr, None);
     assert!(peers.as_array().unwrap().iter().any(|a| {
-        a["id"].as_str() == Some(agent_id.as_str()) && a["status"].as_str() == Some("dead")
+        a["id"].as_str() == Some(agent_id.as_str()) && a["status"].as_str() == Some("done")
     }));
 }

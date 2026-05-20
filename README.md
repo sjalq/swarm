@@ -177,7 +177,7 @@ List all agents in the swarm visible to you (parent, siblings, descendants).
 swarm peers [--all]
 ```
 
-- `--all` : Include dead/terminated agents.
+- `--all` : Include done agents.
 
 ### `swarm send`
 
@@ -252,7 +252,7 @@ swarm done ["optional message"]
 
 ### `swarm kill`
 
-Terminate an agent. Its children are re-parented to the killed agent's parent.
+Stop an agent and mark it done.
 
 ```bash
 swarm kill <AGENT_ID>
@@ -338,7 +338,7 @@ If an agent is unresponsive, kill it:
 swarm kill <agent-id>
 ```
 
-### Dead worktree cleanup
+### Done worktree cleanup
 
 If worktrees are left behind after agents finish, clean them up:
 

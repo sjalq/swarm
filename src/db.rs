@@ -129,7 +129,8 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_events_time
                 ON events(created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent
-                ON events(agent_id, created_at);",
+                ON events(agent_id, created_at);
+            UPDATE agents SET status = 'done' WHERE status = 'dead';",
         )?;
         Ok(())
     }
@@ -186,7 +187,7 @@ impl Db {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
-             FROM agents WHERE status NOT IN ('dead', 'done') ORDER BY created_at",
+             FROM agents WHERE status != 'done' ORDER BY created_at",
         )?;
         let agents = stmt
             .query_map([], |row| {
@@ -302,7 +303,7 @@ impl Db {
     pub fn reparent_children(&self, old_parent: &str, new_parent: Option<&str>) -> Result<usize> {
         let conn = self.conn()?;
         let count = conn.execute(
-            "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status NOT IN ('dead', 'done')",
+            "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status != 'done'",
             rusqlite::params![new_parent, old_parent],
         )?;
         Ok(count)
@@ -320,7 +321,7 @@ impl Db {
     pub fn update_agent_status_if_active(&self, id: &str, status: &str) -> Result<bool> {
         let conn = self.conn()?;
         let updated = conn.execute(
-            "UPDATE agents SET status = ?1 WHERE id = ?2 AND status NOT IN ('dead', 'done')",
+            "UPDATE agents SET status = ?1 WHERE id = ?2 AND status != 'done'",
             rusqlite::params![status, id],
         )?;
         Ok(updated > 0)
@@ -355,7 +356,7 @@ impl Db {
         let is_active: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM agents
-                WHERE id = ?1 AND status NOT IN ('dead', 'done')
+                WHERE id = ?1 AND status != 'done'
             )",
             [&msg.to_agent],
             |row| row.get(0),
@@ -517,10 +518,10 @@ impl Db {
         Ok(count > 0)
     }
 
-    pub fn mark_unfinished_agents_dead(&self) -> Result<usize> {
+    pub fn mark_unfinished_agents_done(&self) -> Result<usize> {
         let conn = self.conn()?;
         let count = conn.execute(
-            "UPDATE agents SET status = 'dead' WHERE status NOT IN ('dead', 'done')",
+            "UPDATE agents SET status = 'done' WHERE status != 'done'",
             [],
         )?;
         Ok(count)
@@ -668,26 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_agents_hidden_from_list() {
-        let db = test_db();
-        let agent = AgentRow {
-            id: "dead-agent".into(),
-            role: "ghost".into(),
-            harness: "echo".into(),
-            model: String::new(),
-            status: "dead".into(),
-            parent_id: None,
-            system_prompt: String::new(),
-            work_dir: "/tmp".into(),
-            comms: "mesh".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
-        db.insert_agent(&agent).unwrap();
-        assert!(db.list_agents().unwrap().is_empty());
-        assert!(db.get_agent("dead-agent").unwrap().is_some());
-    }
-
-    #[test]
     fn done_agents_hidden_from_list() {
         let db = test_db();
         let agent = AgentRow {
@@ -705,6 +686,26 @@ mod tests {
         db.insert_agent(&agent).unwrap();
         assert!(db.list_agents().unwrap().is_empty());
         assert!(db.get_agent("done-agent").unwrap().is_some());
+    }
+
+    #[test]
+    fn active_agents_visible_from_list() {
+        let db = test_db();
+        let agent = AgentRow {
+            id: "active-agent".into(),
+            role: "worker".into(),
+            harness: "echo".into(),
+            model: String::new(),
+            status: "idle".into(),
+            parent_id: None,
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            comms: "mesh".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        db.insert_agent(&agent).unwrap();
+        assert_eq!(db.list_agents().unwrap().len(), 1);
+        assert!(db.get_agent("active-agent").unwrap().is_some());
     }
 
     #[test]

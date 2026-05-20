@@ -55,7 +55,7 @@ enum Commands {
 
     /// List all agents in the swarm
     Peers {
-        /// Include dead agents
+        /// Include done agents
         #[arg(long)]
         all: bool,
 
@@ -155,7 +155,7 @@ enum Commands {
         message: Option<String>,
     },
 
-    /// Kill an agent
+    /// Stop an agent and mark it done
     Kill {
         /// Agent ID to terminate
         target: String,
@@ -437,7 +437,7 @@ async fn run_orchestrator(
                         }
                     }
                     SwarmEvent::AgentKilled { agent_id } => {
-                        println!("[swarm] killed: {agent_id}");
+                        println!("[swarm] stopped: {agent_id}");
                     }
                     SwarmEvent::AgentStatus { agent_id, status } => {
                         println!("[swarm] {agent_id} -> {status}");
@@ -788,7 +788,7 @@ async fn cmd_kill(target: &str) -> std::result::Result<(), Box<dyn std::error::E
         .await?;
 
     if resp.status().is_success() {
-        println!("killed {target}");
+        println!("stopped {target}");
     } else {
         return Err(response_error(resp).await);
     }
