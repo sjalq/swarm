@@ -218,6 +218,7 @@ pub struct Orchestrator {
     event_tx: broadcast::Sender<SwarmEvent>,
     addr: String,
     project_dir: PathBuf,
+    project_key: String,
     data_dir: PathBuf,
     start_time: Instant,
 }
@@ -231,6 +232,10 @@ impl Orchestrator {
         data_dir: PathBuf,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let project_key = project_dir.to_string_lossy().to_string();
+        if let Err(e) = db.assign_unscoped_agents_to_project(&project_key) {
+            tracing::error!("failed to assign legacy agents to project: {e}");
+        }
         Self {
             db,
             registry,
@@ -238,6 +243,7 @@ impl Orchestrator {
             event_tx,
             addr,
             project_dir,
+            project_key,
             data_dir,
             start_time: Instant::now(),
         }
@@ -454,15 +460,18 @@ impl Orchestrator {
     }
 
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
-        self.db.list_agents()
+        self.db.list_agents_for_project(&self.project_key)
     }
 
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
-        self.db.list_all_agents()
+        self.db.list_all_agents_for_project(&self.project_key)
     }
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
-        self.db.get_agent(id)
+        Ok(self
+            .db
+            .get_agent(id)?
+            .filter(|agent| agent.project_dir.as_deref() == Some(self.project_key.as_str())))
     }
 
     pub fn get_agent_log(
@@ -471,6 +480,8 @@ impl Orchestrator {
         limit: usize,
         filter: LogFilter,
     ) -> Result<Vec<LogEntry>> {
+        self.get_agent(agent_id)?
+            .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
         self.db.get_agent_log(agent_id, limit, filter)
     }
 
@@ -481,6 +492,8 @@ impl Orchestrator {
         filter: LogFilter,
         query: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
+        self.get_agent(agent_id)?
+            .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
         self.db.search_agent_log(agent_id, limit, filter, query)
     }
 
@@ -491,7 +504,6 @@ impl Orchestrator {
         query: Option<&str>,
     ) -> Result<AgentBrief> {
         let agent = self
-            .db
             .get_agent(agent_id)?
             .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
         let latest_handover = self.db.latest_handover(agent_id)?;
@@ -519,7 +531,7 @@ impl Orchestrator {
     }
 
     pub fn run_brief(&self, limit: usize, query: Option<&str>) -> Result<RunBrief> {
-        let mut agents = self.db.list_all_agents()?;
+        let mut agents = self.list_all_agents()?;
         agents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         let query_lower = query.map(str::to_lowercase);
@@ -567,9 +579,11 @@ impl Orchestrator {
         }
 
         Ok(RunBrief {
-            stats: self.db.stats()?,
+            stats: self.stats()?,
             agents: summaries,
-            recent_handovers: self.db.latest_handovers(limit)?,
+            recent_handovers: self
+                .db
+                .latest_handovers_for_project(&self.project_key, limit)?,
         })
     }
 
@@ -579,11 +593,12 @@ impl Orchestrator {
         agent_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EventRow>> {
-        self.db.list_events(since, agent_id, limit)
+        self.db
+            .list_events_for_project(&self.project_key, since, agent_id, limit)
     }
 
     pub fn stats(&self) -> Result<DbStats> {
-        self.db.stats()
+        self.db.stats_for_project(&self.project_key)
     }
 
     pub fn uptime_seconds(&self) -> u64 {
@@ -607,7 +622,7 @@ impl Orchestrator {
         perspective_id: &str,
         include_inactive: bool,
     ) -> Result<Vec<AgentView>> {
-        let all = self.db.list_all_agents()?;
+        let all = self.list_all_agents()?;
         let self_parent: Option<String> = all
             .iter()
             .find(|a| a.id == perspective_id)
@@ -821,7 +836,7 @@ impl Orchestrator {
     pub fn worktree_info(&self, agent_id: &str) -> Result<Option<WorktreeInfo>> {
         Self::validate_agent_id(agent_id)?;
 
-        if self.db.get_agent(agent_id)?.is_none() {
+        if self.get_agent(agent_id)?.is_none() {
             return Err(SwarmError::AgentNotFound(agent_id.to_string()));
         }
 
@@ -842,7 +857,7 @@ impl Orchestrator {
     }
 
     pub fn resume_existing_workers(&self) -> Result<usize> {
-        let agents = self.db.list_agents()?;
+        let agents = self.list_agents()?;
         let mut resumed = 0;
 
         for agent in agents {
@@ -881,6 +896,11 @@ impl Orchestrator {
         if !worktree_dir.exists() {
             return Ok(());
         }
+        if let Some(agent) = self.db.get_agent(agent_id)? {
+            if agent.project_dir.as_deref() != Some(self.project_key.as_str()) {
+                return Err(SwarmError::AgentNotFound(agent_id.to_string()));
+            }
+        }
 
         let output = std::process::Command::new("git")
             .args([
@@ -903,7 +923,6 @@ impl Orchestrator {
 
         if delete_branch {
             let branch_name = self
-                .db
                 .get_agent(agent_id)?
                 .and_then(|agent| agent.worktree_branch)
                 .unwrap_or_else(|| Self::worktree_branch_name(agent_id));
@@ -933,7 +952,13 @@ impl Orchestrator {
             SwarmEvent::AgentStatus { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentOutput { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentError { agent_id, .. } => Some(agent_id.clone()),
-            SwarmEvent::MessageRouted { .. } => None,
+            SwarmEvent::MessageRouted { from, to } => {
+                if to == "user" {
+                    Some(from.clone())
+                } else {
+                    Some(to.clone())
+                }
+            }
             SwarmEvent::UserNotification { from, .. } => Some(from.clone()),
         }
     }
@@ -1017,8 +1042,10 @@ impl Orchestrator {
 
         let db = self.db.clone();
         let to_id = to.to_string();
+        let project_key = self.project_key.clone();
         let agent = Self::blocking_db("get agent", move || db.get_agent(&to_id))
             .await?
+            .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
         if agent.comms == "parent-only" {
@@ -1093,8 +1120,10 @@ impl Orchestrator {
     pub async fn done_agent_with_report(&self, id: &str, report: DoneReport) -> Result<()> {
         let db = self.db.clone();
         let agent_id = id.to_string();
+        let project_key = self.project_key.clone();
         let agent = Self::blocking_db("get agent", move || db.get_agent(&agent_id))
             .await?
+            .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
 
         if !Self::active_status(&agent.status) {
@@ -1164,8 +1193,10 @@ impl Orchestrator {
     pub async fn kill_agent(&self, id: &str) -> Result<()> {
         let db = self.db.clone();
         let agent_id = id.to_string();
+        let project_key = self.project_key.clone();
         let agent = Self::blocking_db("get agent", move || db.get_agent(&agent_id))
             .await?
+            .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
         if !Self::active_status(&agent.status) {
             return Ok(());

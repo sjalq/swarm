@@ -22,6 +22,14 @@ fn newest_mtime(path: &Path) -> Option<SystemTime> {
     None
 }
 
+fn clear_dist() {
+    let dist = Path::new("frontend/dist");
+    if dist.exists() {
+        std::fs::remove_dir_all(dist).ok();
+    }
+    std::fs::create_dir_all(dist).ok();
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/style.css");
@@ -35,11 +43,16 @@ fn main() {
         let dist_mtime = std::fs::metadata(dist_index)
             .and_then(|m| m.modified())
             .ok();
-        let source_dirs = ["frontend/src", "frontend/style.css", "frontend/index.html", "frontend/Cargo.toml"];
+        let source_dirs = [
+            "frontend/src",
+            "frontend/style.css",
+            "frontend/index.html",
+            "frontend/Cargo.toml",
+        ];
         let any_newer = dist_mtime.is_some_and(|dist_t| {
-            source_dirs.iter().any(|src| {
-                newest_mtime(Path::new(src)).is_some_and(|src_t| src_t > dist_t)
-            })
+            source_dirs
+                .iter()
+                .any(|src| newest_mtime(Path::new(src)).is_some_and(|src_t| src_t > dist_t))
         });
         if !any_newer {
             return;
@@ -48,22 +61,26 @@ fn main() {
 
     if !Path::new("frontend/Cargo.toml").exists() {
         println!("cargo:warning=frontend/ directory not found; dashboard will not be embedded");
-        std::fs::create_dir_all("frontend/dist").ok();
+        clear_dist();
         return;
     }
 
-    let trunk = Command::new("trunk").arg("--version").output();
+    let trunk = Command::new("trunk")
+        .arg("--version")
+        .env_remove("NO_COLOR")
+        .output();
 
     match trunk {
         Ok(output) if output.status.success() => {
             let status = Command::new("trunk")
                 .args(["build", "--release"])
                 .current_dir("frontend")
+                .env_remove("NO_COLOR")
                 .status()
                 .expect("failed to run trunk build");
             if !status.success() {
-                println!("cargo:warning=trunk build failed; dashboard will not be embedded");
-                std::fs::create_dir_all("frontend/dist").ok();
+                clear_dist();
+                panic!("trunk build failed");
             }
         }
         _ => {
@@ -71,7 +88,7 @@ fn main() {
                 "cargo:warning=trunk not found; dashboard will not be embedded. \
                  Install with: cargo install trunk"
             );
-            std::fs::create_dir_all("frontend/dist").ok();
+            clear_dist();
         }
     }
 }

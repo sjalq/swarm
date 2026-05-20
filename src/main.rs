@@ -260,8 +260,7 @@ async fn main() {
                     .unwrap_or_else(|| "echo".into())
             });
 
-            let resolved_data_dir =
-                SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
+            let resolved_data_dir = SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
 
             if let Err(msg) = swarm::harness::preflight_check(&harness) {
                 eprintln!("{msg}");

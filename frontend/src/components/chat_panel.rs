@@ -1,6 +1,10 @@
 use crate::api;
 use crate::state::{format_timestamp, LogEntry};
 use leptos::prelude::*;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use wasm_bindgen_futures::spawn_local;
 
 #[component]
@@ -8,10 +12,11 @@ pub fn ChatPanel(agent_id: String) -> impl IntoView {
     let entries = RwSignal::new(Vec::<LogEntry>::new());
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
-    let cancelled = RwSignal::new(false);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_flag = cancelled.clone();
 
     on_cleanup(move || {
-        cancelled.set(true);
+        cancel_flag.store(true, Ordering::Relaxed);
     });
 
     let id = agent_id.clone();
@@ -30,7 +35,7 @@ pub fn ChatPanel(agent_id: String) -> impl IntoView {
     spawn_local(async move {
         loop {
             gloo_timers::future::TimeoutFuture::new(3_000).await;
-            if cancelled.get_untracked() {
+            if cancelled.load(Ordering::Relaxed) {
                 break;
             }
             if let Ok(log) = api::fetch_agent_log(&poll_id, 200).await {

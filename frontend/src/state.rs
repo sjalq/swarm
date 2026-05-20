@@ -11,19 +11,6 @@ pub enum RemoteData<T> {
     Failure(String),
 }
 
-impl<T> RemoteData<T> {
-    pub fn is_loading(&self) -> bool {
-        matches!(self, RemoteData::Loading)
-    }
-
-    pub fn as_success(&self) -> Option<&T> {
-        match self {
-            RemoteData::Success(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
 // ── WebSocket connection FSM ──
 
 #[derive(Clone, Debug, PartialEq)]

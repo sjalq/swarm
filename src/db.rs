@@ -186,6 +186,8 @@ impl Db {
                 ON agents(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_agents_parent_status
                 ON agents(parent_id, status);
+            CREATE INDEX IF NOT EXISTS idx_agents_project_status
+                ON agents(project_dir, status, created_at);
             UPDATE agents
                 SET status = 'done',
                     ended_at = COALESCE(
@@ -231,6 +233,15 @@ impl Db {
             worktree_branch: row.get(11)?,
             project_dir: row.get(12)?,
         })
+    }
+
+    pub fn assign_unscoped_agents_to_project(&self, project_dir: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let count = conn.execute(
+            "UPDATE agents SET project_dir = ?1 WHERE project_dir IS NULL",
+            [project_dir],
+        )?;
+        Ok(count)
     }
 
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
@@ -283,6 +294,18 @@ impl Db {
         Ok(agents)
     }
 
+    pub fn list_agents_for_project(&self, project_dir: &str) -> Result<Vec<AgentRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir
+             FROM agents WHERE status != 'done' AND project_dir = ?1 ORDER BY created_at",
+        )?;
+        let agents = stmt
+            .query_map([project_dir], Self::agent_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(agents)
+    }
+
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -291,6 +314,18 @@ impl Db {
         )?;
         let agents = stmt
             .query_map([], Self::agent_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(agents)
+    }
+
+    pub fn list_all_agents_for_project(&self, project_dir: &str) -> Result<Vec<AgentRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir
+             FROM agents WHERE project_dir = ?1 ORDER BY created_at",
+        )?;
+        let agents = stmt
+            .query_map([project_dir], Self::agent_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(agents)
     }
@@ -341,6 +376,76 @@ impl Db {
                 "SELECT id, event_type, agent_id, payload, created_at
                  FROM events ORDER BY created_at ASC LIMIT ?1",
                 vec![limit.to_string()],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let events = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    payload: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(events)
+    }
+
+    pub fn list_events_for_project(
+        &self,
+        project_dir: &str,
+        since: Option<&str>,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRow>> {
+        let conn = self.conn()?;
+        let (sql, params) = match (since, agent_id) {
+            (Some(since), Some(aid)) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events
+                 WHERE created_at >= ?1
+                   AND agent_id = ?2
+                   AND agent_id IN (SELECT id FROM agents WHERE project_dir = ?3)
+                 ORDER BY created_at ASC LIMIT ?4",
+                vec![
+                    since.to_string(),
+                    aid.to_string(),
+                    project_dir.to_string(),
+                    limit.to_string(),
+                ],
+            ),
+            (Some(since), None) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events
+                 WHERE created_at >= ?1
+                   AND agent_id IN (SELECT id FROM agents WHERE project_dir = ?2)
+                 ORDER BY created_at ASC LIMIT ?3",
+                vec![
+                    since.to_string(),
+                    project_dir.to_string(),
+                    limit.to_string(),
+                ],
+            ),
+            (None, Some(aid)) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events
+                 WHERE agent_id = ?1
+                   AND agent_id IN (SELECT id FROM agents WHERE project_dir = ?2)
+                 ORDER BY created_at ASC LIMIT ?3",
+                vec![aid.to_string(), project_dir.to_string(), limit.to_string()],
+            ),
+            (None, None) => (
+                "SELECT id, event_type, agent_id, payload, created_at
+                 FROM events
+                 WHERE agent_id IN (SELECT id FROM agents WHERE project_dir = ?1)
+                 ORDER BY created_at ASC LIMIT ?2",
+                vec![project_dir.to_string(), limit.to_string()],
             ),
         };
         let mut stmt = conn.prepare(sql)?;
@@ -535,6 +640,28 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn latest_handovers_for_project(
+        &self,
+        project_dir: &str,
+        limit: usize,
+    ) -> Result<Vec<HandoverRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT h.id, h.agent_id, h.summary, h.outcome, h.deliverable, h.checks, h.risk, h.next_action, h.created_at
+             FROM handovers h
+             INNER JOIN agents a ON a.id = h.agent_id
+             WHERE a.project_dir = ?1
+             ORDER BY h.created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![project_dir, limit],
+                Self::handover_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_agent_log(
         &self,
         agent_id: &str,
@@ -690,6 +817,47 @@ impl Db {
         let errors: i64 = conn.query_row(
             "SELECT COUNT(*) FROM output_log WHERE kind IN ('error', 'timeout')",
             [],
+            |row| row.get(0),
+        )?;
+
+        Ok(DbStats {
+            total: total as u64,
+            alive: alive as u64,
+            done: done as u64,
+            messages: messages as u64,
+            errors: errors as u64,
+        })
+    }
+
+    pub fn stats_for_project(&self, project_dir: &str) -> Result<DbStats> {
+        let conn = self.conn()?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE project_dir = ?1",
+            [project_dir],
+            |row| row.get(0),
+        )?;
+        let alive: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE project_dir = ?1 AND status != 'done'",
+            [project_dir],
+            |row| row.get(0),
+        )?;
+        let done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE project_dir = ?1 AND status = 'done'",
+            [project_dir],
+            |row| row.get(0),
+        )?;
+        let messages: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE from_agent IN (SELECT id FROM agents WHERE project_dir = ?1)
+                OR to_agent IN (SELECT id FROM agents WHERE project_dir = ?1)",
+            [project_dir],
+            |row| row.get(0),
+        )?;
+        let errors: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM output_log
+             WHERE kind IN ('error', 'timeout')
+               AND agent_id IN (SELECT id FROM agents WHERE project_dir = ?1)",
+            [project_dir],
             |row| row.get(0),
         )?;
 

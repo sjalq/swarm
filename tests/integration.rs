@@ -4,7 +4,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use swarm::db::{Db, LogFilter, MessageRow, OutputLogRow};
+use swarm::db::{AgentRow, Db, LogFilter, MessageRow, OutputLogRow};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
 use swarm::orchestrator::{DoneReport, Orchestrator, SwarmEvent};
@@ -185,6 +185,87 @@ async fn spawn_and_list_agents() {
 
     let agents = orch.list_agents().unwrap();
     assert_eq!(agents.len(), 2);
+}
+
+#[tokio::test]
+async fn global_data_dir_scopes_agents_to_current_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let project_a = dir.path().join("project-a");
+    let project_b = dir.path().join("project-b");
+    std::fs::create_dir_all(data_dir.join("agents")).unwrap();
+    std::fs::create_dir_all(&project_a).unwrap();
+    std::fs::create_dir_all(&project_b).unwrap();
+
+    let db = Arc::new(Db::open(&data_dir.join("swarm.db")).unwrap());
+    for (id, project_dir) in [("worker-a", &project_a), ("worker-b", &project_b)] {
+        db.insert_agent(&AgentRow {
+            id: id.into(),
+            role: "worker".into(),
+            harness: "echo".into(),
+            model: String::new(),
+            status: "idle".into(),
+            parent_id: None,
+            system_prompt: String::new(),
+            work_dir: data_dir
+                .join("agents")
+                .join(id)
+                .to_string_lossy()
+                .to_string(),
+            comms: "mesh".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: None,
+            worktree_branch: None,
+            project_dir: Some(project_dir.to_string_lossy().to_string()),
+        })
+        .unwrap();
+    }
+
+    db.enqueue_message(&MessageRow {
+        id: "message-a".into(),
+        from_agent: "user".into(),
+        to_agent: "worker-a".into(),
+        content: "project a".into(),
+        delivered: false,
+        created_at: "2026-01-01T00:00:01Z".into(),
+    })
+    .unwrap();
+    db.enqueue_message(&MessageRow {
+        id: "message-b".into(),
+        from_agent: "user".into(),
+        to_agent: "worker-b".into(),
+        content: "project b".into(),
+        delivered: false,
+        created_at: "2026-01-01T00:00:01Z".into(),
+    })
+    .unwrap();
+
+    let orch_a = Arc::new(Orchestrator::new(
+        db.clone(),
+        HarnessRegistry::new(),
+        "http://127.0.0.1:0".into(),
+        project_a.clone(),
+        data_dir.clone(),
+    ));
+    let orch_b = Arc::new(Orchestrator::new(
+        db,
+        HarnessRegistry::new(),
+        "http://127.0.0.1:0".into(),
+        project_b,
+        data_dir,
+    ));
+
+    assert_eq!(orch_a.list_agents().unwrap().len(), 1);
+    assert!(orch_a.get_agent("worker-a").unwrap().is_some());
+    assert!(orch_a.get_agent("worker-b").unwrap().is_none());
+    assert_eq!(orch_a.stats().unwrap().messages, 1);
+    assert_eq!(orch_a.resume_existing_workers().unwrap(), 1);
+
+    assert_eq!(orch_b.list_agents().unwrap().len(), 1);
+    assert!(orch_b.get_agent("worker-a").unwrap().is_none());
+    assert!(orch_b.get_agent("worker-b").unwrap().is_some());
+    assert_eq!(orch_b.stats().unwrap().messages, 1);
+    assert_eq!(orch_b.resume_existing_workers().unwrap(), 1);
 }
 
 #[tokio::test]

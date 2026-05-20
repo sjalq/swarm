@@ -208,13 +208,9 @@ pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) ->
     match dashboard_dir {
         Some(dir) if dir.exists() => {
             let index = dir.join("index.html");
-            api.fallback_service(
-                ServeDir::new(&dir).not_found_service(ServeFile::new(index)),
-            )
+            api.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(index)))
         }
-        _ if DashboardAssets::get("index.html").is_some() => {
-            api.fallback(serve_embedded)
-        }
+        _ if DashboardAssets::get("index.html").is_some() => api.fallback(serve_embedded),
         _ => api.fallback(not_found),
     }
 }
@@ -234,10 +230,7 @@ async fn serve_embedded(uri: axum::http::Uri) -> impl IntoResponse {
         }
         None => match DashboardAssets::get("index.html") {
             Some(content) => (
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/html".to_string(),
-                )],
+                [(axum::http::header::CONTENT_TYPE, "text/html".to_string())],
                 content.data.to_vec(),
             )
                 .into_response(),
