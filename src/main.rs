@@ -1,4 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use swarm::config::SwarmConfig;
@@ -56,6 +58,10 @@ enum Commands {
         /// Include dead agents
         #[arg(long)]
         all: bool,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Send a message to an agent
@@ -94,10 +100,18 @@ enum Commands {
     },
 
     /// List available models for each harness (offline catalog)
-    Models,
+    Models {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show own agent status
-    Status,
+    Status {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// View an agent's recent activity (messages and output)
     Log {
@@ -115,6 +129,14 @@ enum Commands {
         /// Show only harness output
         #[arg(long, conflicts_with = "messages")]
         output: bool,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum content characters to show in text output (0 disables truncation)
+        #[arg(long, default_value = "500")]
+        truncate: usize,
     },
 
     /// Clean up an agent's worktree and optionally its branch
@@ -194,8 +216,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Peers { all } => {
-            if let Err(e) = cmd_peers(all).await {
+        Commands::Peers { all, json } => {
+            if let Err(e) = cmd_peers(all, json).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -240,11 +262,14 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Models => {
-            cmd_models_offline();
+        Commands::Models { json } => {
+            if let Err(e) = cmd_models_offline(json) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
-        Commands::Status => {
-            if let Err(e) = cmd_status().await {
+        Commands::Status { json } => {
+            if let Err(e) = cmd_status(json).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -254,6 +279,8 @@ async fn main() {
             last,
             messages,
             output,
+            json,
+            truncate,
         } => {
             let filter = if messages {
                 "messages"
@@ -262,7 +289,7 @@ async fn main() {
             } else {
                 "all"
             };
-            if let Err(e) = cmd_log(&target, last, filter).await {
+            if let Err(e) = cmd_log(&target, last, filter, json, truncate).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -450,26 +477,58 @@ fn swarm_agent_id() -> Option<String> {
     std::env::var("SWARM_AGENT_ID").ok()
 }
 
-async fn cmd_peers(include_all: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn wants_json(explicit: bool) -> bool {
+    explicit || !std::io::stdout().is_terminal()
+}
+
+fn print_json<T: Serialize>(value: &T) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    serde_json::to_writer(std::io::stdout(), value)?;
+    println!();
+    Ok(())
+}
+
+async fn cmd_peers(
+    include_all: bool,
+    json: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let mut url = format!("{socket}/api/agents");
+    let mut params = Vec::new();
     if let Some(agent_id) = swarm_agent_id() {
-        url.push_str(&format!("?perspective={agent_id}"));
+        params.push(format!("perspective={agent_id}"));
+    }
+    if include_all {
+        params.push("all=true".to_string());
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
     }
 
     let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
+    let agents: Vec<serde_json::Value> = resp
+        .into_iter()
+        .filter(|agent| {
+            include_all
+                || match agent["status"].as_str() {
+                    Some("dead") => false,
+                    _ => true,
+                }
+        })
+        .collect();
 
-    if resp.is_empty() {
+    if wants_json(json) {
+        return print_json(&agents);
+    }
+
+    if agents.is_empty() {
         println!("no agents");
         return Ok(());
     }
 
     let has_perspective = swarm_agent_id().is_some();
-    for agent in &resp {
+    for agent in &agents {
         let status = agent["status"].as_str().unwrap_or("?");
-        if !include_all && status == "dead" {
-            continue;
-        }
         let id = agent["id"].as_str().unwrap_or("?");
         let harness = agent["harness"].as_str().unwrap_or("?");
         let role = agent["role"].as_str().unwrap_or("?");
@@ -555,13 +614,17 @@ async fn cmd_spawn(
     Ok(())
 }
 
-async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
     let resp: serde_json::Value = reqwest::get(format!("{socket}/api/agents/{agent_id}"))
         .await?
         .json()
         .await?;
+
+    if wants_json(json) {
+        return print_json(&resp);
+    }
 
     let model = resp["model"].as_str().unwrap_or("");
     let model_display = if model.is_empty() { "(default)" } else { model };
@@ -575,19 +638,60 @@ async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_models_offline() {
-    for kind in CliKind::all_kinds() {
-        let name = kind.default_binary();
-        let default = kind.default_model();
-        let models = kind.known_models();
+#[derive(Serialize)]
+struct ModelsCatalogEntry {
+    harness: String,
+    default_model: String,
+    models: Vec<String>,
+}
+
+fn models_catalog() -> Vec<ModelsCatalogEntry> {
+    CliKind::all_kinds()
+        .iter()
+        .map(|kind| ModelsCatalogEntry {
+            harness: kind.default_binary().to_string(),
+            default_model: kind.default_model().to_string(),
+            models: kind.known_models().iter().map(|m| m.to_string()).collect(),
+        })
+        .collect()
+}
+
+fn cmd_models_offline(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let catalog = models_catalog();
+    if wants_json(json) {
+        return print_json(&catalog);
+    }
+
+    for entry in &catalog {
+        let name = &entry.harness;
+        let default = &entry.default_model;
+        let models = &entry.models;
         println!("{}:", name);
         for m in models {
-            if *m == default {
+            if m == default {
                 println!("  {} (default)", m);
             } else {
                 println!("  {}", m);
             }
         }
+    }
+    Ok(())
+}
+
+fn truncate_for_display(content: &str, limit: usize) -> String {
+    if limit == 0 {
+        return content.to_string();
+    }
+
+    let mut indices = content.char_indices();
+    if let Some((byte_idx, _)) = indices.nth(limit) {
+        format!(
+            "{}... ({} chars total)",
+            &content[..byte_idx],
+            content.chars().count()
+        )
+    } else {
+        content.to_string()
     }
 }
 
@@ -595,6 +699,8 @@ async fn cmd_log(
     target: &str,
     limit: usize,
     filter: &str,
+    json: bool,
+    truncate: usize,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let mut url = format!("{socket}/api/agents/{target}/log?n={limit}");
@@ -602,6 +708,10 @@ async fn cmd_log(
         url.push_str(&format!("&type={filter}"));
     }
     let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
+
+    if wants_json(json) {
+        return print_json(&resp);
+    }
 
     if resp.is_empty() {
         println!("no log entries for {target}");
@@ -614,12 +724,7 @@ async fn cmd_log(
         let kind = entry["kind"].as_str().unwrap_or("?");
         let peer = entry["peer"].as_str().unwrap_or("");
         let content = entry["content"].as_str().unwrap_or("");
-
-        let display_content = if content.len() > 200 {
-            format!("{}... ({} chars total)", &content[..200], content.len())
-        } else {
-            content.to_string()
-        };
+        let display_content = truncate_for_display(content, truncate);
 
         match kind {
             "recv" => {
@@ -812,4 +917,30 @@ fn cmd_manpage() {
     let man = clap_mangen::Man::new(cmd);
     man.render(&mut std::io::stdout())
         .expect("failed to write manpage");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_for_display_uses_requested_limit() {
+        assert_eq!(
+            truncate_for_display("abcdefghijklmnopqrstuvwxyz", 5),
+            "abcde... (26 chars total)"
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_zero_disables_truncation() {
+        assert_eq!(
+            truncate_for_display("abcdefghijklmnopqrstuvwxyz", 0),
+            "abcdefghijklmnopqrstuvwxyz"
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_handles_char_boundaries() {
+        assert_eq!(truncate_for_display("éclair", 1), "é... (6 chars total)");
+    }
 }
