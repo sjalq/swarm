@@ -273,6 +273,7 @@ async fn kill_agent() {
     // But still fetchable directly
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
     assert_eq!(fetched.status, "done");
+    assert!(fetched.ended_at.is_some(), "kill should populate ended_at");
 }
 
 #[tokio::test]
@@ -1343,6 +1344,7 @@ async fn done_agent_without_parent_still_works() {
 
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
     assert_eq!(fetched.status, "done");
+    assert!(fetched.ended_at.is_some(), "done should populate ended_at");
 }
 
 #[tokio::test]
@@ -1369,7 +1371,12 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
     orch.done_agent(&agent.id, Some("first done"))
         .await
         .unwrap();
-    assert_eq!(orch.get_agent(&agent.id).unwrap().unwrap().status, "done");
+    let done_agent = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(done_agent.status, "done");
+    assert!(
+        done_agent.ended_at.is_some(),
+        "done should populate ended_at"
+    );
     assert_eq!(
         orch.get_agent(&child.id)
             .unwrap()
@@ -1388,6 +1395,11 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
 
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
     assert_ne!(fetched.status, "done");
+    assert_eq!(
+        fetched.ended_at.as_deref(),
+        None,
+        "resuming a done agent should clear ended_at"
+    );
     assert_eq!(fetched.parent_id.as_deref(), Some(parent.id.as_str()));
     assert_eq!(
         orch.get_agent(&child.id)
@@ -1542,6 +1554,16 @@ async fn worktree_creates_isolated_branch() {
     let agent = orch
         .spawn_agent_with_model("editor", "echo", None, "edit files", None, "mesh", true)
         .unwrap();
+    let branch_name = format!("swarm/{}", agent.id);
+    assert_eq!(agent.worktree_branch.as_deref(), Some(branch_name.as_str()));
+    assert_eq!(
+        orch.get_agent(&agent.id)
+            .unwrap()
+            .unwrap()
+            .worktree_branch
+            .as_deref(),
+        Some(branch_name.as_str())
+    );
 
     let worktree = orch.worktree_dir(&agent.id).unwrap();
     assert!(worktree.is_some(), "worktree dir should exist after spawn");
@@ -1559,7 +1581,7 @@ async fn worktree_creates_isolated_branch() {
         .unwrap();
     let branches = String::from_utf8_lossy(&output.stdout);
     assert!(
-        branches.contains(&format!("swarm/{}", agent.id)),
+        branches.contains(&branch_name),
         "branch swarm/{} should exist",
         agent.id
     );
@@ -1608,6 +1630,7 @@ async fn no_worktree_by_default() {
     let agent = orch
         .spawn_agent("reviewer", "echo", "review code", None, "mesh")
         .unwrap();
+    assert_eq!(agent.worktree_branch, None);
 
     let worktree = orch.worktree_dir(&agent.id).unwrap();
     assert!(

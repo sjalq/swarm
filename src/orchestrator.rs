@@ -196,16 +196,39 @@ impl Orchestrator {
         Ok(self.workers()?.contains_key(agent_id))
     }
 
-    fn log_result<T>(context: &str, result: Result<T>) {
-        if let Err(e) = result {
-            tracing::error!("{context}: {e}");
+    async fn blocking_db<T, F>(context: &'static str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| SwarmError::Internal(format!("{context} task failed: {e}")))?
+    }
+
+    async fn update_status_if_active_async(db: Arc<Db>, agent_id: String, status: String) {
+        if let Err(e) = Self::blocking_db("update agent status", move || {
+            db.update_agent_status_if_active(&agent_id, &status)
+        })
+        .await
+        {
+            tracing::error!("failed to update agent status: {e}");
         }
     }
 
-    fn update_status_if_active(db: &Db, agent_id: &str, status: &str) {
-        match db.update_agent_status_if_active(agent_id, status) {
-            Ok(_) => {}
-            Err(e) => tracing::error!("failed to update agent status: {e}"),
+    async fn update_status_async(db: Arc<Db>, agent_id: String, status: String) {
+        if let Err(e) = Self::blocking_db("update agent status", move || {
+            db.update_agent_status(&agent_id, &status)
+        })
+        .await
+        {
+            tracing::error!("failed to update agent status: {e}");
+        }
+    }
+
+    async fn insert_output_log_async(db: Arc<Db>, entry: OutputLogRow, context: &'static str) {
+        if let Err(e) = Self::blocking_db(context, move || db.insert_output_log(&entry)).await {
+            tracing::error!("{context}: {e}");
         }
     }
 
@@ -264,17 +287,23 @@ impl Orchestrator {
         Ok(true)
     }
 
-    fn reactivate_agent(&self, agent: &AgentRow) -> Result<()> {
+    async fn reactivate_agent_async(&self, agent: &AgentRow) -> Result<()> {
         if Self::active_status(&agent.status) {
             return Ok(());
         }
 
         self.start_worker_for_agent(agent, true)?;
-        self.db.update_agent_status(&agent.id, "idle")?;
-        self.emit_event(SwarmEvent::AgentStatus {
+        let db = self.db.clone();
+        let agent_id = agent.id.clone();
+        Self::blocking_db("reactivate agent", move || {
+            db.update_agent_status(&agent_id, "idle")
+        })
+        .await?;
+        self.emit_event_async(SwarmEvent::AgentStatus {
             agent_id: agent.id.clone(),
             status: "idle".to_string(),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -410,6 +439,7 @@ impl Orchestrator {
         Self::validate_agent_id(&id)?;
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
+        let worktree_branch = use_worktree.then(|| Self::worktree_branch_name(&id));
 
         if use_worktree {
             self.create_worktree(&id)?;
@@ -428,6 +458,8 @@ impl Orchestrator {
             work_dir: topic_dir.to_string_lossy().to_string(),
             comms: comms.to_string(),
             created_at: now,
+            ended_at: None,
+            worktree_branch,
         };
 
         if let Err(e) = self.db.insert_agent(&agent) {
@@ -478,11 +510,15 @@ impl Orchestrator {
         Ok(agent)
     }
 
+    fn worktree_branch_name(agent_id: &str) -> String {
+        format!("swarm/{agent_id}")
+    }
+
     fn create_worktree(&self, agent_id: &str) -> Result<PathBuf> {
         Self::validate_agent_id(agent_id)?;
 
         let worktree_dir = self.data_dir.join("worktrees").join(agent_id);
-        let branch_name = format!("swarm/{agent_id}");
+        let branch_name = Self::worktree_branch_name(agent_id);
 
         std::fs::create_dir_all(self.data_dir.join("worktrees"))?;
 
@@ -581,7 +617,11 @@ impl Orchestrator {
         }
 
         if delete_branch {
-            let branch_name = format!("swarm/{agent_id}");
+            let branch_name = self
+                .db
+                .get_agent(agent_id)?
+                .and_then(|agent| agent.worktree_branch)
+                .unwrap_or_else(|| Self::worktree_branch_name(agent_id));
             let output = std::process::Command::new("git")
                 .args(["branch", "-D", &branch_name])
                 .current_dir(&self.project_dir)
@@ -600,8 +640,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn emit_event(&self, event: SwarmEvent) {
-        let agent_id = match &event {
+    fn event_agent_id(event: &SwarmEvent) -> Option<String> {
+        match event {
             SwarmEvent::AgentSpawned { agent } => Some(agent.id.clone()),
             SwarmEvent::AgentDone { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentKilled { agent_id } => Some(agent_id.clone()),
@@ -609,8 +649,11 @@ impl Orchestrator {
             SwarmEvent::AgentOutput { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentError { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::MessageRouted { .. } => None,
-        };
-        let event_type = match &event {
+        }
+    }
+
+    fn event_type(event: &SwarmEvent) -> &'static str {
+        match event {
             SwarmEvent::AgentSpawned { .. } => "agent_spawned",
             SwarmEvent::AgentDone { .. } => "agent_done",
             SwarmEvent::AgentKilled { .. } => "agent_killed",
@@ -618,7 +661,12 @@ impl Orchestrator {
             SwarmEvent::AgentOutput { .. } => "agent_output",
             SwarmEvent::AgentError { .. } => "agent_error",
             SwarmEvent::MessageRouted { .. } => "message_routed",
-        };
+        }
+    }
+
+    fn emit_event(&self, event: SwarmEvent) {
+        let agent_id = Self::event_agent_id(&event);
+        let event_type = Self::event_type(&event);
         if let Ok(payload) = serde_json::to_string(&event) {
             if let Err(e) = self.db.insert_event(&EventRow {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -633,10 +681,32 @@ impl Orchestrator {
         let _ = self.event_tx.send(event);
     }
 
+    async fn emit_event_async(&self, event: SwarmEvent) {
+        let agent_id = Self::event_agent_id(&event);
+        let event_type = Self::event_type(&event);
+        if let Ok(payload) = serde_json::to_string(&event) {
+            let db = self.db.clone();
+            let event = EventRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: event_type.to_string(),
+                agent_id,
+                payload,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) =
+                Self::blocking_db("persist event", move || db.insert_event(&event)).await
+            {
+                tracing::error!("failed to persist event: {e}");
+            }
+        }
+        let _ = self.event_tx.send(event);
+    }
+
     pub async fn send_message(&self, from: &str, to: &str, content: &str) -> Result<MessageRow> {
-        let agent = self
-            .db
-            .get_agent(to)?
+        let db = self.db.clone();
+        let to_id = to.to_string();
+        let agent = Self::blocking_db("get agent", move || db.get_agent(&to_id))
+            .await?
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
         if agent.comms == "parent-only" {
@@ -657,7 +727,7 @@ impl Orchestrator {
         }
 
         if !Self::active_status(&agent.status) {
-            self.reactivate_agent(&agent)?;
+            self.reactivate_agent_async(&agent).await?;
         }
 
         if !self.has_worker(to)? {
@@ -675,25 +745,33 @@ impl Orchestrator {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        if !self.db.enqueue_message_for_active_agent(&msg)? {
+        let db = self.db.clone();
+        let msg_for_insert = msg.clone();
+        if !Self::blocking_db("enqueue message", move || {
+            db.enqueue_message_for_active_agent(&msg_for_insert)
+        })
+        .await?
+        {
             return Err(SwarmError::Internal(format!(
                 "agent {to} is not accepting messages"
             )));
         }
         self.notify_worker(to, WorkerCmd::NewMessage)?;
 
-        self.emit_event(SwarmEvent::MessageRouted {
+        self.emit_event_async(SwarmEvent::MessageRouted {
             from: from.to_string(),
             to: to.to_string(),
-        });
+        })
+        .await;
 
         Ok(msg)
     }
 
     pub async fn done_agent(&self, id: &str, message: Option<&str>) -> Result<()> {
-        let agent = self
-            .db
-            .get_agent(id)?
+        let db = self.db.clone();
+        let agent_id = id.to_string();
+        let agent = Self::blocking_db("get agent", move || db.get_agent(&agent_id))
+            .await?
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
 
         if !Self::active_status(&agent.status) {
@@ -710,18 +788,25 @@ impl Orchestrator {
                     delivered: false,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 };
-                self.db.enqueue_message(&msg)?;
+                let db = self.db.clone();
+                Self::blocking_db("enqueue done message", move || db.enqueue_message(&msg)).await?;
                 if let Err(e) = self.notify_worker(parent_id, WorkerCmd::NewMessage) {
                     tracing::error!("failed to notify parent agent {parent_id}: {e}");
                 }
-                self.emit_event(SwarmEvent::MessageRouted {
+                self.emit_event_async(SwarmEvent::MessageRouted {
                     from: id.to_string(),
                     to: parent_id.clone(),
-                });
+                })
+                .await;
             }
         }
 
-        self.db.update_agent_status(id, "done")?;
+        let db = self.db.clone();
+        let agent_id = id.to_string();
+        Self::blocking_db("mark agent done", move || {
+            db.update_agent_status(&agent_id, "done")
+        })
+        .await?;
 
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
@@ -729,23 +814,30 @@ impl Orchestrator {
                 tracing::debug!("agent worker already stopped: {id}");
             }
         }
-        self.emit_event(SwarmEvent::AgentDone {
+        self.emit_event_async(SwarmEvent::AgentDone {
             agent_id: id.to_string(),
             message: message.map(String::from),
-        });
+        })
+        .await;
         Ok(())
     }
 
     pub async fn kill_agent(&self, id: &str) -> Result<()> {
-        let agent = self
-            .db
-            .get_agent(id)?
+        let db = self.db.clone();
+        let agent_id = id.to_string();
+        let agent = Self::blocking_db("get agent", move || db.get_agent(&agent_id))
+            .await?
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
         if !Self::active_status(&agent.status) {
             return Ok(());
         }
 
-        self.db.update_agent_status(id, "done")?;
+        let db = self.db.clone();
+        let agent_id = id.to_string();
+        Self::blocking_db("mark agent killed", move || {
+            db.update_agent_status(&agent_id, "done")
+        })
+        .await?;
 
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
@@ -753,9 +845,10 @@ impl Orchestrator {
                 tracing::debug!("agent worker already stopped: {id}");
             }
         }
-        self.emit_event(SwarmEvent::AgentKilled {
+        self.emit_event_async(SwarmEvent::AgentKilled {
             agent_id: id.to_string(),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -766,14 +859,20 @@ impl Orchestrator {
         };
 
         for (agent_id, worker) in workers {
-            self.db.update_agent_status(&agent_id, "done")?;
+            let db = self.db.clone();
+            let status_agent_id = agent_id.clone();
+            Self::blocking_db("mark agent done", move || {
+                db.update_agent_status(&status_agent_id, "done")
+            })
+            .await?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
                 tracing::debug!("agent worker already stopped: {agent_id}");
             }
-            self.emit_event(SwarmEvent::AgentDone {
+            self.emit_event_async(SwarmEvent::AgentDone {
                 agent_id,
                 message: None,
-            });
+            })
+            .await;
         }
 
         Ok(())
@@ -813,8 +912,21 @@ impl Orchestrator {
             has_pending = false;
 
             let mut messages = Vec::new();
-            while let Ok(Some(msg)) = db.dequeue_message(&agent_id) {
-                messages.push(msg);
+            loop {
+                let dequeue_db = db.clone();
+                let dequeue_agent_id = agent_id.clone();
+                match Self::blocking_db("dequeue message", move || {
+                    dequeue_db.dequeue_message(&dequeue_agent_id)
+                })
+                .await
+                {
+                    Ok(Some(msg)) => messages.push(msg),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("failed to dequeue message: {e}");
+                        break;
+                    }
+                }
             }
             if messages.is_empty() {
                 continue;
@@ -829,7 +941,12 @@ impl Orchestrator {
                 }
             }
 
-            Self::update_status_if_active(&db, &agent_id, "working");
+            Self::update_status_if_active_async(
+                db.clone(),
+                agent_id.clone(),
+                "working".to_string(),
+            )
+            .await;
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
                 status: "working".to_string(),
@@ -888,6 +1005,7 @@ impl Orchestrator {
             let mut had_error = false;
             let mut accumulated_output = String::new();
             let mut interrupted = false;
+            let run_started = tokio::time::Instant::now();
 
             loop {
                 tokio::select! {
@@ -909,13 +1027,13 @@ impl Orchestrator {
                                         text: text.clone(),
                                     });
                                 }
-                                Self::log_result("failed to persist output log", db.insert_output_log(&OutputLogRow {
+                                Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     agent_id: agent_id.clone(),
                                     content: text,
                                     kind: "output".to_string(),
                                     created_at: chrono::Utc::now().to_rfc3339(),
-                                }));
+                                }, "failed to persist output log").await;
                             }
                             Some(HarnessOutput::Error(err)) => {
                                 had_error = true;
@@ -923,13 +1041,13 @@ impl Orchestrator {
                                     agent_id: agent_id.clone(),
                                     error: err.clone(),
                                 });
-                                Self::log_result("failed to persist error log", db.insert_output_log(&OutputLogRow {
+                                Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     agent_id: agent_id.clone(),
                                     content: err,
                                     kind: "error".to_string(),
                                     created_at: chrono::Utc::now().to_rfc3339(),
-                                }));
+                                }, "failed to persist error log").await;
                             }
                             Some(HarnessOutput::Timeout(partial)) => {
                                 had_error = true;
@@ -940,13 +1058,13 @@ impl Orchestrator {
                                         partial.len()
                                     ),
                                 });
-                                Self::log_result("failed to persist timeout log", db.insert_output_log(&OutputLogRow {
+                                Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     agent_id: agent_id.clone(),
                                     content: partial,
                                     kind: "timeout".to_string(),
                                     created_at: chrono::Utc::now().to_rfc3339(),
-                                }));
+                                }, "failed to persist timeout log").await;
                             }
                             None => break,
                         }
@@ -954,6 +1072,12 @@ impl Orchestrator {
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(WorkerCmd::NewMessage) => {
+                                // Async DB boundaries can yield between quick sends; give those
+                                // follow-up notifications a moment to batch instead of aborting.
+                                if run_started.elapsed() < std::time::Duration::from_millis(25) {
+                                    has_pending = true;
+                                    continue;
+                                }
                                 tracing::info!("agent {} interrupted by new message", agent_id);
                                 harness_handle.abort();
                                 interrupted = true;
@@ -966,10 +1090,12 @@ impl Orchestrator {
                             }
                             None => {
                                 harness_handle.abort();
-                                Self::log_result(
-                                    "failed to mark agent done",
-                                    db.update_agent_status(&agent_id, "done"),
-                                );
+                                Self::update_status_async(
+                                    db.clone(),
+                                    agent_id.clone(),
+                                    "done".to_string(),
+                                )
+                                .await;
                                 return;
                             }
                         }
@@ -979,38 +1105,48 @@ impl Orchestrator {
 
             if interrupted {
                 if !accumulated_output.is_empty() {
-                    Self::log_result(
-                        "failed to persist interrupted log",
-                        db.insert_output_log(&OutputLogRow {
+                    Self::insert_output_log_async(
+                        db.clone(),
+                        OutputLogRow {
                             id: uuid::Uuid::new_v4().to_string(),
                             agent_id: agent_id.clone(),
                             content: accumulated_output,
                             kind: "interrupted".to_string(),
                             created_at: chrono::Utc::now().to_rfc3339(),
-                        }),
-                    );
+                        },
+                        "failed to persist interrupted log",
+                    )
+                    .await;
                 }
                 was_interrupted = true;
                 continue;
             }
 
             let next_status = if had_error { "error" } else { "idle" };
-            Self::update_status_if_active(&db, &agent_id, next_status);
+            Self::update_status_if_active_async(
+                db.clone(),
+                agent_id.clone(),
+                next_status.to_string(),
+            )
+            .await;
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
                 status: next_status.to_string(),
             });
 
-            match db.has_pending_messages(&agent_id) {
+            let pending_db = db.clone();
+            let pending_agent_id = agent_id.clone();
+            match Self::blocking_db("check pending messages", move || {
+                pending_db.has_pending_messages(&pending_agent_id)
+            })
+            .await
+            {
                 Ok(true) => has_pending = true,
                 Ok(false) => {}
                 Err(e) => tracing::error!("failed to check pending messages: {e}"),
             }
         }
 
-        Self::log_result(
-            "failed to mark agent done",
-            db.update_agent_status(&agent_id, "done"),
-        );
+        Self::update_status_async(db.clone(), agent_id.clone(), "done".to_string()).await;
     }
 }
