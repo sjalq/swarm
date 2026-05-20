@@ -173,6 +173,13 @@ impl Orchestrator {
         }
     }
 
+    fn update_status_if_active(db: &Db, agent_id: &str, status: &str) {
+        match db.update_agent_status_if_active(agent_id, status) {
+            Ok(_) => {}
+            Err(e) => tracing::error!("failed to update agent status: {e}"),
+        }
+    }
+
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
         self.db.list_agents()
     }
@@ -599,7 +606,11 @@ impl Orchestrator {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        self.db.enqueue_message(&msg)?;
+        if !self.db.enqueue_message_for_active_agent(&msg)? {
+            return Err(SwarmError::Internal(format!(
+                "agent {to} is not accepting messages"
+            )));
+        }
         self.notify_worker(to, WorkerCmd::NewMessage)?;
 
         self.emit_event(SwarmEvent::MessageRouted {
@@ -638,6 +649,7 @@ impl Orchestrator {
         }
 
         self.db.reparent_children(id, agent.parent_id.as_deref())?;
+        self.db.update_agent_status(id, "done")?;
 
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
@@ -645,7 +657,6 @@ impl Orchestrator {
                 tracing::debug!("agent worker already stopped: {id}");
             }
         }
-        self.db.update_agent_status(id, "done")?;
         self.emit_event(SwarmEvent::AgentDone {
             agent_id: id.to_string(),
             message: message.map(String::from),
@@ -660,6 +671,7 @@ impl Orchestrator {
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
         let new_parent = agent.parent_id;
         self.db.reparent_children(id, new_parent.as_deref())?;
+        self.db.update_agent_status(id, "dead")?;
 
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
@@ -667,7 +679,6 @@ impl Orchestrator {
                 tracing::debug!("agent worker already stopped: {id}");
             }
         }
-        self.db.update_agent_status(id, "dead")?;
         self.emit_event(SwarmEvent::AgentKilled {
             agent_id: id.to_string(),
         });
@@ -681,10 +692,10 @@ impl Orchestrator {
         };
 
         for (agent_id, worker) in workers {
+            self.db.update_agent_status(&agent_id, "dead")?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
                 tracing::debug!("agent worker already stopped: {agent_id}");
             }
-            self.db.update_agent_status(&agent_id, "dead")?;
             self.emit_event(SwarmEvent::AgentKilled { agent_id });
         }
 
@@ -740,10 +751,7 @@ impl Orchestrator {
                 }
             }
 
-            Self::log_result(
-                "failed to mark agent working",
-                db.update_agent_status(&agent_id, "working"),
-            );
+            Self::update_status_if_active(&db, &agent_id, "working");
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
                 status: "working".to_string(),
@@ -909,10 +917,7 @@ impl Orchestrator {
             }
 
             let next_status = if had_error { "error" } else { "idle" };
-            Self::log_result(
-                "failed to update agent status",
-                db.update_agent_status(&agent_id, next_status),
-            );
+            Self::update_status_if_active(&db, &agent_id, next_status);
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
                 status: next_status.to_string(),

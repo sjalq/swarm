@@ -317,6 +317,15 @@ impl Db {
         Ok(())
     }
 
+    pub fn update_agent_status_if_active(&self, id: &str, status: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let updated = conn.execute(
+            "UPDATE agents SET status = ?1 WHERE id = ?2 AND status NOT IN ('dead', 'done')",
+            rusqlite::params![status, id],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn delete_agent(&self, id: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;
@@ -338,6 +347,38 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn enqueue_message_for_active_agent(&self, msg: &MessageRow) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let is_active: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM agents
+                WHERE id = ?1 AND status NOT IN ('dead', 'done')
+            )",
+            [&msg.to_agent],
+            |row| row.get(0),
+        )?;
+
+        if !is_active {
+            return Ok(false);
+        }
+
+        tx.execute(
+            "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                msg.id,
+                msg.from_agent,
+                msg.to_agent,
+                msg.content,
+                msg.delivered as i32,
+                msg.created_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn insert_output_log(&self, entry: &OutputLogRow) -> Result<()> {
@@ -664,5 +705,39 @@ mod tests {
         db.insert_agent(&agent).unwrap();
         assert!(db.list_agents().unwrap().is_empty());
         assert!(db.get_agent("done-agent").unwrap().is_some());
+    }
+
+    #[test]
+    fn terminal_agents_reject_atomic_status_and_message_updates() {
+        let db = test_db();
+        let agent = AgentRow {
+            id: "done-agent".into(),
+            role: "finished".into(),
+            harness: "echo".into(),
+            model: String::new(),
+            status: "done".into(),
+            parent_id: None,
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            comms: "mesh".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        db.insert_agent(&agent).unwrap();
+
+        assert!(!db
+            .update_agent_status_if_active("done-agent", "idle")
+            .unwrap());
+        assert_eq!(db.get_agent("done-agent").unwrap().unwrap().status, "done");
+
+        let msg = MessageRow {
+            id: "msg-terminal".into(),
+            from_agent: "user".into(),
+            to_agent: "done-agent".into(),
+            content: "hello?".into(),
+            delivered: false,
+            created_at: "2026-01-01T00:00:01Z".into(),
+        };
+        assert!(!db.enqueue_message_for_active_agent(&msg).unwrap());
+        assert!(!db.has_pending_messages("done-agent").unwrap());
     }
 }
