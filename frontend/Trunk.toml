@@ -1,0 +1,15 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "index.html", "style.css"]
+
+[[proxy]]
+backend = "http://127.0.0.1:9800/api"
+rewrite = "/api"
+
+[[proxy]]
+backend = "ws://127.0.0.1:9800/ws"
+rewrite = "/ws"
+ws = true

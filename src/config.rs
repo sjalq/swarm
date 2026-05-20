@@ -7,6 +7,7 @@ pub struct SwarmConfig {
     pub default_port: Option<u16>,
     pub default_model: Option<String>,
     pub default_comms: Option<String>,
+    pub data_dir: Option<String>,
     pub claude_bin: Option<String>,
     pub codex_bin: Option<String>,
     pub gemini_bin: Option<String>,
@@ -18,6 +19,70 @@ impl SwarmConfig {
         let global = Self::load_global();
         let project = project_dir.and_then(Self::load_project);
         Self::merge(global, project)
+    }
+
+    pub fn default_data_dir() -> PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("swarm")
+    }
+
+    fn breadcrumb_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("swarm").join("active-data-dir"))
+    }
+
+    pub fn write_breadcrumb(data_dir: &Path) {
+        if let Some(path) = Self::breadcrumb_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, data_dir.to_string_lossy().as_bytes());
+        }
+    }
+
+    pub fn read_breadcrumb() -> Option<PathBuf> {
+        let path = Self::breadcrumb_path()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        let p = PathBuf::from(content.trim());
+        p.exists().then_some(p)
+    }
+
+    pub fn resolve_data_dir(
+        cli_override: Option<&Path>,
+        config: &SwarmConfig,
+    ) -> PathBuf {
+        if let Some(dir) = cli_override {
+            return dir.to_path_buf();
+        }
+        if let Some(ref dir) = config.data_dir {
+            return PathBuf::from(dir);
+        }
+        if let Some(dir) = Self::query_running_server() {
+            return dir;
+        }
+        if let Some(dir) = Self::read_breadcrumb() {
+            return dir;
+        }
+        Self::default_data_dir()
+    }
+
+    fn query_running_server() -> Option<PathBuf> {
+        let socket =
+            std::env::var("SWARM_SOCKET").unwrap_or_else(|_| "http://127.0.0.1:9800".into());
+        let url = format!("{}/api/health", socket);
+        let resp = std::process::Command::new("curl")
+            .args(["-sf", "--max-time", "1", &url])
+            .output()
+            .ok()?;
+        if !resp.status.success() {
+            return None;
+        }
+        let body = String::from_utf8_lossy(&resp.stdout);
+        let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+        value
+            .get("data_dir")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
     }
 
     fn global_path() -> Option<PathBuf> {
@@ -50,6 +115,7 @@ impl SwarmConfig {
             default_port: over.default_port.or(base.default_port),
             default_model: over.default_model.or(base.default_model),
             default_comms: over.default_comms.or(base.default_comms),
+            data_dir: over.data_dir.or(base.data_dir),
             claude_bin: over.claude_bin.or(base.claude_bin),
             codex_bin: over.codex_bin.or(base.codex_bin),
             gemini_bin: over.gemini_bin.or(base.gemini_bin),

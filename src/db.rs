@@ -18,6 +18,7 @@ pub struct AgentRow {
     pub created_at: String,
     pub ended_at: Option<String>,
     pub worktree_branch: Option<String>,
+    pub project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +147,7 @@ impl Db {
         )?;
         Self::ensure_agents_column(&conn, "ended_at", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "worktree_branch", "TEXT NULL")?;
+        Self::ensure_agents_column(&conn, "project_dir", "TEXT NULL")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_agents_status
                 ON agents(status, created_at);
@@ -194,14 +196,15 @@ impl Db {
             created_at: row.get(9)?,
             ended_at: row.get(10)?,
             worktree_branch: row.get(11)?,
+            project_dir: row.get(12)?,
         })
     }
 
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 agent.id,
                 agent.role,
@@ -215,6 +218,7 @@ impl Db {
                 agent.created_at,
                 agent.ended_at,
                 agent.worktree_branch,
+                agent.project_dir,
             ],
         )?;
         Ok(())
@@ -223,7 +227,7 @@ impl Db {
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir
              FROM agents WHERE id = ?1",
         )?;
         let result = stmt.query_row([id], Self::agent_from_row);
@@ -237,7 +241,7 @@ impl Db {
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir
              FROM agents WHERE status != 'done' ORDER BY created_at",
         )?;
         let agents = stmt
@@ -249,7 +253,7 @@ impl Db {
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir
              FROM agents ORDER BY created_at",
         )?;
         let agents = stmt
@@ -623,6 +627,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
             worktree_branch: None,
+            project_dir: None,
         }
     }
 

@@ -51,6 +51,14 @@ enum Commands {
         /// Skip automatic .gitignore update
         #[arg(long)]
         no_gitignore: bool,
+
+        /// Override data directory (default: platform data dir)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Path to the dashboard frontend dist directory (dev override)
+        #[arg(long)]
+        dashboard: Option<PathBuf>,
     },
 
     /// List all agents in the swarm
@@ -194,6 +202,8 @@ async fn main() {
             prompt,
             role,
             no_gitignore,
+            data_dir,
+            dashboard,
         } => {
             let config = SwarmConfig::load(Some(&project_dir));
             let port = port.unwrap_or_else(|| config.default_port.unwrap_or(9800));
@@ -204,13 +214,25 @@ async fn main() {
                     .unwrap_or_else(|| "echo".into())
             });
 
+            let resolved_data_dir =
+                SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
+
             if let Err(msg) = swarm::harness::preflight_check(&harness) {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
 
-            if let Err(e) =
-                run_orchestrator(project_dir, port, harness, prompt, role, no_gitignore).await
+            if let Err(e) = run_orchestrator(
+                project_dir,
+                resolved_data_dir,
+                port,
+                harness,
+                prompt,
+                role,
+                no_gitignore,
+                dashboard,
+            )
+            .await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -329,11 +351,13 @@ async fn main() {
 
 async fn run_orchestrator(
     project_dir: PathBuf,
+    data_dir: PathBuf,
     port: u16,
     harness: String,
     prompt: String,
     role: String,
     no_gitignore: bool,
+    dashboard: Option<PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -343,9 +367,12 @@ async fn run_orchestrator(
         .init();
 
     let project_dir = std::fs::canonicalize(&project_dir)?;
-    let data_dir = project_dir.join(".swarm");
     std::fs::create_dir_all(&data_dir)?;
-    std::fs::create_dir_all(data_dir.join("agents"))?;
+    let agents_dir = project_dir.join(".swarm").join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+
+    SwarmConfig::write_breadcrumb(&data_dir);
+    tracing::info!("data directory: {}", data_dir.display());
 
     if !no_gitignore {
         let gitignore = project_dir.join(".gitignore");
@@ -397,7 +424,7 @@ async fn run_orchestrator(
     }
 
     // Start HTTP server
-    let router = swarm::server::router(orch.clone());
+    let router = swarm::server::router_with_dashboard(orch.clone(), dashboard);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 

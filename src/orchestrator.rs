@@ -385,6 +385,14 @@ impl Orchestrator {
         self.start_time.elapsed().as_secs()
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
     pub fn list_agents_with_perspective(&self, perspective_id: &str) -> Result<Vec<AgentView>> {
         self.list_agents_with_perspective_all(perspective_id, false)
     }
@@ -508,6 +516,7 @@ impl Orchestrator {
             created_at: now,
             ended_at: None,
             worktree_branch,
+            project_dir: Some(self.project_dir.to_string_lossy().to_string()),
         };
 
         if let Err(e) = self.db.insert_agent(&agent) {
