@@ -151,6 +151,33 @@ impl Orchestrator {
         !matches!(status, "dead" | "done")
     }
 
+    fn validate_identifier(kind: &str, value: &str) -> Result<()> {
+        if value.is_empty() {
+            return Err(SwarmError::InvalidInput(format!(
+                "{kind} must not be empty"
+            )));
+        }
+
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(SwarmError::InvalidInput(format!(
+                "{kind} contains invalid characters; allowed characters are [a-zA-Z0-9_-]"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_role(role: &str) -> Result<()> {
+        Self::validate_identifier("role", role)
+    }
+
+    fn validate_agent_id(agent_id: &str) -> Result<()> {
+        Self::validate_identifier("agent_id", agent_id)
+    }
+
     fn notify_worker(&self, agent_id: &str, cmd: WorkerCmd) -> Result<bool> {
         let workers = self.workers()?;
         if let Some(worker) = workers.get(agent_id) {
@@ -287,6 +314,8 @@ impl Orchestrator {
         comms: &str,
         use_worktree: bool,
     ) -> Result<AgentRow> {
+        Self::validate_role(role)?;
+
         let harness = self
             .registry
             .get(harness_name)
@@ -295,6 +324,7 @@ impl Orchestrator {
         let uuid = uuid::Uuid::new_v4().to_string();
         let short_id = &uuid[..8];
         let id = format!("{role}-{short_id}");
+        Self::validate_agent_id(&id)?;
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
 
@@ -384,6 +414,8 @@ impl Orchestrator {
     }
 
     fn create_worktree(&self, agent_id: &str) -> Result<PathBuf> {
+        Self::validate_agent_id(agent_id)?;
+
         let worktree_dir = self.data_dir.join("worktrees").join(agent_id);
         let branch_name = format!("swarm/{agent_id}");
 
@@ -412,12 +444,14 @@ impl Orchestrator {
         Ok(worktree_dir)
     }
 
-    pub fn worktree_dir(&self, agent_id: &str) -> Option<PathBuf> {
+    pub fn worktree_dir(&self, agent_id: &str) -> Result<Option<PathBuf>> {
+        Self::validate_agent_id(agent_id)?;
+
         let dir = self.data_dir.join("worktrees").join(agent_id);
         if dir.exists() {
-            Some(dir)
+            Ok(Some(dir))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -442,7 +476,7 @@ impl Orchestrator {
 
             let topic_dir = PathBuf::from(&agent.work_dir);
             let agent_project_dir = self
-                .worktree_dir(&agent.id)
+                .worktree_dir(&agent.id)?
                 .unwrap_or_else(|| self.project_dir.clone());
             let model = if agent.model.is_empty() {
                 None
@@ -484,6 +518,8 @@ impl Orchestrator {
     }
 
     pub fn cleanup_agent(&self, agent_id: &str, delete_branch: bool) -> Result<()> {
+        Self::validate_agent_id(agent_id)?;
+
         let worktree_dir = self.data_dir.join("worktrees").join(agent_id);
         if !worktree_dir.exists() {
             return Ok(());

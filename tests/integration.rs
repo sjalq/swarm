@@ -434,6 +434,29 @@ async fn unknown_harness_rejected() {
 }
 
 #[tokio::test]
+async fn spawn_rejects_unsafe_roles() {
+    let (dir, orch) = setup();
+
+    for role in ["../../../etc/passwd", "foo;rm -rf /", ""] {
+        let err = orch
+            .spawn_agent(role, "echo", "", None, "mesh")
+            .expect_err("unsafe role should be rejected");
+        assert!(
+            err.to_string().contains("invalid input: role"),
+            "unexpected error for role {role:?}: {err}"
+        );
+    }
+
+    assert!(
+        std::fs::read_dir(dir.path().join("agents"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "invalid roles should not create agent topic dirs"
+    );
+}
+
+#[tokio::test]
 async fn echo_agent_log_captures_messages_and_output() {
     let (_dir, orch) = setup();
 
@@ -1188,7 +1211,7 @@ async fn worktree_creates_isolated_branch() {
         .spawn_agent_with_model("editor", "echo", None, "edit files", None, "mesh", true)
         .unwrap();
 
-    let worktree = orch.worktree_dir(&agent.id);
+    let worktree = orch.worktree_dir(&agent.id).unwrap();
     assert!(worktree.is_some(), "worktree dir should exist after spawn");
     let wt = worktree.unwrap();
     assert!(
@@ -1218,7 +1241,7 @@ async fn no_worktree_by_default() {
         .spawn_agent("reviewer", "echo", "review code", None, "mesh")
         .unwrap();
 
-    let worktree = orch.worktree_dir(&agent.id);
+    let worktree = orch.worktree_dir(&agent.id).unwrap();
     assert!(
         worktree.is_none(),
         "no worktree should exist for default spawn"
@@ -1233,13 +1256,36 @@ async fn cleanup_removes_worktree() {
         .spawn_agent_with_model("cleaner", "echo", None, "edit", None, "mesh", true)
         .unwrap();
 
-    assert!(orch.worktree_dir(&agent.id).is_some());
+    assert!(orch.worktree_dir(&agent.id).unwrap().is_some());
 
     orch.cleanup_agent(&agent.id, false).unwrap();
     assert!(
-        orch.worktree_dir(&agent.id).is_none(),
+        orch.worktree_dir(&agent.id).unwrap().is_none(),
         "worktree should be gone after cleanup"
     );
+}
+
+#[tokio::test]
+async fn cleanup_and_worktree_lookup_reject_unsafe_agent_ids() {
+    let (_dir, orch) = setup();
+
+    for agent_id in ["../../../etc/passwd", "foo;rm -rf /", ""] {
+        let err = orch
+            .cleanup_agent(agent_id, false)
+            .expect_err("unsafe agent_id should be rejected by cleanup");
+        assert!(
+            err.to_string().contains("invalid input: agent_id"),
+            "unexpected cleanup error for agent_id {agent_id:?}: {err}"
+        );
+
+        let err = orch
+            .worktree_dir(agent_id)
+            .expect_err("unsafe agent_id should be rejected by worktree lookup");
+        assert!(
+            err.to_string().contains("invalid input: agent_id"),
+            "unexpected worktree lookup error for agent_id {agent_id:?}: {err}"
+        );
+    }
 }
 
 #[tokio::test]
