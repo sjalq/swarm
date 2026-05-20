@@ -457,7 +457,11 @@ async fn cmd_peers(include_all: bool) -> std::result::Result<(), Box<dyn std::er
         url.push_str(&format!("?perspective={agent_id}"));
     }
 
-    let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
+    let resp = reqwest::get(&url).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let resp: Vec<serde_json::Value> = resp.json().await?;
 
     if resp.is_empty() {
         println!("no agents");
@@ -513,8 +517,7 @@ async fn cmd_send(
     if resp.status().is_success() {
         println!("sent to {target}");
     } else {
-        let body = resp.text().await?;
-        eprintln!("failed: {body}");
+        return Err(response_error(resp).await);
     }
     Ok(())
 }
@@ -549,8 +552,7 @@ async fn cmd_spawn(
         let id = agent["id"].as_str().unwrap_or("?");
         println!("{id}");
     } else {
-        let body = resp.text().await?;
-        eprintln!("failed: {body}");
+        return Err(response_error(resp).await);
     }
     Ok(())
 }
@@ -558,10 +560,11 @@ async fn cmd_spawn(
 async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
-    let resp: serde_json::Value = reqwest::get(format!("{socket}/api/agents/{agent_id}"))
-        .await?
-        .json()
-        .await?;
+    let resp = reqwest::get(format!("{socket}/api/agents/{agent_id}")).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let resp: serde_json::Value = resp.json().await?;
 
     let model = resp["model"].as_str().unwrap_or("");
     let model_display = if model.is_empty() { "(default)" } else { model };
@@ -601,7 +604,11 @@ async fn cmd_log(
     if filter != "all" {
         url.push_str(&format!("&type={filter}"));
     }
-    let resp: Vec<serde_json::Value> = reqwest::get(&url).await?.json().await?;
+    let resp = reqwest::get(&url).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let resp: Vec<serde_json::Value> = resp.json().await?;
 
     if resp.is_empty() {
         println!("no log entries for {target}");
@@ -652,8 +659,7 @@ async fn cmd_cleanup(
     if resp.status().is_success() {
         println!("cleaned up {target}");
     } else {
-        let body = resp.text().await?;
-        eprintln!("failed: {body}");
+        return Err(response_error(resp).await);
     }
     Ok(())
 }
@@ -673,8 +679,7 @@ async fn cmd_done(message: Option<&str>) -> std::result::Result<(), Box<dyn std:
     if resp.status().is_success() {
         println!("done");
     } else {
-        let body = resp.text().await?;
-        eprintln!("failed: {body}");
+        return Err(response_error(resp).await);
     }
     Ok(())
 }
@@ -690,10 +695,31 @@ async fn cmd_kill(target: &str) -> std::result::Result<(), Box<dyn std::error::E
     if resp.status().is_success() {
         println!("killed {target}");
     } else {
-        let body = resp.text().await?;
-        eprintln!("failed: {body}");
+        return Err(response_error(resp).await);
     }
     Ok(())
+}
+
+async fn response_error(resp: reqwest::Response) -> Box<dyn std::error::Error> {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = if body.trim().is_empty() {
+        status.to_string()
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+        let mut detail = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or(body.trim())
+            .to_string();
+        if let Some(hint) = value.get("hint").and_then(|v| v.as_str()) {
+            detail.push_str("; hint: ");
+            detail.push_str(hint);
+        }
+        detail
+    } else {
+        body
+    };
+    format!("request failed ({status}): {detail}").into()
 }
 
 fn cmd_doctor() {

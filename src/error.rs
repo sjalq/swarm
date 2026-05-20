@@ -6,6 +6,8 @@ pub enum SwarmError {
     Process(String),
     Io(std::io::Error),
     AgentNotFound(String),
+    AgentInactive { id: String, status: String },
+    InvalidRequest(String),
     Timeout(String),
     Internal(String),
 }
@@ -17,6 +19,13 @@ impl fmt::Display for SwarmError {
             Self::Process(msg) => write!(f, "process error: {msg}"),
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::AgentNotFound(id) => write!(f, "agent not found: {id}"),
+            Self::AgentInactive { id, status } => {
+                write!(
+                    f,
+                    "agent {id} is not accepting messages; status is {status}"
+                )
+            }
+            Self::InvalidRequest(msg) => write!(f, "{msg}"),
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }

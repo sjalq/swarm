@@ -1,15 +1,18 @@
 use crate::db::LogFilter;
+use crate::error::SwarmError;
 use crate::harness::CliKind;
 use crate::orchestrator::Orchestrator;
 use axum::extract::ws;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 type AppState = Arc<Orchestrator>;
+const PEERS_HINT: &str = "run swarm peers to list agents";
 
 #[derive(Deserialize)]
 pub struct SpawnRequest {
@@ -83,6 +86,53 @@ struct ModelsResponse {
     models: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+fn json_error(status: StatusCode, error: impl Into<String>, hint: Option<&str>) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.into(),
+            hint: hint.map(String::from),
+        }),
+    )
+        .into_response()
+}
+
+fn swarm_error_response(error: &SwarmError) -> Response {
+    match error {
+        SwarmError::AgentNotFound(id) => json_error(
+            StatusCode::NOT_FOUND,
+            format!("agent not found: {id}"),
+            Some(PEERS_HINT),
+        ),
+        SwarmError::AgentInactive { id, status } => json_error(
+            StatusCode::CONFLICT,
+            format!("agent {id} is not accepting messages; status is {status}"),
+            Some(PEERS_HINT),
+        ),
+        SwarmError::InvalidRequest(message) => {
+            json_error(StatusCode::BAD_REQUEST, message.clone(), None)
+        }
+        SwarmError::Timeout(message) => json_error(
+            StatusCode::REQUEST_TIMEOUT,
+            format!("timeout: {message}"),
+            None,
+        ),
+        SwarmError::Db(_)
+        | SwarmError::Process(_)
+        | SwarmError::Io(_)
+        | SwarmError::Internal(_) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), None)
+        }
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/agents", get(list_agents).post(spawn_agent))
@@ -94,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(list_events))
         .route("/api/models", get(list_models))
         .route("/ws", get(ws_handler))
+        .fallback(not_found)
         .with_state(state)
 }
 
@@ -104,16 +155,12 @@ async fn list_agents(
     if let Some(perspective) = params.perspective {
         match orch.list_agents_with_perspective(&perspective) {
             Ok(views) => Json(views).into_response(),
-            Err(e) => {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
+            Err(e) => swarm_error_response(&e),
         }
     } else {
         match orch.list_agents() {
             Ok(agents) => Json(agents).into_response(),
-            Err(e) => {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
+            Err(e) => swarm_error_response(&e),
         }
     }
 }
@@ -121,8 +168,8 @@ async fn list_agents(
 async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match orch.get_agent(&id) {
         Ok(Some(agent)) => Json(agent).into_response(),
-        Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(None) => swarm_error_response(&SwarmError::AgentNotFound(id)),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -144,15 +191,13 @@ async fn spawn_agent(
     .await;
 
     match result {
-        Ok(Ok(agent)) => (axum::http::StatusCode::CREATED, Json(agent)).into_response(),
-        Ok(Err(e)) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(Ok(agent)) => (StatusCode::CREATED, Json(agent)).into_response(),
+        Ok(Err(e)) => swarm_error_response(&e),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
             format!("spawn task failed: {e}"),
-        )
-            .into_response(),
+            None,
+        ),
     }
 }
 
@@ -162,7 +207,7 @@ async fn send_message(
 ) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -178,7 +223,7 @@ async fn get_agent_log(
     };
     match orch.get_agent_log(&id, params.n, filter) {
         Ok(entries) => Json(entries).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -188,8 +233,8 @@ async fn done_agent(
     Json(req): Json<DoneRequest>,
 ) -> impl IntoResponse {
     match orch.done_agent(&id, req.message.as_deref()).await {
-        Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -202,22 +247,20 @@ async fn cleanup_agent(
         tokio::task::spawn_blocking(move || orch.cleanup_agent(&id, params.delete_branch)).await;
 
     match result {
-        Ok(Ok(())) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => swarm_error_response(&e),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
             format!("cleanup task failed: {e}"),
-        )
-            .into_response(),
+            None,
+        ),
     }
 }
 
 async fn kill_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match orch.kill_agent(&id).await {
-        Ok(()) => axum::http::StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -231,7 +274,7 @@ async fn list_events(
         params.limit,
     ) {
         Ok(events) => Json(events).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => swarm_error_response(&e),
     }
 }
 
@@ -255,6 +298,14 @@ async fn list_models() -> impl IntoResponse {
 
 async fn ws_handler(State(orch): State<AppState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
     upgrade.on_upgrade(move |socket| handle_ws(socket, orch))
+}
+
+async fn not_found() -> impl IntoResponse {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "route not found",
+        Some("run swarm --help"),
+    )
 }
 
 async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
