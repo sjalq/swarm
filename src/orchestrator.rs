@@ -15,6 +15,7 @@ Commands:
   swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
   swarm peers --all [--json]           Include done agents.
   swarm send <agent-id> \"message\"      Send a message to another agent.
+  swarm send user \"message\"            Notify the operator running the orchestrator.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
                                        Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
   swarm spawn --role <name> --harness claude --model claude-sonnet-4-6 --worktree --prompt \"...\"
@@ -33,6 +34,7 @@ Commands:
 
 Communication guidelines:
 - When you receive a message, reply to the sender with your result via `swarm send` if a response is expected.
+- Use `swarm send user \"message\"` when you need to notify the human operator directly.
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
 - Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
 - Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.
@@ -76,6 +78,10 @@ pub enum SwarmEvent {
     MessageRouted {
         from: String,
         to: String,
+    },
+    UserNotification {
+        from: String,
+        content: String,
     },
 }
 
@@ -609,6 +615,7 @@ impl Orchestrator {
             SwarmEvent::AgentOutput { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentError { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::MessageRouted { .. } => None,
+            SwarmEvent::UserNotification { from, .. } => Some(from.clone()),
         };
         let event_type = match &event {
             SwarmEvent::AgentSpawned { .. } => "agent_spawned",
@@ -618,6 +625,7 @@ impl Orchestrator {
             SwarmEvent::AgentOutput { .. } => "agent_output",
             SwarmEvent::AgentError { .. } => "agent_error",
             SwarmEvent::MessageRouted { .. } => "message_routed",
+            SwarmEvent::UserNotification { .. } => "user_notification",
         };
         if let Ok(payload) = serde_json::to_string(&event) {
             if let Err(e) = self.db.insert_event(&EventRow {
@@ -634,6 +642,25 @@ impl Orchestrator {
     }
 
     pub async fn send_message(&self, from: &str, to: &str, content: &str) -> Result<MessageRow> {
+        if to == "user" {
+            let msg = MessageRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                from_agent: from.to_string(),
+                to_agent: to.to_string(),
+                content: content.to_string(),
+                delivered: true,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+
+            self.db.enqueue_message(&msg)?;
+            self.emit_event(SwarmEvent::UserNotification {
+                from: from.to_string(),
+                content: content.to_string(),
+            });
+
+            return Ok(msg);
+        }
+
         let agent = self
             .db
             .get_agent(to)?
