@@ -452,6 +452,57 @@ async fn http_api_spawn_and_list() {
         .unwrap();
     let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(agents.len(), 0);
+
+    let resp = client
+        .get(format!("{addr}/api/agents?all=true"))
+        .send()
+        .await
+        .unwrap();
+    let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"].as_str().unwrap(), agent_id);
+    assert_eq!(agents[0]["status"], "dead");
+}
+
+#[tokio::test]
+async fn http_api_missing_agent_returns_json_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    let agents_dir = dir.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{addr}/api/agents/missing-agent"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "agent not found: missing-agent");
+    assert!(body["hint"].as_str().unwrap().contains("swarm peers"));
 }
 
 #[tokio::test]

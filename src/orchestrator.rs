@@ -12,8 +12,8 @@ const SWARM_PREAMBLE: &str = "\
 You have access to the `swarm` CLI for multi-agent coordination:
 
 Commands:
-  swarm peers                          List visible agents (your parent, siblings, and all descendants) with relation labels.
-  swarm peers --all                    Include dead agents.
+  swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
+  swarm peers --all [--json]           Include dead agents.
   swarm send <agent-id> \"message\"      Send a message to another agent.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
                                        Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
@@ -21,12 +21,13 @@ Commands:
                                        Spawn with a specific model and an isolated git worktree.
   swarm cleanup <agent-id>             Remove a done/dead agent's git worktree.
   swarm cleanup <agent-id> --delete-branch  Also delete the agent's branch.
-  swarm models                         List available models for each harness.
-  swarm log <agent-id>                 View an agent's recent activity (messages sent/received and output).
+  swarm models [--json]                List available models for each harness.
+  swarm log <agent-id> [--json]        View an agent's recent activity (messages sent/received and output).
   swarm log <agent-id> -n <count>      Show the last N entries (default: 20).
+  swarm log <agent-id> --truncate <N>  Truncate text log content to N chars (default: 500; 0 disables).
   swarm log <agent-id> --messages      Show only messages (sent and received).
   swarm log <agent-id> --output        Show only harness output.
-  swarm status                         Show your own agent status (includes model info).
+  swarm status [--json]                Show your own agent status (includes model info).
   swarm done \"optional final message\"   Signal that you have finished your task. Sends a message to your parent and exits gracefully.
   swarm kill <agent-id>                Terminate an agent. Its children are re-parented to the killed agent's parent.
 
@@ -211,6 +212,10 @@ impl Orchestrator {
         self.db.list_agents()
     }
 
+    pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
+        self.db.list_all_agents()
+    }
+
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         self.db.get_agent(id)
     }
@@ -234,6 +239,14 @@ impl Orchestrator {
     }
 
     pub fn list_agents_with_perspective(&self, perspective_id: &str) -> Result<Vec<AgentView>> {
+        self.list_agents_with_perspective_all(perspective_id, false)
+    }
+
+    pub fn list_agents_with_perspective_all(
+        &self,
+        perspective_id: &str,
+        include_inactive: bool,
+    ) -> Result<Vec<AgentView>> {
         let all = self.db.list_all_agents()?;
         let self_parent: Option<String> = all
             .iter()
@@ -260,7 +273,7 @@ impl Orchestrator {
 
         let views = all
             .into_iter()
-            .filter(|a| Self::active_status(&a.status))
+            .filter(|a| include_inactive || Self::active_status(&a.status))
             .filter_map(|a| {
                 let relation = if a.id == perspective_id {
                     "self"

@@ -47,6 +47,8 @@ pub struct SendRequest {
 #[derive(Deserialize)]
 pub struct ListQuery {
     pub perspective: Option<String>,
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Deserialize)]
@@ -89,47 +91,52 @@ struct ModelsResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<String>,
+    hint: String,
 }
 
-fn json_error(status: StatusCode, error: impl Into<String>, hint: Option<&str>) -> Response {
+fn json_error(status: StatusCode, error: impl Into<String>, hint: impl Into<String>) -> Response {
     (
         status,
         Json(ErrorResponse {
             error: error.into(),
-            hint: hint.map(String::from),
+            hint: hint.into(),
         }),
     )
         .into_response()
 }
 
-fn swarm_error_response(error: &SwarmError) -> Response {
+fn swarm_error_response(error: SwarmError) -> Response {
     match error {
         SwarmError::AgentNotFound(id) => json_error(
             StatusCode::NOT_FOUND,
             format!("agent not found: {id}"),
-            Some(PEERS_HINT),
+            PEERS_HINT,
         ),
         SwarmError::AgentInactive { id, status } => json_error(
             StatusCode::CONFLICT,
             format!("agent {id} is not accepting messages; status is {status}"),
-            Some(PEERS_HINT),
+            PEERS_HINT,
         ),
-        SwarmError::InvalidRequest(message) => {
-            json_error(StatusCode::BAD_REQUEST, message.clone(), None)
-        }
+        SwarmError::InvalidInput(message) => json_error(
+            StatusCode::BAD_REQUEST,
+            message,
+            "use only letters, numbers, underscores, and hyphens for role names and agent IDs",
+        ),
+        SwarmError::InvalidRequest(message) => json_error(
+            StatusCode::BAD_REQUEST,
+            message,
+            "check the request and retry",
+        ),
         SwarmError::Timeout(message) => json_error(
             StatusCode::REQUEST_TIMEOUT,
             format!("timeout: {message}"),
-            None,
+            "retry the request",
         ),
-        SwarmError::Db(_)
-        | SwarmError::Process(_)
-        | SwarmError::Io(_)
-        | SwarmError::Internal(_) => {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), None)
-        }
+        other => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            other.to_string(),
+            "check the swarm server logs and retry the request",
+        ),
     }
 }
 
@@ -153,14 +160,19 @@ async fn list_agents(
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
     if let Some(perspective) = params.perspective {
-        match orch.list_agents_with_perspective(&perspective) {
+        match orch.list_agents_with_perspective_all(&perspective, params.all) {
             Ok(views) => Json(views).into_response(),
-            Err(e) => swarm_error_response(&e),
+            Err(e) => swarm_error_response(e),
+        }
+    } else if params.all {
+        match orch.list_all_agents() {
+            Ok(agents) => Json(agents).into_response(),
+            Err(e) => swarm_error_response(e),
         }
     } else {
         match orch.list_agents() {
             Ok(agents) => Json(agents).into_response(),
-            Err(e) => swarm_error_response(&e),
+            Err(e) => swarm_error_response(e),
         }
     }
 }
@@ -168,8 +180,8 @@ async fn list_agents(
 async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match orch.get_agent(&id) {
         Ok(Some(agent)) => Json(agent).into_response(),
-        Ok(None) => swarm_error_response(&SwarmError::AgentNotFound(id)),
-        Err(e) => swarm_error_response(&e),
+        Ok(None) => swarm_error_response(SwarmError::AgentNotFound(id)),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -192,11 +204,11 @@ async fn spawn_agent(
 
     match result {
         Ok(Ok(agent)) => (StatusCode::CREATED, Json(agent)).into_response(),
-        Ok(Err(e)) => swarm_error_response(&e),
+        Ok(Err(e)) => swarm_error_response(e),
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("spawn task failed: {e}"),
-            None,
+            "check the swarm server logs and retry the request",
         ),
     }
 }
@@ -207,7 +219,7 @@ async fn send_message(
 ) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
-        Err(e) => swarm_error_response(&e),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -223,7 +235,7 @@ async fn get_agent_log(
     };
     match orch.get_agent_log(&id, params.n, filter) {
         Ok(entries) => Json(entries).into_response(),
-        Err(e) => swarm_error_response(&e),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -234,7 +246,7 @@ async fn done_agent(
 ) -> impl IntoResponse {
     match orch.done_agent(&id, req.message.as_deref()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => swarm_error_response(&e),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -248,11 +260,11 @@ async fn cleanup_agent(
 
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => swarm_error_response(&e),
+        Ok(Err(e)) => swarm_error_response(e),
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cleanup task failed: {e}"),
-            None,
+            "check the swarm server logs and retry the request",
         ),
     }
 }
@@ -260,7 +272,7 @@ async fn cleanup_agent(
 async fn kill_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match orch.kill_agent(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => swarm_error_response(&e),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -274,7 +286,7 @@ async fn list_events(
         params.limit,
     ) {
         Ok(events) => Json(events).into_response(),
-        Err(e) => swarm_error_response(&e),
+        Err(e) => swarm_error_response(e),
     }
 }
 
@@ -301,11 +313,7 @@ async fn ws_handler(State(orch): State<AppState>, upgrade: WebSocketUpgrade) -> 
 }
 
 async fn not_found() -> impl IntoResponse {
-    json_error(
-        StatusCode::NOT_FOUND,
-        "route not found",
-        Some("run swarm --help"),
-    )
+    json_error(StatusCode::NOT_FOUND, "route not found", "run swarm --help")
 }
 
 async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
