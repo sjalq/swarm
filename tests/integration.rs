@@ -4,7 +4,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use swarm::db::{Db, LogFilter};
+use swarm::db::{Db, LogFilter, MessageRow, OutputLogRow};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
 use swarm::orchestrator::{Orchestrator, SwarmEvent};
@@ -83,6 +83,18 @@ async fn setup_http_server() -> (tempfile::TempDir, Arc<Orchestrator>, String) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     (dir, orch, addr)
+}
+
+async fn start_http_server(orch: Arc<Orchestrator>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+    let router = swarm::server::router(orch);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
 }
 
 async fn wait_for_agent_output(
@@ -578,6 +590,133 @@ async fn http_api_spawn_and_list() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["id"].as_str().unwrap(), agent_id);
     assert_eq!(agents[0]["status"], "done");
+}
+
+#[tokio::test]
+async fn http_api_health_returns_status_uptime_and_version() {
+    let (_dir, _orch, addr) = setup_http_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{addr}/api/health"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["uptime"].as_u64().is_some());
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn http_api_stats_returns_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let orch = Arc::new(Orchestrator::new(
+        db.clone(),
+        HarnessRegistry::new(),
+        "http://127.0.0.1:0".to_string(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+    let addr = start_http_server(orch.clone()).await;
+
+    let alive = orch.spawn_agent("alive", "echo", "", None, "mesh").unwrap();
+    let done = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    orch.done_agent(&done.id, None).await.unwrap();
+
+    db.enqueue_message(&MessageRow {
+        id: "stats-message".into(),
+        from_agent: "user".into(),
+        to_agent: alive.id.clone(),
+        content: "queued for stats".into(),
+        delivered: false,
+        created_at: "2026-01-01T00:00:00Z".into(),
+    })
+    .unwrap();
+    db.insert_output_log(&OutputLogRow {
+        id: "stats-error".into(),
+        agent_id: alive.id,
+        content: "failed for stats".into(),
+        kind: "error".into(),
+        created_at: "2026-01-01T00:00:01Z".into(),
+    })
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{addr}/api/stats"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["alive"], 1);
+    assert_eq!(body["done"], 1);
+    assert_eq!(body["messages"], 1);
+    assert_eq!(body["errors"], 1);
+}
+
+#[tokio::test]
+async fn http_api_agent_worktree_returns_git_details() {
+    let (_dir, orch) = setup_with_git();
+    let addr = start_http_server(orch.clone()).await;
+
+    let agent = orch
+        .spawn_agent_with_model("editor", "echo", None, "", None, "mesh", true)
+        .unwrap();
+    let worktree = orch
+        .worktree_dir(&agent.id)
+        .unwrap()
+        .expect("worktree should exist");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{addr}/api/agents/{}/worktree", agent.id))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["branch"], format!("swarm/{}", agent.id));
+    assert_eq!(body["path"].as_str().unwrap(), worktree.to_string_lossy());
+    assert_eq!(body["dirty"], false);
+    assert_eq!(body["head"].as_str().unwrap().len(), 40);
+
+    std::fs::write(worktree.join("README.md"), "# changed\n").unwrap();
+
+    let resp = client
+        .get(format!("{addr}/api/agents/{}/worktree", agent.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["dirty"], true);
+}
+
+#[tokio::test]
+async fn agent_preamble_includes_reply_limits_and_retry_guidance() {
+    let (_dir, orch) = setup();
+    let mut rx = orch.subscribe();
+
+    let agent = orch
+        .spawn_agent("probe", "echo", "inspect preamble", None, "mesh")
+        .unwrap();
+
+    let output = wait_for_agent_output(&mut rx, &agent.id, "All swarm commands").await;
+    assert!(output.contains("Always reply via `swarm send`"));
+    assert!(output.contains("Never reply to status broadcasts"));
+    assert!(output.contains("Keep swarm messages under 300 words"));
+    assert!(output.contains("All swarm commands are idempotent and safe to retry"));
 }
 
 #[tokio::test]

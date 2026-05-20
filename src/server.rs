@@ -89,6 +89,13 @@ struct ModelsResponse {
 }
 
 #[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    uptime: u64,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
     hint: String,
@@ -142,17 +149,35 @@ fn swarm_error_response(error: SwarmError) -> Response {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/api/health", get(health))
+        .route("/api/stats", get(get_stats))
         .route("/api/agents", get(list_agents).post(spawn_agent))
         .route("/api/agents/{id}", get(get_agent).delete(kill_agent))
         .route("/api/agents/{id}/done", post(done_agent))
         .route("/api/agents/{id}/cleanup", post(cleanup_agent))
         .route("/api/agents/{id}/log", get(get_agent_log))
+        .route("/api/agents/{id}/worktree", get(get_agent_worktree))
         .route("/api/messages", post(send_message))
         .route("/api/events", get(list_events))
         .route("/api/models", get(list_models))
         .route("/ws", get(ws_handler))
         .fallback(not_found)
         .with_state(state)
+}
+
+async fn health(State(orch): State<AppState>) -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        uptime: orch.uptime_seconds(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
+    match orch.stats() {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
 }
 
 async fn list_agents(
@@ -235,6 +260,21 @@ async fn get_agent_log(
     };
     match orch.get_agent_log(&id, params.n, filter) {
         Ok(entries) => Json(entries).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn get_agent_worktree(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match orch.worktree_info(&id) {
+        Ok(Some(info)) => Json(info).into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            format!("worktree not found for agent: {id}"),
+            "spawn the agent with --worktree or check swarm peers --all",
+        ),
         Err(e) => swarm_error_response(e),
     }
 }
