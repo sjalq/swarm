@@ -1,15 +1,37 @@
 [package]
-name = "swarm"
+name = "swarm-cli"
 version = "0.1.0"
 edition = "2021"
+description = "Multi-agent CLI orchestrator that coordinates Claude, Codex, Gemini, and Grok CLIs."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sjalq/swarm"
+homepage = "https://github.com/sjalq/swarm"
+documentation = "https://github.com/sjalq/swarm"
+readme = "README.md"
+keywords = ["cli", "agent", "ai", "orchestrator", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.75"
+authors = ["Schalk Dormehl"]
+
+[lib]
+name = "swarm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swarm"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+dirs = "5"
 rusqlite = { version = "0.33", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
