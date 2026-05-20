@@ -55,6 +55,7 @@ Communication guidelines:
 - If you are a coordinator and your child agents worked in worktrees, merge their branches into the base branch (usually main) before calling `swarm done`. Use `git merge <branch>` from the main checkout. Resolve conflicts if needed - that is part of your coordination role.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SwarmEvent {
     AgentSpawned {
