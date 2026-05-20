@@ -76,8 +76,9 @@ pub fn AgentNode(node: AgentTreeNode) -> AnyView {
                 view! { <ChatPanel agent_id=aid /> }.into_any()
             } else {
                 let prompt = detail_prompt.get();
-                let prompt_preview = if prompt.len() > 500 {
-                    format!("{}...", &prompt[..500])
+                let prompt_preview = if prompt.chars().count() > 500 {
+                    let truncated: String = prompt.chars().take(500).collect();
+                    format!("{}...", truncated)
                 } else {
                     prompt
                 };

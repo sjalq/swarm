@@ -8,6 +8,11 @@ pub fn ChatPanel(agent_id: String) -> impl IntoView {
     let entries = RwSignal::new(Vec::<LogEntry>::new());
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
+    let cancelled = RwSignal::new(false);
+
+    on_cleanup(move || {
+        cancelled.set(true);
+    });
 
     let id = agent_id.clone();
     spawn_local(async move {
@@ -25,6 +30,9 @@ pub fn ChatPanel(agent_id: String) -> impl IntoView {
     spawn_local(async move {
         loop {
             gloo_timers::future::TimeoutFuture::new(3_000).await;
+            if cancelled.get_untracked() {
+                break;
+            }
             if let Ok(log) = api::fetch_agent_log(&poll_id, 200).await {
                 entries.set(log);
             }

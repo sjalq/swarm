@@ -69,6 +69,12 @@ impl SwarmConfig {
     fn query_running_server() -> Option<PathBuf> {
         let socket =
             std::env::var("SWARM_SOCKET").unwrap_or_else(|_| "http://127.0.0.1:9800".into());
+
+        // Security: only allow http:// to loopback addresses to prevent SSRF
+        if !Self::is_safe_loopback_url(&socket) {
+            return None;
+        }
+
         let url = format!("{}/api/health", socket);
         let resp = std::process::Command::new("curl")
             .args(["-sf", "--max-time", "1", &url])
@@ -79,10 +85,27 @@ impl SwarmConfig {
         }
         let body = String::from_utf8_lossy(&resp.stdout);
         let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-        value
+        let dir = value
             .get("data_dir")
             .and_then(|v| v.as_str())
-            .map(PathBuf::from)
+            .map(PathBuf::from)?;
+
+        // Only trust the returned path if it actually exists on this machine
+        if dir.exists() { Some(dir) } else { None }
+    }
+
+    fn is_safe_loopback_url(url: &str) -> bool {
+        let Some(rest) = url.strip_prefix("http://") else {
+            return false;
+        };
+        let host_port = rest.split('/').next().unwrap_or("");
+        // Handle bracketed IPv6 like [::1]:9800
+        let host = if host_port.starts_with('[') {
+            host_port.split(']').next().unwrap_or("").trim_start_matches('[')
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        matches!(host, "127.0.0.1" | "localhost" | "::1")
     }
 
     fn global_path() -> Option<PathBuf> {
@@ -179,5 +202,23 @@ mod tests {
         assert_eq!(cfg.default_harness.as_deref(), Some("claude"));
         assert_eq!(cfg.default_port, Some(9801));
         assert_eq!(cfg.claude_bin.as_deref(), Some("/usr/local/bin/claude"));
+    }
+
+    #[test]
+    fn loopback_url_validation_allows_safe_addresses() {
+        assert!(SwarmConfig::is_safe_loopback_url("http://127.0.0.1:9800"));
+        assert!(SwarmConfig::is_safe_loopback_url("http://localhost:9800"));
+        assert!(SwarmConfig::is_safe_loopback_url("http://[::1]:9800"));
+        assert!(SwarmConfig::is_safe_loopback_url("http://127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_url_validation_blocks_unsafe_addresses() {
+        assert!(!SwarmConfig::is_safe_loopback_url("http://169.254.169.254"));
+        assert!(!SwarmConfig::is_safe_loopback_url("http://evil.com:9800"));
+        assert!(!SwarmConfig::is_safe_loopback_url("https://127.0.0.1:9800"));
+        assert!(!SwarmConfig::is_safe_loopback_url("file:///etc/passwd"));
+        assert!(!SwarmConfig::is_safe_loopback_url("http://10.0.0.1:9800"));
+        assert!(!SwarmConfig::is_safe_loopback_url("http://192.168.1.1:9800"));
     }
 }
