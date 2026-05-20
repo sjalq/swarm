@@ -64,9 +64,9 @@ enum Commands {
         json: bool,
     },
 
-    /// Send a message to an agent
+    /// Send a message to an agent or notify the operator
     Send {
-        /// Target agent ID
+        /// Target agent ID, or "user" to notify the operator
         target: String,
         /// Message content
         message: String,
@@ -444,6 +444,9 @@ async fn run_orchestrator(
                     }
                     SwarmEvent::MessageRouted { from, to } => {
                         println!("[swarm] message: {from} -> {to}");
+                    }
+                    SwarmEvent::UserNotification { from, content } => {
+                        println!("[NOTIFY {from}] {content}");
                     }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

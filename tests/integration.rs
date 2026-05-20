@@ -311,6 +311,65 @@ async fn message_to_nonexistent_agent_fails() {
 }
 
 #[tokio::test]
+async fn user_is_valid_message_target_for_operator_notifications() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .spawn_agent("notifier", "echo", "", None, "mesh")
+        .unwrap();
+    assert!(orch.get_agent("user").unwrap().is_none());
+
+    let mut rx = orch.subscribe();
+    let msg = orch
+        .send_message(&agent.id, "user", "operator heads up")
+        .await
+        .unwrap();
+
+    assert_eq!(msg.from_agent, agent.id);
+    assert_eq!(msg.to_agent, "user");
+    assert_eq!(msg.content, "operator heads up");
+    assert!(msg.delivered);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(SwarmEvent::UserNotification { from, content })
+                    if from == agent.id && content == "operator heads up" =>
+                {
+                    return;
+                }
+                Err(e) => panic!("event stream closed before notification arrived: {e}"),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for user notification event");
+
+    let log = orch
+        .get_agent_log(&agent.id, 50, LogFilter::Messages)
+        .unwrap();
+    assert!(
+        log.iter().any(|entry| {
+            entry.kind == "sent" && entry.peer == "user" && entry.content == "operator heads up"
+        }),
+        "agent log should include the persisted operator notification"
+    );
+
+    let agent_events = orch.list_events(None, Some(&agent.id), 1000).unwrap();
+    let notifications: Vec<_> = agent_events
+        .iter()
+        .filter(|event| event.event_type == "user_notification")
+        .collect();
+    assert_eq!(notifications.len(), 1);
+
+    let payload: serde_json::Value = serde_json::from_str(&notifications[0].payload).unwrap();
+    assert_eq!(payload["type"], "user_notification");
+    assert_eq!(payload["from"], agent.id);
+    assert_eq!(payload["content"], "operator heads up");
+}
+
+#[tokio::test]
 async fn multiple_messages_processed_in_order() {
     let (_dir, orch) = setup();
 
