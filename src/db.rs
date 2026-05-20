@@ -16,6 +16,8 @@ pub struct AgentRow {
     pub work_dir: String,
     pub comms: String,
     pub created_at: String,
+    pub ended_at: Option<String>,
+    pub worktree_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +105,9 @@ impl Db {
                 system_prompt TEXT NOT NULL DEFAULT '',
                 work_dir TEXT NOT NULL,
                 comms TEXT NOT NULL DEFAULT 'mesh',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                ended_at TEXT NULL,
+                worktree_branch TEXT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
@@ -138,17 +142,66 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_events_time
                 ON events(created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent
-                ON events(agent_id, created_at);
-            UPDATE agents SET status = 'done' WHERE status = 'dead';",
+                ON events(agent_id, created_at);",
+        )?;
+        Self::ensure_agents_column(&conn, "ended_at", "TEXT NULL")?;
+        Self::ensure_agents_column(&conn, "worktree_branch", "TEXT NULL")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_agents_status
+                ON agents(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agents_parent_status
+                ON agents(parent_id, status);
+            UPDATE agents
+                SET status = 'done',
+                    ended_at = COALESCE(
+                        ended_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    )
+                WHERE status = 'dead';",
         )?;
         Ok(())
+    }
+
+    fn ensure_agents_column(conn: &Connection, column: &str, definition: &str) -> Result<()> {
+        let exists = {
+            let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let columns = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            columns.iter().any(|name| name == column)
+        };
+
+        if !exists {
+            conn.execute(
+                &format!("ALTER TABLE agents ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
+        Ok(AgentRow {
+            id: row.get(0)?,
+            role: row.get(1)?,
+            harness: row.get(2)?,
+            model: row.get(3)?,
+            status: row.get(4)?,
+            parent_id: row.get(5)?,
+            system_prompt: row.get(6)?,
+            work_dir: row.get(7)?,
+            comms: row.get(8)?,
+            created_at: row.get(9)?,
+            ended_at: row.get(10)?,
+            worktree_branch: row.get(11)?,
+        })
     }
 
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 agent.id,
                 agent.role,
@@ -160,6 +213,8 @@ impl Db {
                 agent.work_dir,
                 agent.comms,
                 agent.created_at,
+                agent.ended_at,
+                agent.worktree_branch,
             ],
         )?;
         Ok(())
@@ -168,23 +223,10 @@ impl Db {
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
              FROM agents WHERE id = ?1",
         )?;
-        let result = stmt.query_row([id], |row| {
-            Ok(AgentRow {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                harness: row.get(2)?,
-                model: row.get(3)?,
-                status: row.get(4)?,
-                parent_id: row.get(5)?,
-                system_prompt: row.get(6)?,
-                work_dir: row.get(7)?,
-                comms: row.get(8)?,
-                created_at: row.get(9)?,
-            })
-        });
+        let result = stmt.query_row([id], Self::agent_from_row);
         match result {
             Ok(agent) => Ok(Some(agent)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -195,24 +237,11 @@ impl Db {
     pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
              FROM agents WHERE status != 'done' ORDER BY created_at",
         )?;
         let agents = stmt
-            .query_map([], |row| {
-                Ok(AgentRow {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    harness: row.get(2)?,
-                    model: row.get(3)?,
-                    status: row.get(4)?,
-                    parent_id: row.get(5)?,
-                    system_prompt: row.get(6)?,
-                    work_dir: row.get(7)?,
-                    comms: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], Self::agent_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(agents)
     }
@@ -220,24 +249,11 @@ impl Db {
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at
+            "SELECT id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch
              FROM agents ORDER BY created_at",
         )?;
         let agents = stmt
-            .query_map([], |row| {
-                Ok(AgentRow {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    harness: row.get(2)?,
-                    model: row.get(3)?,
-                    status: row.get(4)?,
-                    parent_id: row.get(5)?,
-                    system_prompt: row.get(6)?,
-                    work_dir: row.get(7)?,
-                    comms: row.get(8)?,
-                    created_at: row.get(9)?,
-                })
-            })?
+            .query_map([], Self::agent_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(agents)
     }
@@ -320,18 +336,32 @@ impl Db {
 
     pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn()?;
+        let ended_at = (status == "done").then(|| chrono::Utc::now().to_rfc3339());
         conn.execute(
-            "UPDATE agents SET status = ?1 WHERE id = ?2",
-            rusqlite::params![status, id],
+            "UPDATE agents
+                SET status = ?1,
+                    ended_at = CASE
+                        WHEN ?1 = 'done' THEN COALESCE(ended_at, ?3)
+                        ELSE NULL
+                    END
+                WHERE id = ?2",
+            rusqlite::params![status, id, ended_at],
         )?;
         Ok(())
     }
 
     pub fn update_agent_status_if_active(&self, id: &str, status: &str) -> Result<bool> {
         let conn = self.conn()?;
+        let ended_at = (status == "done").then(|| chrono::Utc::now().to_rfc3339());
         let updated = conn.execute(
-            "UPDATE agents SET status = ?1 WHERE id = ?2 AND status != 'done'",
-            rusqlite::params![status, id],
+            "UPDATE agents
+                SET status = ?1,
+                    ended_at = CASE
+                        WHEN ?1 = 'done' THEN COALESCE(ended_at, ?3)
+                        ELSE NULL
+                    END
+                WHERE id = ?2 AND status != 'done'",
+            rusqlite::params![status, id, ended_at],
         )?;
         Ok(updated > 0)
     }
@@ -529,9 +559,13 @@ impl Db {
 
     pub fn mark_unfinished_agents_done(&self) -> Result<usize> {
         let conn = self.conn()?;
+        let ended_at = chrono::Utc::now().to_rfc3339();
         let count = conn.execute(
-            "UPDATE agents SET status = 'done' WHERE status != 'done'",
-            [],
+            "UPDATE agents
+                SET status = 'done',
+                    ended_at = COALESCE(ended_at, ?1)
+                WHERE status != 'done'",
+            [ended_at],
         )?;
         Ok(count)
     }
@@ -575,21 +609,94 @@ mod tests {
         Db::open(Path::new(":memory:")).unwrap()
     }
 
-    #[test]
-    fn agent_crud() {
-        let db = test_db();
-        let agent = AgentRow {
-            id: "test-1234".into(),
+    fn test_agent(id: &str, status: &str) -> AgentRow {
+        AgentRow {
+            id: id.into(),
             role: "tester".into(),
             harness: "echo".into(),
             model: String::new(),
-            status: "idle".into(),
+            status: status.into(),
             parent_id: None,
             system_prompt: "you are a tester".into(),
             work_dir: "/tmp/test".into(),
             comms: "mesh".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
-        };
+            ended_at: None,
+            worktree_branch: None,
+        }
+    }
+
+    fn agent_columns(db: &Db) -> Vec<String> {
+        let conn = db.conn().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(agents)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn agent_indexes(db: &Db) -> Vec<String> {
+        let conn = db.conn().unwrap();
+        let mut stmt = conn.prepare("PRAGMA index_list(agents)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn initializes_agent_metadata_columns_and_indexes() {
+        let db = test_db();
+
+        let columns = agent_columns(&db);
+        assert!(columns.contains(&"ended_at".to_string()));
+        assert!(columns.contains(&"worktree_branch".to_string()));
+
+        let indexes = agent_indexes(&db);
+        assert!(indexes.contains(&"idx_agents_status".to_string()));
+        assert!(indexes.contains(&"idx_agents_parent_status".to_string()));
+    }
+
+    #[test]
+    fn migrates_legacy_agents_table_metadata_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("swarm.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    parent_id TEXT,
+                    system_prompt TEXT NOT NULL DEFAULT '',
+                    work_dir TEXT NOT NULL,
+                    comms TEXT NOT NULL DEFAULT 'mesh',
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at)
+                VALUES ('legacy-agent', 'worker', 'echo', '', 'idle', NULL, '', '/tmp', 'mesh', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&db_path).unwrap();
+        let columns = agent_columns(&db);
+        assert!(columns.contains(&"ended_at".to_string()));
+        assert!(columns.contains(&"worktree_branch".to_string()));
+
+        let agent = db.get_agent("legacy-agent").unwrap().unwrap();
+        assert_eq!(agent.status, "idle");
+        assert_eq!(agent.ended_at, None);
+        assert_eq!(agent.worktree_branch, None);
+    }
+
+    #[test]
+    fn agent_crud() {
+        let db = test_db();
+        let agent = test_agent("test-1234", "idle");
         db.insert_agent(&agent).unwrap();
 
         let fetched = db.get_agent("test-1234").unwrap().unwrap();
@@ -710,18 +817,7 @@ mod tests {
     #[test]
     fn done_agents_hidden_from_list() {
         let db = test_db();
-        let agent = AgentRow {
-            id: "done-agent".into(),
-            role: "finished".into(),
-            harness: "echo".into(),
-            model: String::new(),
-            status: "done".into(),
-            parent_id: None,
-            system_prompt: String::new(),
-            work_dir: "/tmp".into(),
-            comms: "mesh".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
+        let agent = test_agent("done-agent", "done");
         db.insert_agent(&agent).unwrap();
         assert!(db.list_agents().unwrap().is_empty());
         assert!(db.get_agent("done-agent").unwrap().is_some());
@@ -730,18 +826,7 @@ mod tests {
     #[test]
     fn active_agents_visible_from_list() {
         let db = test_db();
-        let agent = AgentRow {
-            id: "active-agent".into(),
-            role: "worker".into(),
-            harness: "echo".into(),
-            model: String::new(),
-            status: "idle".into(),
-            parent_id: None,
-            system_prompt: String::new(),
-            work_dir: "/tmp".into(),
-            comms: "mesh".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
+        let agent = test_agent("active-agent", "idle");
         db.insert_agent(&agent).unwrap();
         assert_eq!(db.list_agents().unwrap().len(), 1);
         assert!(db.get_agent("active-agent").unwrap().is_some());
@@ -750,18 +835,7 @@ mod tests {
     #[test]
     fn terminal_agents_reject_atomic_status_and_message_updates() {
         let db = test_db();
-        let agent = AgentRow {
-            id: "done-agent".into(),
-            role: "finished".into(),
-            harness: "echo".into(),
-            model: String::new(),
-            status: "done".into(),
-            parent_id: None,
-            system_prompt: String::new(),
-            work_dir: "/tmp".into(),
-            comms: "mesh".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
+        let agent = test_agent("done-agent", "done");
         db.insert_agent(&agent).unwrap();
 
         assert!(!db
@@ -779,5 +853,24 @@ mod tests {
         };
         assert!(!db.enqueue_message_for_active_agent(&msg).unwrap());
         assert!(!db.has_pending_messages("done-agent").unwrap());
+    }
+
+    #[test]
+    fn done_status_sets_ended_at_and_reactivation_clears_it() {
+        let db = test_db();
+        db.insert_agent(&test_agent("agent-1", "idle")).unwrap();
+
+        db.update_agent_status("agent-1", "done").unwrap();
+        let done_agent = db.get_agent("agent-1").unwrap().unwrap();
+        assert_eq!(done_agent.status, "done");
+        assert!(
+            done_agent.ended_at.is_some(),
+            "done transition should set ended_at"
+        );
+
+        db.update_agent_status("agent-1", "idle").unwrap();
+        let active_agent = db.get_agent("agent-1").unwrap().unwrap();
+        assert_eq!(active_agent.status, "idle");
+        assert_eq!(active_agent.ended_at, None);
     }
 }

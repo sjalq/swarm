@@ -147,6 +147,16 @@ fn swarm_error_response(error: SwarmError) -> Response {
     }
 }
 
+async fn blocking_orchestrator<T, F>(context: &'static str, f: F) -> Result<T, SwarmError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SwarmError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| SwarmError::Internal(format!("{context} task failed: {e}")))?
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -174,7 +184,7 @@ async fn health(State(orch): State<AppState>) -> impl IntoResponse {
 }
 
 async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
-    match orch.stats() {
+    match blocking_orchestrator("get stats", move || orch.stats()).await {
         Ok(stats) => Json(stats).into_response(),
         Err(e) => swarm_error_response(e),
     }
@@ -185,17 +195,21 @@ async fn list_agents(
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
     if let Some(perspective) = params.perspective {
-        match orch.list_agents_with_perspective_all(&perspective, params.all) {
+        match blocking_orchestrator("list agents", move || {
+            orch.list_agents_with_perspective_all(&perspective, params.all)
+        })
+        .await
+        {
             Ok(views) => Json(views).into_response(),
             Err(e) => swarm_error_response(e),
         }
     } else if params.all {
-        match orch.list_all_agents() {
+        match blocking_orchestrator("list agents", move || orch.list_all_agents()).await {
             Ok(agents) => Json(agents).into_response(),
             Err(e) => swarm_error_response(e),
         }
     } else {
-        match orch.list_agents() {
+        match blocking_orchestrator("list agents", move || orch.list_agents()).await {
             Ok(agents) => Json(agents).into_response(),
             Err(e) => swarm_error_response(e),
         }
@@ -203,7 +217,12 @@ async fn list_agents(
 }
 
 async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match orch.get_agent(&id) {
+    match blocking_orchestrator("get agent", {
+        let id = id.clone();
+        move || orch.get_agent(&id)
+    })
+    .await
+    {
         Ok(Some(agent)) => Json(agent).into_response(),
         Ok(None) => swarm_error_response(SwarmError::AgentNotFound(id)),
         Err(e) => swarm_error_response(e),
@@ -258,7 +277,12 @@ async fn get_agent_log(
         Some("output") => LogFilter::Output,
         _ => LogFilter::All,
     };
-    match orch.get_agent_log(&id, params.n, filter) {
+    match blocking_orchestrator("get agent log", {
+        let id = id.clone();
+        move || orch.get_agent_log(&id, params.n, filter)
+    })
+    .await
+    {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => swarm_error_response(e),
     }
@@ -268,7 +292,12 @@ async fn get_agent_worktree(
     State(orch): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match orch.worktree_info(&id) {
+    match blocking_orchestrator("get agent worktree", {
+        let id = id.clone();
+        move || orch.worktree_info(&id)
+    })
+    .await
+    {
         Ok(Some(info)) => Json(info).into_response(),
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
@@ -320,11 +349,15 @@ async fn list_events(
     State(orch): State<AppState>,
     Query(params): Query<EventQuery>,
 ) -> impl IntoResponse {
-    match orch.list_events(
-        params.since.as_deref(),
-        params.agent_id.as_deref(),
-        params.limit,
-    ) {
+    match blocking_orchestrator("list events", move || {
+        orch.list_events(
+            params.since.as_deref(),
+            params.agent_id.as_deref(),
+            params.limit,
+        )
+    })
+    .await
+    {
         Ok(events) => Json(events).into_response(),
         Err(e) => swarm_error_response(e),
     }
