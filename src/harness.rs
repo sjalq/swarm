@@ -78,6 +78,28 @@ impl CliKind {
         }
     }
 
+    pub fn env_var_name(&self) -> &'static str {
+        match self {
+            Self::Claude => "SWARM_CLAUDE_BIN",
+            Self::Gemini => "SWARM_GEMINI_BIN",
+            Self::Codex => "SWARM_CODEX_BIN",
+            Self::Grok => "SWARM_GROK_BIN",
+        }
+    }
+
+    pub fn resolved_binary(&self) -> String {
+        std::env::var(self.env_var_name()).unwrap_or_else(|_| self.default_binary().to_string())
+    }
+
+    pub fn api_key_env_names(&self) -> &[&'static str] {
+        match self {
+            Self::Claude => &["ANTHROPIC_API_KEY"],
+            Self::Codex => &["OPENAI_API_KEY", "CODEX_API_KEY"],
+            Self::Gemini => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+            Self::Grok => &["XAI_API_KEY"],
+        }
+    }
+
     pub fn default_model(&self) -> &'static str {
         match self {
             Self::Claude => "claude-opus-4-6",
@@ -102,6 +124,10 @@ impl CliKind {
             Self::Codex => &["gpt-5.5", "o3", "o4-mini"],
             Self::Grok => &["grok-3", "grok-build"],
         }
+    }
+
+    pub fn all_kinds() -> &'static [CliKind] {
+        &[Self::Claude, Self::Gemini, Self::Codex, Self::Grok]
     }
 
     pub fn from_harness_name(name: &str) -> Option<Self> {
@@ -218,7 +244,7 @@ pub struct CliHarness {
 
 impl CliHarness {
     pub fn new(kind: CliKind) -> Self {
-        let binary = kind.default_binary().to_string();
+        let binary = kind.resolved_binary();
         let model = kind.default_model().to_string();
         Self {
             kind,
@@ -415,6 +441,51 @@ impl Harness for CliHarness {
     }
 }
 
+// -- Pre-flight check --------------------------------------------------------
+
+pub fn preflight_check(harness_name: &str) -> std::result::Result<(), String> {
+    if harness_name == "echo" {
+        return Ok(());
+    }
+    let kind = CliKind::from_harness_name(harness_name)
+        .ok_or_else(|| format!("unknown harness: {harness_name}"))?;
+    let binary = kind.resolved_binary();
+    let found = which_binary(&binary);
+    if !found {
+        let env_var = kind.env_var_name();
+        let is_override = std::env::var(env_var).is_ok();
+        let detail = if is_override {
+            format!(
+                "error: harness '{}' binary '{}' (from {}) not found on PATH or as absolute path.",
+                harness_name, binary, env_var
+            )
+        } else {
+            format!(
+                "error: harness '{}' requires the `{}` CLI on PATH. \
+                 Install it (see https://github.com/sjalq/swarm#harnesses) \
+                 or set {} to its path. Run `swarm doctor` to diagnose.",
+                harness_name, binary, env_var
+            )
+        };
+        return Err(detail);
+    }
+    Ok(())
+}
+
+fn which_binary(binary: &str) -> bool {
+    let path = std::path::Path::new(binary);
+    if path.is_absolute() {
+        return path.exists();
+    }
+    std::process::Command::new("which")
+        .arg(binary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // -- Registry ----------------------------------------------------------------
 
 pub struct HarnessRegistry {
@@ -479,5 +550,41 @@ mod tests {
             HarnessOutput::Complete(text) => assert_eq!(text, "(echo) hello world"),
             other => panic!("expected Complete, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn echo_preflight_always_passes() {
+        assert!(preflight_check("echo").is_ok());
+    }
+
+    #[test]
+    fn unknown_harness_preflight_fails() {
+        assert!(preflight_check("nonexistent").is_err());
+    }
+
+    #[test]
+    fn cli_kind_env_vars() {
+        assert_eq!(CliKind::Claude.env_var_name(), "SWARM_CLAUDE_BIN");
+        assert_eq!(CliKind::Codex.env_var_name(), "SWARM_CODEX_BIN");
+        assert_eq!(CliKind::Gemini.env_var_name(), "SWARM_GEMINI_BIN");
+        assert_eq!(CliKind::Grok.env_var_name(), "SWARM_GROK_BIN");
+    }
+
+    #[test]
+    fn cli_kind_all_kinds() {
+        let kinds = CliKind::all_kinds();
+        assert_eq!(kinds.len(), 4);
+    }
+
+    #[test]
+    fn api_key_env_names() {
+        assert_eq!(CliKind::Claude.api_key_env_names(), &["ANTHROPIC_API_KEY"]);
+        assert!(CliKind::Codex
+            .api_key_env_names()
+            .contains(&"OPENAI_API_KEY"));
+        assert!(CliKind::Gemini
+            .api_key_env_names()
+            .contains(&"GEMINI_API_KEY"));
+        assert_eq!(CliKind::Grok.api_key_env_names(), &["XAI_API_KEY"]);
     }
 }

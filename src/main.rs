@@ -1,13 +1,22 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
+use swarm::config::SwarmConfig;
 use swarm::db::Db;
-use swarm::harness::HarnessRegistry;
+use swarm::harness::{CliKind, HarnessRegistry};
 use swarm::orchestrator::{Orchestrator, SwarmEvent};
-use swarm::server;
 
 #[derive(Parser)]
-#[command(name = "swarm", about = "Multi-agent CLI orchestrator")]
+#[command(
+    name = "swarm",
+    about = "Multi-agent CLI orchestrator",
+    long_about = "Multi-agent CLI orchestrator that coordinates Claude, Codex, Gemini, and Grok CLIs.\n\n\
+        Environment variables:\n  \
+        SWARM_CLAUDE_BIN  Override the claude binary path\n  \
+        SWARM_CODEX_BIN   Override the codex binary path\n  \
+        SWARM_GEMINI_BIN  Override the gemini binary path\n  \
+        SWARM_GROK_BIN    Override the grok binary path"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,12 +31,12 @@ enum Commands {
         project_dir: PathBuf,
 
         /// Server port
-        #[arg(long, default_value = "9800")]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Harness for the parent agent (claude, gemini, codex, grok, echo)
-        #[arg(long, default_value = "echo")]
-        harness: String,
+        #[arg(long)]
+        harness: Option<String>,
 
         /// Initial prompt for the parent agent
         #[arg(long, default_value = "")]
@@ -36,6 +45,10 @@ enum Commands {
         /// Role name for the parent agent
         #[arg(long, default_value = "coordinator")]
         role: String,
+
+        /// Skip automatic .gitignore update
+        #[arg(long)]
+        no_gitignore: bool,
     },
 
     /// List all agents in the swarm
@@ -60,16 +73,16 @@ enum Commands {
         role: String,
 
         /// Harness to use (claude, gemini, codex, grok, echo)
-        #[arg(long, default_value = "echo")]
-        harness: String,
+        #[arg(long)]
+        harness: Option<String>,
 
         /// System prompt for the agent
         #[arg(long, default_value = "")]
         prompt: String,
 
         /// Communication mode: mesh or parent-only
-        #[arg(long, default_value = "mesh")]
-        comms: String,
+        #[arg(long)]
+        comms: Option<String>,
 
         /// Model override (e.g. claude-sonnet-4-6, gemini-2.5-flash)
         #[arg(long)]
@@ -80,7 +93,7 @@ enum Commands {
         worktree: bool,
     },
 
-    /// List available models for each harness
+    /// List available models for each harness (offline catalog)
     Models,
 
     /// Show own agent status
@@ -125,6 +138,26 @@ enum Commands {
         /// Agent ID to terminate
         target: String,
     },
+
+    /// Check harness availability, versions, and API keys
+    Doctor,
+
+    /// Print shell completion script to stdout
+    Completions {
+        /// Target shell
+        shell: ShellArg,
+    },
+
+    /// Print roff manpage to stdout
+    Manpage,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ShellArg {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
 }
 
 #[tokio::main]
@@ -138,8 +171,25 @@ async fn main() {
             harness,
             prompt,
             role,
+            no_gitignore,
         } => {
-            if let Err(e) = run_orchestrator(project_dir, port, harness, prompt, role).await {
+            let config = SwarmConfig::load(Some(&project_dir));
+            let port = port.unwrap_or_else(|| config.default_port.unwrap_or(9800));
+            let harness = harness.unwrap_or_else(|| {
+                config
+                    .default_harness
+                    .clone()
+                    .unwrap_or_else(|| "echo".into())
+            });
+
+            if let Err(msg) = swarm::harness::preflight_check(&harness) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+
+            if let Err(e) =
+                run_orchestrator(project_dir, port, harness, prompt, role, no_gitignore).await
+            {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -164,6 +214,25 @@ async fn main() {
             model,
             worktree,
         } => {
+            let config = SwarmConfig::load(None);
+            let harness = harness.unwrap_or_else(|| {
+                config
+                    .default_harness
+                    .clone()
+                    .unwrap_or_else(|| "echo".into())
+            });
+            let comms = comms.unwrap_or_else(|| {
+                config
+                    .default_comms
+                    .clone()
+                    .unwrap_or_else(|| "mesh".into())
+            });
+
+            if let Err(msg) = swarm::harness::preflight_check(&harness) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+
             if let Err(e) =
                 cmd_spawn(&role, &harness, &prompt, &comms, model.as_deref(), worktree).await
             {
@@ -172,10 +241,7 @@ async fn main() {
             }
         }
         Commands::Models => {
-            if let Err(e) = cmd_models().await {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+            cmd_models_offline();
         }
         Commands::Status => {
             if let Err(e) = cmd_status().await {
@@ -222,6 +288,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Doctor => {
+            cmd_doctor();
+        }
+        Commands::Completions { shell } => {
+            cmd_completions(shell);
+        }
+        Commands::Manpage => {
+            cmd_manpage();
+        }
     }
 }
 
@@ -231,6 +306,7 @@ async fn run_orchestrator(
     harness: String,
     prompt: String,
     role: String,
+    no_gitignore: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -244,24 +320,38 @@ async fn run_orchestrator(
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(data_dir.join("agents"))?;
 
-    // Ensure .swarm is gitignored (worktrees live inside it)
-    let gitignore = project_dir.join(".gitignore");
-    let needs_entry = if gitignore.exists() {
-        let content = std::fs::read_to_string(&gitignore)?;
-        !content
-            .lines()
-            .any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
-    } else {
-        true
-    };
-    if needs_entry {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitignore)?;
-        writeln!(f, "\n.swarm/")?;
-        tracing::info!("added .swarm/ to .gitignore");
+    if !no_gitignore {
+        let gitignore = project_dir.join(".gitignore");
+        let needs_entry = if gitignore.exists() {
+            let content = std::fs::read_to_string(&gitignore)?;
+            !content
+                .lines()
+                .any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
+        } else {
+            true
+        };
+        if needs_entry {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&gitignore)?;
+            writeln!(f, "\n.swarm/")?;
+            tracing::info!("added .swarm/ to .gitignore");
+        }
+    }
+
+    // Port conflict detection
+    match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
+        Ok(listener) => drop(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "error: port {} is in use. Pass --port <other> or kill the existing process (lsof -i :{}).",
+                port, port
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
     }
 
     let db = Arc::new(Db::open(&data_dir.join("swarm.db"))?);
@@ -280,7 +370,7 @@ async fn run_orchestrator(
     }
 
     // Start HTTP server
-    let router = server::router(orch.clone());
+    let router = swarm::server::router(orch.clone());
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 
@@ -485,27 +575,13 @@ async fn cmd_status() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_models() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
-    let resp: Vec<serde_json::Value> = reqwest::get(format!("{socket}/api/models"))
-        .await?
-        .json()
-        .await?;
-
-    for harness in &resp {
-        let name = harness["harness"].as_str().unwrap_or("?");
-        let default = harness["default_model"].as_str().unwrap_or("?");
-        let models = harness["models"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| v.as_str().unwrap_or("?"))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
+fn cmd_models_offline() {
+    for kind in CliKind::all_kinds() {
+        let name = kind.default_binary();
+        let default = kind.default_model();
+        let models = kind.known_models();
         println!("{}:", name);
-        for m in &models {
+        for m in models {
             if *m == default {
                 println!("  {} (default)", m);
             } else {
@@ -513,7 +589,6 @@ async fn cmd_models() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    Ok(())
 }
 
 async fn cmd_log(
@@ -619,4 +694,122 @@ async fn cmd_kill(target: &str) -> std::result::Result<(), Box<dyn std::error::E
         eprintln!("failed: {body}");
     }
     Ok(())
+}
+
+fn cmd_doctor() {
+    println!("swarm doctor");
+    println!("{:-<70}", "");
+
+    let harnesses = CliKind::all_kinds();
+    println!(
+        "{:<10} {:<30} {:<8} {:<24} {:<8}",
+        "Harness", "Binary", "Found", "Version", "API Key"
+    );
+    println!("{:-<70}", "");
+
+    for kind in harnesses {
+        let name = kind.default_binary();
+        let env_var = kind.env_var_name();
+        let binary = kind.resolved_binary();
+        let bin_source = if std::env::var(env_var).is_ok() {
+            format!("{} ({})", binary, env_var)
+        } else {
+            binary.clone()
+        };
+
+        let found = binary_on_path(&binary);
+        let found_str = if found { "Y" } else { "N" };
+
+        let version = if found {
+            get_binary_version(&binary)
+        } else {
+            "-".to_string()
+        };
+
+        let api_key_present = kind
+            .api_key_env_names()
+            .iter()
+            .any(|k| std::env::var(k).is_ok());
+        let api_key_str = if api_key_present { "Y" } else { "N" };
+
+        println!(
+            "{:<10} {:<30} {:<8} {:<24} {:<8}",
+            name, bin_source, found_str, version, api_key_str
+        );
+    }
+
+    println!("{:-<70}", "");
+
+    let git_found = binary_on_path("git");
+    println!(
+        "{:<10} {:<30} {:<8} {:<24}",
+        "git",
+        "git",
+        if git_found { "Y" } else { "N" },
+        if git_found {
+            get_binary_version("git")
+        } else {
+            "-".to_string()
+        }
+    );
+
+    println!("{:-<70}", "");
+
+    let all_ok = harnesses
+        .iter()
+        .all(|k| binary_on_path(&k.resolved_binary()))
+        && git_found;
+    if all_ok {
+        println!("PASS: all harnesses and git found");
+    } else {
+        println!("FAIL: some harnesses or git not found (see above)");
+    }
+}
+
+fn binary_on_path(binary: &str) -> bool {
+    let path = std::path::Path::new(binary);
+    if path.is_absolute() {
+        return path.exists();
+    }
+    std::process::Command::new("which")
+        .arg(binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn get_binary_version(binary: &str) -> String {
+    let result = std::process::Command::new(binary)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().next().unwrap_or("-").trim().to_string()
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn cmd_completions(shell: ShellArg) {
+    let clap_shell = match shell {
+        ShellArg::Bash => clap_complete::Shell::Bash,
+        ShellArg::Zsh => clap_complete::Shell::Zsh,
+        ShellArg::Fish => clap_complete::Shell::Fish,
+        ShellArg::Powershell => clap_complete::Shell::PowerShell,
+    };
+    let mut cmd = Cli::command();
+    clap_complete::generate(clap_shell, &mut cmd, "swarm", &mut std::io::stdout());
+}
+
+fn cmd_manpage() {
+    let cmd = Cli::command();
+    let man = clap_mangen::Man::new(cmd);
+    man.render(&mut std::io::stdout())
+        .expect("failed to write manpage");
 }
