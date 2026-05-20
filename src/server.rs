@@ -8,10 +8,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
+
+#[derive(Embed)]
+#[folder = "frontend/dist/"]
+struct DashboardAssets;
 
 type AppState = Arc<Orchestrator>;
 const PEERS_HINT: &str = "run swarm peers to list agents";
@@ -112,6 +117,8 @@ struct HealthResponse {
     status: &'static str,
     uptime: u64,
     version: &'static str,
+    data_dir: String,
+    project_dir: String,
 }
 
 #[derive(Serialize)]
@@ -201,9 +208,41 @@ pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) ->
     match dashboard_dir {
         Some(dir) if dir.exists() => {
             let index = dir.join("index.html");
-            api.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(index)))
+            api.fallback_service(
+                ServeDir::new(&dir).not_found_service(ServeFile::new(index)),
+            )
+        }
+        _ if DashboardAssets::get("index.html").is_some() => {
+            api.fallback(serve_embedded)
         }
         _ => api.fallback(not_found),
+    }
+}
+
+async fn serve_embedded(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match DashboardAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(axum::http::header::CONTENT_TYPE, mime.as_ref().to_string())],
+                content.data.to_vec(),
+            )
+                .into_response()
+        }
+        None => match DashboardAssets::get("index.html") {
+            Some(content) => (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/html".to_string(),
+                )],
+                content.data.to_vec(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
 }
 
@@ -212,6 +251,8 @@ async fn health(State(orch): State<AppState>) -> impl IntoResponse {
         status: "ok",
         uptime: orch.uptime_seconds(),
         version: env!("CARGO_PKG_VERSION"),
+        data_dir: orch.data_dir().to_string_lossy().to_string(),
+        project_dir: orch.project_dir().to_string_lossy().to_string(),
     })
 }
 

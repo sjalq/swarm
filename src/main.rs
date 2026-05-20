@@ -52,7 +52,11 @@ enum Commands {
         #[arg(long)]
         no_gitignore: bool,
 
-        /// Path to the dashboard frontend dist directory
+        /// Override data directory (default: platform data dir)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Path to the dashboard frontend dist directory (dev override)
         #[arg(long)]
         dashboard: Option<PathBuf>,
     },
@@ -244,6 +248,7 @@ async fn main() {
             prompt,
             role,
             no_gitignore,
+            data_dir,
             dashboard,
         } => {
             let config = SwarmConfig::load(Some(&project_dir));
@@ -255,6 +260,9 @@ async fn main() {
                     .unwrap_or_else(|| "echo".into())
             });
 
+            let resolved_data_dir =
+                SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
+
             if let Err(msg) = swarm::harness::preflight_check(&harness) {
                 eprintln!("{msg}");
                 std::process::exit(1);
@@ -262,6 +270,7 @@ async fn main() {
 
             if let Err(e) = run_orchestrator(
                 project_dir,
+                resolved_data_dir,
                 port,
                 harness,
                 prompt,
@@ -419,6 +428,7 @@ async fn main() {
 
 async fn run_orchestrator(
     project_dir: PathBuf,
+    data_dir: PathBuf,
     port: u16,
     harness: String,
     prompt: String,
@@ -434,9 +444,12 @@ async fn run_orchestrator(
         .init();
 
     let project_dir = std::fs::canonicalize(&project_dir)?;
-    let data_dir = project_dir.join(".swarm");
     std::fs::create_dir_all(&data_dir)?;
-    std::fs::create_dir_all(data_dir.join("agents"))?;
+    let agents_dir = project_dir.join(".swarm").join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+
+    SwarmConfig::write_breadcrumb(&data_dir);
+    tracing::info!("data directory: {}", data_dir.display());
 
     if !no_gitignore {
         let gitignore = project_dir.join(".gitignore");
@@ -488,14 +501,7 @@ async fn run_orchestrator(
     }
 
     // Start HTTP server
-    let dashboard_dir = dashboard.or_else(|| {
-        let candidate = std::env::current_exe().ok()?.parent()?.join("dashboard");
-        candidate.exists().then_some(candidate)
-    });
-    if let Some(ref dir) = dashboard_dir {
-        tracing::info!("serving dashboard from {}", dir.display());
-    }
-    let router = swarm::server::router_with_dashboard(orch.clone(), dashboard_dir);
+    let router = swarm::server::router_with_dashboard(orch.clone(), dashboard);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 

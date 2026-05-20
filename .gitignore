@@ -2,3 +2,7 @@
 .env.agent
 .swarm/
 *.swp
+frontend/dist/
+frontend/target/
+.playwright-mcp/
+.claude/

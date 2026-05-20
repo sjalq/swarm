@@ -21,11 +21,15 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let addr = format!("http://127.0.0.1:{port}");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
             "run",
             "--project-dir",
             dir.path().to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
             "--port",
             &port.to_string(),
             "--harness",
