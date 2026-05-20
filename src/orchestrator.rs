@@ -604,23 +604,23 @@ impl Orchestrator {
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
         if !Self::active_status(&agent.status) {
-            return Err(SwarmError::Internal(format!(
-                "agent {to} is not accepting messages; status is {}",
-                agent.status
-            )));
+            return Err(SwarmError::AgentInactive {
+                id: to.to_string(),
+                status: agent.status,
+            });
         }
 
         if agent.comms == "parent-only" {
             match agent.parent_id.as_deref() {
                 Some(parent) if from == parent || from == "user" || from == "system" => {}
                 Some(parent) => {
-                    return Err(SwarmError::Internal(format!(
+                    return Err(SwarmError::InvalidRequest(format!(
                         "agent {to} only accepts messages from its parent ({parent})"
                     )));
                 }
                 None if from == "user" || from == "system" => {}
                 None => {
-                    return Err(SwarmError::Internal(format!(
+                    return Err(SwarmError::InvalidRequest(format!(
                         "agent {to} has parent-only comms but no parent"
                     )));
                 }
@@ -662,6 +662,10 @@ impl Orchestrator {
             .db
             .get_agent(id)?
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
+
+        if !Self::active_status(&agent.status) {
+            return Ok(());
+        }
 
         if let Some(msg_content) = message {
             if let Some(ref parent_id) = agent.parent_id {

@@ -22,6 +22,34 @@ fn setup() -> (tempfile::TempDir, Arc<Orchestrator>) {
     (dir, orch)
 }
 
+async fn setup_http_server() -> (tempfile::TempDir, Arc<Orchestrator>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let registry = HarnessRegistry::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        registry,
+        addr.clone(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+
+    let router = swarm::server::router(orch.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (dir, orch, addr)
+}
+
 fn setup_with_git() -> (tempfile::TempDir, Arc<Orchestrator>) {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
@@ -424,6 +452,90 @@ async fn http_api_spawn_and_list() {
         .unwrap();
     let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(agents.len(), 0);
+}
+
+#[tokio::test]
+async fn http_api_agent_not_found_returns_json_error() {
+    let (_dir, _orch, addr) = setup_http_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{addr}/api/agents/missing-agent"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "agent not found: missing-agent");
+    assert_eq!(body["hint"], "run swarm peers to list agents");
+}
+
+#[tokio::test]
+async fn http_api_send_to_done_or_dead_agent_returns_json_error() {
+    let (_dir, orch, addr) = setup_http_server().await;
+    let client = reqwest::Client::new();
+
+    let done_agent = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    orch.done_agent(&done_agent.id, None).await.unwrap();
+
+    let resp = client
+        .post(format!("{addr}/api/messages"))
+        .json(&serde_json::json!({
+            "from": "user",
+            "to": done_agent.id,
+            "content": "hello?"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("status is done"));
+    assert_eq!(body["hint"], "run swarm peers to list agents");
+
+    let dead_agent = orch.spawn_agent("dead", "echo", "", None, "mesh").unwrap();
+    orch.kill_agent(&dead_agent.id).await.unwrap();
+
+    let resp = client
+        .post(format!("{addr}/api/messages"))
+        .json(&serde_json::json!({
+            "from": "user",
+            "to": dead_agent.id,
+            "content": "hello?"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("status is dead"));
+    assert_eq!(body["hint"], "run swarm peers to list agents");
+}
+
+#[tokio::test]
+async fn cli_send_to_done_agent_exits_nonzero() {
+    let (_dir, orch, addr) = setup_http_server().await;
+    let agent = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    orch.done_agent(&agent.id, None).await.unwrap();
+    let agent_id = agent.id.clone();
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_swarm"))
+            .env("SWARM_SOCKET", addr)
+            .args(["send", &agent_id, "hello?"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not accepting messages"), "{stderr}");
+    assert!(stderr.contains("status is done"), "{stderr}");
 }
 
 #[tokio::test]
@@ -1082,6 +1194,49 @@ async fn done_agent_sends_message_to_parent() {
         .filter(|e| e.kind == "recv" && e.content == "task complete")
         .collect();
     assert_eq!(recv.len(), 1, "parent should receive the done message");
+}
+
+#[tokio::test]
+async fn done_agent_is_idempotent() {
+    let (_dir, orch) = setup();
+
+    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let child = orch
+        .spawn_agent("worker", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.done_agent(&child.id, Some("first done"))
+        .await
+        .unwrap();
+    orch.done_agent(&child.id, Some("second done"))
+        .await
+        .unwrap();
+
+    let fetched = orch.get_agent(&child.id).unwrap().unwrap();
+    assert_eq!(fetched.status, "done");
+
+    let log = orch.get_agent_log(&parent.id, 50, LogFilter::All).unwrap();
+    let first_messages = log
+        .iter()
+        .filter(|e| e.kind == "recv" && e.content == "first done")
+        .count();
+    let second_messages = log
+        .iter()
+        .filter(|e| e.kind == "recv" && e.content == "second done")
+        .count();
+    assert_eq!(first_messages, 1, "first done message should be sent once");
+    assert_eq!(
+        second_messages, 0,
+        "second done call should not enqueue a parent message"
+    );
+
+    let done_events = orch
+        .list_events(None, Some(&child.id), 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == "agent_done")
+        .count();
+    assert_eq!(done_events, 1, "done event should only be emitted once");
 }
 
 #[tokio::test]
