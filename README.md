@@ -30,8 +30,8 @@ swarm run --harness claude --prompt "Refactor the auth module into smaller files
 # In another terminal, check on agents
 swarm peers
 
-# View what the coordinator is doing
-swarm log <agent-id>
+# View a compact digest before opening raw logs
+swarm brief <agent-id>
 ```
 
 ## Install
@@ -224,13 +224,27 @@ swarm models
 View an agent's recent activity.
 
 ```bash
-swarm log <AGENT_ID> [-n <COUNT>] [--messages] [--output]
+swarm log <AGENT_ID> [-n <COUNT>] [--messages] [--output] [--search <TEXT>] [--raw]
 ```
 
 Options:
 - `-n <COUNT>` : Number of entries to show (default: `20`)
 - `--messages` : Show only messages (sent and received)
 - `--output` : Show only harness output
+- `--search <TEXT>` : Search log content case-insensitively before applying the limit
+- `--raw` : Disable text truncation and show exact full log entries
+
+### `swarm brief`
+
+Show a compact digest that is safe to use as working context before reaching for raw logs.
+
+```bash
+swarm brief                 # run-level summary
+swarm brief <AGENT_ID>      # one agent summary and compact recent log
+swarm brief <AGENT_ID> --search "timeout"
+```
+
+Brief output includes status, prompt size, latest structured handover, and short log previews. Use `swarm log --raw` when you need the exact transcript.
 
 ### `swarm cleanup`
 
@@ -248,7 +262,15 @@ Signal that you have finished your task. Sends an optional final message to your
 
 ```bash
 swarm done ["optional message"]
+swarm done "Implemented auth" \
+  --outcome done \
+  --deliverable "branch swarm/auth-worker" \
+  --checks "cargo test" \
+  --risk "browser flow not checked" \
+  --next-action "review and merge"
 ```
+
+The optional structured fields are stored separately from the raw transcript and appear in `swarm brief`, keeping handoffs concise for coordinators and follow-on agents.
 
 ### `swarm kill`
 

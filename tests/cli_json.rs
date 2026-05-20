@@ -84,6 +84,24 @@ fn run_swarm_json(args: &[&str], addr: &str, agent_id: Option<&str>) -> serde_js
     })
 }
 
+fn run_swarm_ok(args: &[&str], addr: &str, agent_id: Option<&str>) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
+    command.args(args).env("SWARM_SOCKET", addr);
+    if let Some(agent_id) = agent_id {
+        command.env("SWARM_AGENT_ID", agent_id);
+    } else {
+        command.env_remove("SWARM_AGENT_ID");
+    }
+
+    let output = command.output().expect("failed to run swarm command");
+    assert!(
+        output.status.success(),
+        "command {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn peers_status_and_log_json_flags_parse() {
     let (_dir, _run, addr, agent_id) = start_swarm().await;
@@ -154,4 +172,42 @@ async fn peers_status_and_log_piped_output_is_json_without_flag() {
     assert!(peers.as_array().unwrap().iter().any(|a| {
         a["id"].as_str() == Some(agent_id.as_str()) && a["status"].as_str() == Some("done")
     }));
+}
+
+#[tokio::test]
+async fn brief_and_structured_done_json_flags_parse() {
+    let (_dir, _run, addr, agent_id) = start_swarm().await;
+
+    run_swarm_ok(
+        &[
+            "done",
+            "handover summary",
+            "--outcome",
+            "done",
+            "--deliverable",
+            "branch swarm/test",
+            "--checks",
+            "cargo test",
+            "--risk",
+            "none",
+            "--next-action",
+            "review",
+        ],
+        &addr,
+        Some(&agent_id),
+    );
+
+    let brief = run_swarm_json(&["brief", &agent_id, "--json"], &addr, None);
+    assert_eq!(brief["id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(
+        brief["latest_handover"]["summary"].as_str(),
+        Some("handover summary")
+    );
+    assert_eq!(
+        brief["latest_handover"]["next_action"].as_str(),
+        Some("review")
+    );
+
+    let run = run_swarm_json(&["brief", "--json"], &addr, None);
+    assert!(run["agents"].as_array().is_some());
 }

@@ -1,4 +1,6 @@
-use crate::db::{AgentRow, Db, DbStats, EventRow, LogEntry, LogFilter, MessageRow, OutputLogRow};
+use crate::db::{
+    AgentRow, Db, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow, OutputLogRow,
+};
 use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 const SWARM_PREAMBLE: &str = "\
-You have access to the `swarm` CLI for multi-agent coordination:
+You are a swarm agent running inside a multi-agent coordination session.
+The `swarm` CLI is available in this shell for coordination with the operator and other agents.
 
 Commands:
   swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
@@ -24,14 +27,24 @@ Commands:
   swarm cleanup <agent-id>             Remove a done agent's git worktree.
   swarm cleanup <agent-id> --delete-branch  Also delete the agent's branch.
   swarm models [--json]                List available models for each harness.
+  swarm brief [agent-id] [--json]      View a compact run or agent digest without raw transcript payloads.
   swarm log <agent-id> [--json]        View an agent's recent activity (messages sent/received and output).
   swarm log <agent-id> -n <count>      Show the last N entries (default: 20).
+  swarm log <agent-id> --search <text> Search recent log content before displaying entries.
+  swarm log <agent-id> --raw           Show exact full log content in text output.
   swarm log <agent-id> --truncate <N>  Truncate text log content to N chars (default: 500; 0 disables).
   swarm log <agent-id> --messages      Show only messages (sent and received).
   swarm log <agent-id> --output        Show only harness output.
   swarm status [--json]                Show your own agent status (includes model info).
   swarm done \"optional final message\"   Signal that you have finished your task. Sends a message to your parent and exits gracefully.
+  swarm done \"summary\" --outcome done --deliverable \"branch/file/report\" --checks \"...\" --risk \"...\" --next-action \"...\"
+                                       Attach a structured handover for brief views.
   swarm kill <agent-id>                Stop an agent and mark it done.
+
+Runtime context:
+- Your agent ID, role, and project directory are shown below this preamble.
+- SWARM_AGENT_ID, SWARM_SOCKET, and SWARM_PROJECT_DIR are set for this process.
+- Run project work from the shown project directory. Use `swarm status` if you need to confirm your identity or runtime details.
 
 Communication guidelines:
 - Always reply via `swarm send` when the sender asks a question or directly requests a result.
@@ -41,9 +54,10 @@ Communication guidelines:
 - Use `swarm send user \"message\"` when you need to notify the human operator directly.
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
 - Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
-- Use `swarm log <agent-id>` to check on agents you have delegated work to, rather than interrupting them with a status request.
+- Use `swarm brief <agent-id>` first when checking delegated agents. Use `swarm log <agent-id> --search <text>` for targeted follow-up, and `swarm log <agent-id> --raw` only when exact transcript details matter.
 - `swarm peers` shows only your parent, siblings, and descendants. Agents outside your family tree are not visible to you.
 - When your assigned task is complete, call `swarm done \"summary of what you did\"` to signal completion and report back to your parent. Do not stay idle - finish and exit.
+- Prefer structured handovers when finishing: include outcome, deliverable, checks, residual risk, and next action. Keep the summary short and put detail in files or commits when possible.
 - If you spawn child agents, their relationship to you is preserved when you finish. You do not need to clean them up unless they are stuck or no longer useful.
 - Git worktrees (`--worktree` on spawn) give an agent its own branch and file checkout. Use your judgment:
   - DO use worktrees when multiple agents will edit files in the same compiled project (Rust, Elm, etc.) - the compiler will fail if two agents edit concurrently.
@@ -103,6 +117,75 @@ pub struct WorktreeInfo {
     pub head: String,
     pub dirty: bool,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoneReport {
+    pub summary: Option<String>,
+    pub outcome: Option<String>,
+    pub deliverable: Option<String>,
+    pub checks: Option<String>,
+    pub risk: Option<String>,
+    pub next_action: Option<String>,
+}
+
+impl DoneReport {
+    fn has_content(&self) -> bool {
+        self.summary
+            .as_ref()
+            .or(self.outcome.as_ref())
+            .or(self.deliverable.as_ref())
+            .or(self.checks.as_ref())
+            .or(self.risk.as_ref())
+            .or(self.next_action.as_ref())
+            .is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BriefLogEntry {
+    pub timestamp: String,
+    pub kind: String,
+    pub peer: String,
+    pub content_chars: usize,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentBrief {
+    pub id: String,
+    pub role: String,
+    pub harness: String,
+    pub model: String,
+    pub status: String,
+    pub parent_id: Option<String>,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub prompt_chars: usize,
+    pub latest_handover: Option<HandoverRow>,
+    pub recent_log: Vec<BriefLogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentBriefSummary {
+    pub id: String,
+    pub role: String,
+    pub harness: String,
+    pub status: String,
+    pub parent_id: Option<String>,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub prompt_chars: usize,
+    pub latest_handover: Option<HandoverRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunBrief {
+    pub stats: DbStats,
+    pub agents: Vec<AgentBriefSummary>,
+    pub recent_handovers: Vec<HandoverRow>,
 }
 
 enum WorkerCmd {
@@ -172,6 +255,29 @@ impl Orchestrator {
 
     fn active_status(status: &str) -> bool {
         status != "done"
+    }
+
+    fn brief_log_entry(entry: LogEntry) -> BriefLogEntry {
+        let content_chars = entry.content.chars().count();
+        let mut preview = entry
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        const PREVIEW_CHARS: usize = 240;
+        if preview.chars().count() > PREVIEW_CHARS {
+            let mut truncated = preview.chars().take(PREVIEW_CHARS).collect::<String>();
+            truncated.push_str("...");
+            preview = truncated;
+        }
+
+        BriefLogEntry {
+            timestamp: entry.timestamp,
+            kind: entry.kind,
+            peer: entry.peer,
+            content_chars,
+            preview,
+        }
     }
 
     fn validate_identifier(kind: &str, value: &str) -> Result<()> {
@@ -366,6 +472,105 @@ impl Orchestrator {
         filter: LogFilter,
     ) -> Result<Vec<LogEntry>> {
         self.db.get_agent_log(agent_id, limit, filter)
+    }
+
+    pub fn search_agent_log(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        filter: LogFilter,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        self.db.search_agent_log(agent_id, limit, filter, query)
+    }
+
+    pub fn agent_brief(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        query: Option<&str>,
+    ) -> Result<AgentBrief> {
+        let agent = self
+            .db
+            .get_agent(agent_id)?
+            .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
+        let latest_handover = self.db.latest_handover(agent_id)?;
+        let recent_log = self
+            .db
+            .search_agent_log(agent_id, limit, LogFilter::All, query)?
+            .into_iter()
+            .map(Self::brief_log_entry)
+            .collect();
+
+        Ok(AgentBrief {
+            id: agent.id,
+            role: agent.role,
+            harness: agent.harness,
+            model: agent.model,
+            status: agent.status,
+            parent_id: agent.parent_id,
+            created_at: agent.created_at,
+            ended_at: agent.ended_at,
+            worktree_branch: agent.worktree_branch,
+            prompt_chars: agent.system_prompt.chars().count(),
+            latest_handover,
+            recent_log,
+        })
+    }
+
+    pub fn run_brief(&self, limit: usize, query: Option<&str>) -> Result<RunBrief> {
+        let mut agents = self.db.list_all_agents()?;
+        agents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let query_lower = query.map(str::to_lowercase);
+        let mut summaries = Vec::new();
+        for agent in agents {
+            let latest_handover = self.db.latest_handover(&agent.id)?;
+            if let Some(query) = query_lower.as_deref() {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {}",
+                    agent.id,
+                    agent.role,
+                    agent.harness,
+                    agent.status,
+                    agent.parent_id.as_deref().unwrap_or(""),
+                    latest_handover
+                        .as_ref()
+                        .and_then(|h| h.summary.as_deref())
+                        .unwrap_or(""),
+                    latest_handover
+                        .as_ref()
+                        .and_then(|h| h.next_action.as_deref())
+                        .unwrap_or("")
+                )
+                .to_lowercase();
+                if !haystack.contains(query) {
+                    continue;
+                }
+            }
+
+            summaries.push(AgentBriefSummary {
+                id: agent.id,
+                role: agent.role,
+                harness: agent.harness,
+                status: agent.status,
+                parent_id: agent.parent_id,
+                created_at: agent.created_at,
+                ended_at: agent.ended_at,
+                worktree_branch: agent.worktree_branch,
+                prompt_chars: agent.system_prompt.chars().count(),
+                latest_handover,
+            });
+            if summaries.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(RunBrief {
+            stats: self.db.stats()?,
+            agents: summaries,
+            recent_handovers: self.db.latest_handovers(limit)?,
+        })
     }
 
     pub fn list_events(
@@ -866,6 +1071,17 @@ impl Orchestrator {
     }
 
     pub async fn done_agent(&self, id: &str, message: Option<&str>) -> Result<()> {
+        self.done_agent_with_report(
+            id,
+            DoneReport {
+                summary: message.map(str::to_string),
+                ..DoneReport::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn done_agent_with_report(&self, id: &str, report: DoneReport) -> Result<()> {
         let db = self.db.clone();
         let agent_id = id.to_string();
         let agent = Self::blocking_db("get agent", move || db.get_agent(&agent_id))
@@ -876,7 +1092,23 @@ impl Orchestrator {
             return Ok(());
         }
 
-        if let Some(msg_content) = message {
+        if report.has_content() {
+            let handover = HandoverRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: id.to_string(),
+                summary: report.summary.clone(),
+                outcome: report.outcome.clone(),
+                deliverable: report.deliverable.clone(),
+                checks: report.checks.clone(),
+                risk: report.risk.clone(),
+                next_action: report.next_action.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let db = self.db.clone();
+            Self::blocking_db("insert handover", move || db.insert_handover(&handover)).await?;
+        }
+
+        if let Some(msg_content) = report.summary.as_deref() {
             if let Some(ref parent_id) = agent.parent_id {
                 let msg = MessageRow {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -914,7 +1146,7 @@ impl Orchestrator {
         }
         self.emit_event_async(SwarmEvent::AgentDone {
             agent_id: id.to_string(),
-            message: message.map(String::from),
+            message: report.summary.clone(),
         })
         .await;
         Ok(())

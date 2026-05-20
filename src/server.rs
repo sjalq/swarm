@@ -1,7 +1,7 @@
 use crate::db::LogFilter;
 use crate::error::SwarmError;
 use crate::harness::CliKind;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{DoneReport, Orchestrator};
 use axum::extract::ws;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -9,7 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tower_http::services::{ServeDir, ServeFile};
 
 type AppState = Arc<Orchestrator>;
 const PEERS_HINT: &str = "run swarm peers to list agents";
@@ -35,6 +37,11 @@ fn default_comms() -> String {
 #[derive(Deserialize)]
 pub struct DoneRequest {
     pub message: Option<String>,
+    pub outcome: Option<String>,
+    pub deliverable: Option<String>,
+    pub checks: Option<String>,
+    pub risk: Option<String>,
+    pub next_action: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +64,7 @@ pub struct LogQuery {
     pub n: usize,
     #[serde(rename = "type", default)]
     pub filter_type: Option<String>,
+    pub q: Option<String>,
 }
 
 fn default_log_limit() -> usize {
@@ -79,6 +87,17 @@ pub struct EventQuery {
 
 fn default_event_limit() -> usize {
     100
+}
+
+#[derive(Deserialize)]
+pub struct BriefQuery {
+    #[serde(default = "default_brief_limit")]
+    pub limit: usize,
+    pub q: Option<String>,
+}
+
+fn default_brief_limit() -> usize {
+    20
 }
 
 #[derive(Serialize)]
@@ -158,11 +177,17 @@ where
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    router_with_dashboard(state, None)
+}
+
+pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) -> Router {
+    let api = Router::new()
         .route("/api/health", get(health))
+        .route("/api/brief", get(get_run_brief))
         .route("/api/stats", get(get_stats))
         .route("/api/agents", get(list_agents).post(spawn_agent))
         .route("/api/agents/{id}", get(get_agent).delete(kill_agent))
+        .route("/api/agents/{id}/brief", get(get_agent_brief))
         .route("/api/agents/{id}/done", post(done_agent))
         .route("/api/agents/{id}/cleanup", post(cleanup_agent))
         .route("/api/agents/{id}/log", get(get_agent_log))
@@ -171,8 +196,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(list_events))
         .route("/api/models", get(list_models))
         .route("/ws", get(ws_handler))
-        .fallback(not_found)
-        .with_state(state)
+        .with_state(state);
+
+    match dashboard_dir {
+        Some(dir) if dir.exists() => {
+            let index = dir.join("index.html");
+            api.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(index)))
+        }
+        _ => api.fallback(not_found),
+    }
 }
 
 async fn health(State(orch): State<AppState>) -> impl IntoResponse {
@@ -186,6 +218,20 @@ async fn health(State(orch): State<AppState>) -> impl IntoResponse {
 async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
     match blocking_orchestrator("get stats", move || orch.stats()).await {
         Ok(stats) => Json(stats).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn get_run_brief(
+    State(orch): State<AppState>,
+    Query(params): Query<BriefQuery>,
+) -> impl IntoResponse {
+    match blocking_orchestrator("get run brief", move || {
+        orch.run_brief(params.limit, params.q.as_deref())
+    })
+    .await
+    {
+        Ok(brief) => Json(brief).into_response(),
         Err(e) => swarm_error_response(e),
     }
 }
@@ -279,11 +325,27 @@ async fn get_agent_log(
     };
     match blocking_orchestrator("get agent log", {
         let id = id.clone();
-        move || orch.get_agent_log(&id, params.n, filter)
+        move || orch.search_agent_log(&id, params.n, filter, params.q.as_deref())
     })
     .await
     {
         Ok(entries) => Json(entries).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn get_agent_brief(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<BriefQuery>,
+) -> impl IntoResponse {
+    match blocking_orchestrator("get agent brief", {
+        let id = id.clone();
+        move || orch.agent_brief(&id, params.limit, params.q.as_deref())
+    })
+    .await
+    {
+        Ok(brief) => Json(brief).into_response(),
         Err(e) => swarm_error_response(e),
     }
 }
@@ -313,7 +375,15 @@ async fn done_agent(
     Path(id): Path<String>,
     Json(req): Json<DoneRequest>,
 ) -> impl IntoResponse {
-    match orch.done_agent(&id, req.message.as_deref()).await {
+    let report = DoneReport {
+        summary: req.message,
+        outcome: req.outcome,
+        deliverable: req.deliverable,
+        checks: req.checks,
+        risk: req.risk,
+        next_action: req.next_action,
+    };
+    match orch.done_agent_with_report(&id, report).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => swarm_error_response(e),
     }

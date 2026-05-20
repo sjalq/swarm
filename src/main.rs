@@ -51,6 +51,10 @@ enum Commands {
         /// Skip automatic .gitignore update
         #[arg(long)]
         no_gitignore: bool,
+
+        /// Path to the dashboard frontend dist directory
+        #[arg(long)]
+        dashboard: Option<PathBuf>,
     },
 
     /// List all agents in the swarm
@@ -134,9 +138,35 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Search log content case-insensitively before applying the limit
+        #[arg(long, alias = "grep")]
+        search: Option<String>,
+
+        /// Show exact full content in text output
+        #[arg(long)]
+        raw: bool,
+
         /// Maximum content characters to show in text output (0 disables truncation)
         #[arg(long, default_value = "500")]
         truncate: usize,
+    },
+
+    /// Show a compact digest for a run or one agent
+    Brief {
+        /// Agent ID to inspect. Omit for run-level summary.
+        target: Option<String>,
+
+        /// Number of recent agents/log entries to show
+        #[arg(short = 'n', long = "last", default_value = "20")]
+        last: usize,
+
+        /// Search compact run fields or agent log content
+        #[arg(long, alias = "grep")]
+        search: Option<String>,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Clean up an agent's worktree and optionally its branch
@@ -153,6 +183,26 @@ enum Commands {
     Done {
         /// Optional final message to send to your parent
         message: Option<String>,
+
+        /// Structured outcome: done, partial, blocked, failed, etc.
+        #[arg(long)]
+        outcome: Option<String>,
+
+        /// Deliverable produced, such as a branch, file, report, or none
+        #[arg(long)]
+        deliverable: Option<String>,
+
+        /// Verification performed and result
+        #[arg(long)]
+        checks: Option<String>,
+
+        /// Residual risk or unverified area
+        #[arg(long)]
+        risk: Option<String>,
+
+        /// Recommended next action for the caller
+        #[arg(long)]
+        next_action: Option<String>,
     },
 
     /// Stop an agent and mark it done
@@ -194,6 +244,7 @@ async fn main() {
             prompt,
             role,
             no_gitignore,
+            dashboard,
         } => {
             let config = SwarmConfig::load(Some(&project_dir));
             let port = port.unwrap_or_else(|| config.default_port.unwrap_or(9800));
@@ -209,8 +260,16 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            if let Err(e) =
-                run_orchestrator(project_dir, port, harness, prompt, role, no_gitignore).await
+            if let Err(e) = run_orchestrator(
+                project_dir,
+                port,
+                harness,
+                prompt,
+                role,
+                no_gitignore,
+                dashboard,
+            )
+            .await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -280,6 +339,8 @@ async fn main() {
             messages,
             output,
             json,
+            search,
+            raw,
             truncate,
         } => {
             let filter = if messages {
@@ -289,7 +350,20 @@ async fn main() {
             } else {
                 "all"
             };
-            if let Err(e) = cmd_log(&target, last, filter, json, truncate).await {
+            let truncate = if raw { 0 } else { truncate };
+            if let Err(e) = cmd_log(&target, last, filter, json, truncate, search.as_deref()).await
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Brief {
+            target,
+            last,
+            search,
+            json,
+        } => {
+            if let Err(e) = cmd_brief(target.as_deref(), last, search.as_deref(), json).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -303,8 +377,24 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Done { message } => {
-            if let Err(e) = cmd_done(message.as_deref()).await {
+        Commands::Done {
+            message,
+            outcome,
+            deliverable,
+            checks,
+            risk,
+            next_action,
+        } => {
+            if let Err(e) = cmd_done(
+                message.as_deref(),
+                outcome.as_deref(),
+                deliverable.as_deref(),
+                checks.as_deref(),
+                risk.as_deref(),
+                next_action.as_deref(),
+            )
+            .await
+            {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -334,6 +424,7 @@ async fn run_orchestrator(
     prompt: String,
     role: String,
     no_gitignore: bool,
+    dashboard: Option<PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -397,7 +488,14 @@ async fn run_orchestrator(
     }
 
     // Start HTTP server
-    let router = swarm::server::router(orch.clone());
+    let dashboard_dir = dashboard.or_else(|| {
+        let candidate = std::env::current_exe().ok()?.parent()?.join("dashboard");
+        candidate.exists().then_some(candidate)
+    });
+    if let Some(ref dir) = dashboard_dir {
+        tracing::info!("serving dashboard from {}", dir.display());
+    }
+    let router = swarm::server::router_with_dashboard(orch.clone(), dashboard_dir);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 
@@ -697,13 +795,21 @@ async fn cmd_log(
     filter: &str,
     json: bool,
     truncate: usize,
+    search: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
-    let mut url = format!("{socket}/api/agents/{target}/log?n={limit}");
-    if filter != "all" {
-        url.push_str(&format!("&type={filter}"));
+    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/log"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("n", &limit.to_string());
+        if filter != "all" {
+            query.append_pair("type", filter);
+        }
+        if let Some(search) = search {
+            query.append_pair("q", search);
+        }
     }
-    let resp = reqwest::get(&url).await?;
+    let resp = reqwest::get(url).await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -742,6 +848,151 @@ async fn cmd_log(
     Ok(())
 }
 
+async fn cmd_brief(
+    target: Option<&str>,
+    limit: usize,
+    search: Option<&str>,
+    json: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let endpoint = if let Some(target) = target {
+        format!("{socket}/api/agents/{target}/brief")
+    } else {
+        format!("{socket}/api/brief")
+    };
+    let mut url = reqwest::Url::parse(&endpoint)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("limit", &limit.to_string());
+        if let Some(search) = search {
+            query.append_pair("q", search);
+        }
+    }
+
+    let resp = reqwest::get(url).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let brief: serde_json::Value = resp.json().await?;
+
+    if wants_json(json) {
+        return print_json(&brief);
+    }
+
+    if target.is_some() {
+        print_agent_brief(&brief);
+    } else {
+        print_run_brief(&brief);
+    }
+    Ok(())
+}
+
+fn print_agent_brief(brief: &serde_json::Value) {
+    println!(
+        "{} ({}) [{}]",
+        brief["id"].as_str().unwrap_or("?"),
+        brief["role"].as_str().unwrap_or("?"),
+        brief["status"].as_str().unwrap_or("?")
+    );
+    println!(
+        "harness: {}  model: {}  parent: {}",
+        brief["harness"].as_str().unwrap_or("?"),
+        brief["model"].as_str().unwrap_or("").trim(),
+        brief["parent_id"].as_str().unwrap_or("-")
+    );
+    println!(
+        "created: {}  ended: {}  prompt: {} chars",
+        brief["created_at"].as_str().unwrap_or("?"),
+        brief["ended_at"].as_str().unwrap_or("-"),
+        brief["prompt_chars"].as_u64().unwrap_or(0)
+    );
+    if let Some(branch) = brief["worktree_branch"].as_str() {
+        println!("worktree: {branch}");
+    }
+    print_handover(brief.get("latest_handover"));
+
+    if let Some(entries) = brief["recent_log"].as_array() {
+        if !entries.is_empty() {
+            println!("recent:");
+            for entry in entries {
+                println!(
+                    "  {} {:<11} {:<20} {:>5} chars  {}",
+                    entry["timestamp"].as_str().unwrap_or("?"),
+                    entry["kind"].as_str().unwrap_or("?"),
+                    entry["peer"].as_str().unwrap_or(""),
+                    entry["content_chars"].as_u64().unwrap_or(0),
+                    entry["preview"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
+}
+
+fn print_run_brief(brief: &serde_json::Value) {
+    let stats = &brief["stats"];
+    println!(
+        "agents: total={} alive={} done={} messages={} errors={}",
+        stats["total"].as_u64().unwrap_or(0),
+        stats["alive"].as_u64().unwrap_or(0),
+        stats["done"].as_u64().unwrap_or(0),
+        stats["messages"].as_u64().unwrap_or(0),
+        stats["errors"].as_u64().unwrap_or(0)
+    );
+
+    if let Some(agents) = brief["agents"].as_array() {
+        if !agents.is_empty() {
+            println!("recent agents:");
+            for agent in agents {
+                let summary = agent
+                    .get("latest_handover")
+                    .and_then(|h| h.get("summary"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                println!(
+                    "  {:<26} {:<18} {:<8} prompt={:>5} {}",
+                    agent["id"].as_str().unwrap_or("?"),
+                    agent["role"].as_str().unwrap_or("?"),
+                    agent["status"].as_str().unwrap_or("?"),
+                    agent["prompt_chars"].as_u64().unwrap_or(0),
+                    summary
+                );
+            }
+        }
+    }
+
+    if let Some(handovers) = brief["recent_handovers"].as_array() {
+        if !handovers.is_empty() {
+            println!("recent handovers:");
+            for handover in handovers {
+                println!(
+                    "  {:<26} {}",
+                    handover["agent_id"].as_str().unwrap_or("?"),
+                    handover["summary"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
+}
+
+fn print_handover(handover: Option<&serde_json::Value>) {
+    let Some(handover) = handover.filter(|h| !h.is_null()) else {
+        return;
+    };
+    println!("handover:");
+    for (label, key) in [
+        ("summary", "summary"),
+        ("outcome", "outcome"),
+        ("deliverable", "deliverable"),
+        ("checks", "checks"),
+        ("risk", "risk"),
+        ("next", "next_action"),
+    ] {
+        if let Some(value) = handover[key].as_str().filter(|value| !value.is_empty()) {
+            println!("  {label}: {value}");
+        }
+    }
+}
+
 async fn cmd_cleanup(
     target: &str,
     delete_branch: bool,
@@ -762,7 +1013,14 @@ async fn cmd_cleanup(
     Ok(())
 }
 
-async fn cmd_done(message: Option<&str>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_done(
+    message: Option<&str>,
+    outcome: Option<&str>,
+    deliverable: Option<&str>,
+    checks: Option<&str>,
+    risk: Option<&str>,
+    next_action: Option<&str>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
     let client = reqwest::Client::new();
@@ -770,6 +1028,11 @@ async fn cmd_done(message: Option<&str>) -> std::result::Result<(), Box<dyn std:
         .post(format!("{socket}/api/agents/{agent_id}/done"))
         .json(&serde_json::json!({
             "message": message,
+            "outcome": outcome,
+            "deliverable": deliverable,
+            "checks": checks,
+            "risk": risk,
+            "next_action": next_action,
         }))
         .send()
         .await?;

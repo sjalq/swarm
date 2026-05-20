@@ -49,6 +49,19 @@ pub struct OutputLogRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoverRow {
+    pub id: String,
+    pub agent_id: String,
+    pub summary: Option<String>,
+    pub outcome: Option<String>,
+    pub deliverable: Option<String>,
+    pub checks: Option<String>,
+    pub risk: Option<String>,
+    pub next_action: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
     pub kind: String,
@@ -73,6 +86,13 @@ pub struct DbStats {
 
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 impl Db {
@@ -142,7 +162,20 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_events_time
                 ON events(created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent
-                ON events(agent_id, created_at);",
+                ON events(agent_id, created_at);
+            CREATE TABLE IF NOT EXISTS handovers (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                summary TEXT,
+                outcome TEXT,
+                deliverable TEXT,
+                checks TEXT,
+                risk TEXT,
+                next_action TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_handovers_agent
+                ON handovers(agent_id, created_at);",
         )?;
         Self::ensure_agents_column(&conn, "ended_at", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "worktree_branch", "TEXT NULL")?;
@@ -437,83 +470,148 @@ impl Db {
         Ok(())
     }
 
+    pub fn insert_handover(&self, handover: &HandoverRow) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO handovers (
+                id, agent_id, summary, outcome, deliverable, checks, risk, next_action, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                handover.id,
+                handover.agent_id,
+                handover.summary,
+                handover.outcome,
+                handover.deliverable,
+                handover.checks,
+                handover.risk,
+                handover.next_action,
+                handover.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn handover_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoverRow> {
+        Ok(HandoverRow {
+            id: row.get(0)?,
+            agent_id: row.get(1)?,
+            summary: row.get(2)?,
+            outcome: row.get(3)?,
+            deliverable: row.get(4)?,
+            checks: row.get(5)?,
+            risk: row.get(6)?,
+            next_action: row.get(7)?,
+            created_at: row.get(8)?,
+        })
+    }
+
+    pub fn latest_handover(&self, agent_id: &str) -> Result<Option<HandoverRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, summary, outcome, deliverable, checks, risk, next_action, created_at
+             FROM handovers WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let result = stmt.query_row([agent_id], Self::handover_from_row);
+        match result {
+            Ok(handover) => Ok(Some(handover)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn latest_handovers(&self, limit: usize) -> Result<Vec<HandoverRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, summary, outcome, deliverable, checks, risk, next_action, created_at
+             FROM handovers ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], Self::handover_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_agent_log(
         &self,
         agent_id: &str,
         limit: usize,
         filter: LogFilter,
     ) -> Result<Vec<LogEntry>> {
+        self.search_agent_log(agent_id, limit, filter, None)
+    }
+
+    pub fn search_agent_log(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        filter: LogFilter,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
         let conn = self.conn()?;
 
-        let entries = match filter {
+        let base = match filter {
             LogFilter::All => {
-                let mut stmt = conn.prepare(
-                    "SELECT timestamp, kind, peer, content FROM (
-                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
-                        FROM messages WHERE to_agent = ?1
-                        UNION ALL
-                        SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
-                        FROM messages WHERE from_agent = ?1
-                        UNION ALL
-                        SELECT created_at AS timestamp, kind, '' AS peer, content
-                        FROM output_log WHERE agent_id = ?1
-                    ) ORDER BY timestamp ASC LIMIT ?2",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![agent_id, limit], |row| {
-                        Ok(LogEntry {
-                            timestamp: row.get(0)?,
-                            kind: row.get(1)?,
-                            peer: row.get(2)?,
-                            content: row.get(3)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
+                "SELECT timestamp, kind, peer, content FROM (
+                    SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
+                    FROM messages WHERE to_agent = ?1
+                    UNION ALL
+                    SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
+                    FROM messages WHERE from_agent = ?1
+                    UNION ALL
+                    SELECT created_at AS timestamp, kind, '' AS peer, content
+                    FROM output_log WHERE agent_id = ?1
+                )"
             }
             LogFilter::Messages => {
-                let mut stmt = conn.prepare(
-                    "SELECT timestamp, kind, peer, content FROM (
-                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
-                        FROM messages WHERE to_agent = ?1
-                        UNION ALL
-                        SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
-                        FROM messages WHERE from_agent = ?1
-                    ) ORDER BY timestamp ASC LIMIT ?2",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![agent_id, limit], |row| {
-                        Ok(LogEntry {
-                            timestamp: row.get(0)?,
-                            kind: row.get(1)?,
-                            peer: row.get(2)?,
-                            content: row.get(3)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
+                "SELECT timestamp, kind, peer, content FROM (
+                    SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
+                    FROM messages WHERE to_agent = ?1
+                    UNION ALL
+                    SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
+                    FROM messages WHERE from_agent = ?1
+                )"
             }
             LogFilter::Output => {
-                let mut stmt = conn.prepare(
-                    "SELECT created_at, kind, '' AS peer, content
-                     FROM output_log WHERE agent_id = ?1
-                     ORDER BY created_at ASC LIMIT ?2",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![agent_id, limit], |row| {
-                        Ok(LogEntry {
-                            timestamp: row.get(0)?,
-                            kind: row.get(1)?,
-                            peer: row.get(2)?,
-                            content: row.get(3)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
+                "SELECT timestamp, kind, peer, content FROM (
+                    SELECT created_at AS timestamp, kind, '' AS peer, content
+                    FROM output_log WHERE agent_id = ?1
+                )"
             }
         };
 
-        Ok(entries)
+        let mut sql = base.to_string();
+        let pattern = query.map(|q| format!("%{}%", escape_like(q)));
+        if pattern.is_some() {
+            sql.push_str(" WHERE LOWER(content) LIKE LOWER(?2) ESCAPE '\\'");
+            sql.push_str(" ORDER BY timestamp DESC LIMIT ?3");
+        } else {
+            sql.push_str(" ORDER BY timestamp DESC LIMIT ?2");
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = if let Some(pattern) = pattern {
+            stmt.query_map(rusqlite::params![agent_id, pattern, limit], |row| {
+                Ok(LogEntry {
+                    timestamp: row.get(0)?,
+                    kind: row.get(1)?,
+                    peer: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![agent_id, limit], |row| {
+                Ok(LogEntry {
+                    timestamp: row.get(0)?,
+                    kind: row.get(1)?,
+                    peer: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        rows.reverse();
+        Ok(rows)
     }
 
     pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {
@@ -812,6 +910,57 @@ mod tests {
 
         let limited = db.get_agent_log("agent-1", 2, LogFilter::All).unwrap();
         assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].content, "working on it");
+        assert_eq!(limited[1].content, "done");
+    }
+
+    #[test]
+    fn agent_log_search_filters_content() {
+        let db = test_db();
+
+        for (id, content, created_at) in [
+            ("m1", "alpha planning", "2026-01-01T00:00:01Z"),
+            ("m2", "beta checkpoint", "2026-01-01T00:00:02Z"),
+            ("m3", "alpha handoff", "2026-01-01T00:00:03Z"),
+        ] {
+            db.enqueue_message(&MessageRow {
+                id: id.into(),
+                from_agent: "user".into(),
+                to_agent: "agent-1".into(),
+                content: content.into(),
+                delivered: false,
+                created_at: created_at.into(),
+            })
+            .unwrap();
+        }
+
+        let matches = db
+            .search_agent_log("agent-1", 10, LogFilter::Messages, Some("ALPHA"))
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].content, "alpha planning");
+        assert_eq!(matches[1].content, "alpha handoff");
+    }
+
+    #[test]
+    fn handovers_store_structured_finish_report() {
+        let db = test_db();
+        db.insert_handover(&HandoverRow {
+            id: "h1".into(),
+            agent_id: "agent-1".into(),
+            summary: Some("implemented".into()),
+            outcome: Some("done".into()),
+            deliverable: Some("branch swarm/agent-1".into()),
+            checks: Some("cargo test".into()),
+            risk: Some("none known".into()),
+            next_action: Some("review".into()),
+            created_at: "2026-01-01T00:00:01Z".into(),
+        })
+        .unwrap();
+
+        let latest = db.latest_handover("agent-1").unwrap().unwrap();
+        assert_eq!(latest.summary.as_deref(), Some("implemented"));
+        assert_eq!(latest.next_action.as_deref(), Some("review"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use swarm::db::{Db, LogFilter, MessageRow, OutputLogRow};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
-use swarm::orchestrator::{Orchestrator, SwarmEvent};
+use swarm::orchestrator::{DoneReport, Orchestrator, SwarmEvent};
 use tokio::sync::mpsc;
 
 struct ResumeProbeHarness;
@@ -713,7 +713,20 @@ async fn agent_preamble_includes_reply_limits_and_retry_guidance() {
         .spawn_agent("probe", "echo", "inspect preamble", None, "mesh")
         .unwrap();
 
-    let output = wait_for_agent_output(&mut rx, &agent.id, "All swarm commands").await;
+    let output = wait_for_agent_output(
+        &mut rx,
+        &agent.id,
+        "The `swarm` CLI is available in this shell",
+    )
+    .await;
+    assert!(
+        output.contains("You are a swarm agent running inside a multi-agent coordination session")
+    );
+    assert!(output.contains("Runtime context:"));
+    assert!(
+        output.contains("Your agent ID, role, and project directory are shown below this preamble")
+    );
+    assert!(output.contains("SWARM_AGENT_ID, SWARM_SOCKET, and SWARM_PROJECT_DIR"));
     assert!(output.contains("Always reply via `swarm send`"));
     assert!(output.contains("Never reply to status broadcasts"));
     assert!(output.contains("Keep swarm messages under 300 words"));
@@ -1015,6 +1028,29 @@ async fn http_api_agent_log() {
         .unwrap();
     let limited: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(limited.len(), 1);
+
+    // Test search param
+    let resp = client
+        .get(format!("{addr}/api/agents/{agent_id}/log?q=log%20test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let search_matches: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(search_matches
+        .iter()
+        .all(|entry| entry["content"].as_str().unwrap().contains("log test")));
+
+    // Fetch compact brief via HTTP
+    let resp = client
+        .get(format!("{addr}/api/agents/{agent_id}/brief?limit=5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let brief: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(brief["id"].as_str(), Some(agent_id.as_str()));
+    assert!(brief["recent_log"].as_array().is_some());
 }
 
 #[tokio::test]
@@ -1485,6 +1521,47 @@ async fn done_agent_sends_message_to_parent() {
         .filter(|e| e.kind == "recv" && e.content == "task complete")
         .collect();
     assert_eq!(recv.len(), 1, "parent should receive the done message");
+}
+
+#[tokio::test]
+async fn done_agent_structured_report_is_available_in_brief() {
+    let (_dir, orch) = setup();
+
+    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let child = orch
+        .spawn_agent(
+            "worker",
+            "echo",
+            "large prompt body",
+            Some(&parent.id),
+            "mesh",
+        )
+        .unwrap();
+
+    orch.done_agent_with_report(
+        &child.id,
+        DoneReport {
+            summary: Some("implemented report".into()),
+            outcome: Some("done".into()),
+            deliverable: Some("branch swarm/worker".into()),
+            checks: Some("cargo test".into()),
+            risk: Some("browser not checked".into()),
+            next_action: Some("review branch".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let parent_log = orch.get_agent_log(&parent.id, 50, LogFilter::All).unwrap();
+    assert!(parent_log
+        .iter()
+        .any(|e| e.kind == "recv" && e.content == "implemented report"));
+
+    let brief = orch.agent_brief(&child.id, 5, None).unwrap();
+    assert_eq!(brief.prompt_chars, "large prompt body".len());
+    let handover = brief.latest_handover.expect("handover should be stored");
+    assert_eq!(handover.summary.as_deref(), Some("implemented report"));
+    assert_eq!(handover.next_action.as_deref(), Some("review branch"));
 }
 
 #[tokio::test]
