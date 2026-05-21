@@ -1,8 +1,9 @@
 use crate::state::{Agent, LogEntry, Stats, SwarmEvent, WsState};
-use gloo_net::http::Request;
 use futures::StreamExt;
+use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
 use leptos::prelude::*;
+use serde::Serialize;
 use std::collections::HashMap;
 use wasm_bindgen_futures::spawn_local;
 
@@ -76,6 +77,35 @@ pub async fn fetch_agent_log(agent_id: &str, limit: usize) -> Result<Vec<LogEntr
         .map_err(|e| format!("parse failed: {}", e))
 }
 
+#[derive(Serialize)]
+struct SendMessageRequest<'a> {
+    from: &'a str,
+    to: &'a str,
+    content: &'a str,
+}
+
+pub async fn send_user_message(agent_id: &str, content: &str) -> Result<(), String> {
+    let url = format!("{}/messages", api_base());
+    let body = SendMessageRequest {
+        from: "user",
+        to: agent_id,
+        content,
+    };
+
+    let resp = Request::post(&url)
+        .json(&body)
+        .map_err(|e| format!("encode failed: {}", e))?
+        .send()
+        .await
+        .map_err(|e| format!("send failed: {}", e))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    Ok(())
+}
+
 pub fn connect_websocket(
     agents: RwSignal<Vec<Agent>>,
     activity_map: RwSignal<HashMap<String, String>>,
@@ -101,9 +131,7 @@ async fn ws_connect_loop(
                 ws
             }
             Err(e) => {
-                web_sys::console::error_1(
-                    &format!("ws connect failed: {:?}", e).into(),
-                );
+                web_sys::console::error_1(&format!("ws connect failed: {:?}", e).into());
                 let current = ws_state.get_untracked();
                 let next_attempt = match current {
                     WsState::Reconnecting { attempt } => attempt + 1,
@@ -133,9 +161,7 @@ async fn ws_connect_loop(
                 }
                 Ok(WsMessage::Bytes(_)) => {}
                 Err(e) => {
-                    web_sys::console::error_1(
-                        &format!("ws error: {:?}", e).into(),
-                    );
+                    web_sys::console::error_1(&format!("ws error: {:?}", e).into());
                     break;
                 }
             }

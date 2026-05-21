@@ -13,6 +13,10 @@ use swarm::orchestrator::{Orchestrator, SwarmEvent};
     name = "swarm",
     about = "Multi-agent CLI orchestrator",
     long_about = "Multi-agent CLI orchestrator that coordinates Claude, Codex, Gemini, and Grok CLIs.\n\n\
+        Direct responses:\n  \
+        swarm inbox <agent-id>          Read messages sent to the user/calling agent from one agent\n  \
+        swarm inbox --all               Read all recent messages sent to the user/calling agent\n  \
+        swarm log user --messages       Inspect the broader user message log\n\n\
         Environment variables:\n  \
         SWARM_CLAUDE_BIN  Override the claude binary path\n  \
         SWARM_CODEX_BIN   Override the codex binary path\n  \
@@ -72,12 +76,52 @@ enum Commands {
         json: bool,
     },
 
-    /// Send a message to an agent or notify the operator
+    /// Send a direct message to an agent or user
     Send {
-        /// Target agent ID, or "user" to notify the operator
+        /// Target agent ID, or "user" to notify the user
         target: String,
         /// Message content
         message: String,
+    },
+
+    /// Read direct messages sent to the user/calling agent from one agent
+    Inbox {
+        /// Source agent ID to read messages from; omit only with --all
+        #[arg(conflicts_with = "all")]
+        from: Option<String>,
+
+        /// Recipient to inspect (default: current agent when SWARM_AGENT_ID is set, otherwise "user"; use "me" for the current agent)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Show all recent direct messages sent to the recipient
+        #[arg(long)]
+        all: bool,
+
+        /// Number of recent messages to show
+        #[arg(
+            short = 'n',
+            long = "last",
+            visible_alias = "tail",
+            default_value = "20"
+        )]
+        last: usize,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Search message content case-insensitively before applying the limit
+        #[arg(long, alias = "grep")]
+        search: Option<String>,
+
+        /// Show exact full content in text output
+        #[arg(long)]
+        raw: bool,
+
+        /// Maximum content characters to show in text output (0 disables truncation)
+        #[arg(long, default_value = "500")]
+        truncate: usize,
     },
 
     /// Spawn a new child agent
@@ -121,13 +165,18 @@ enum Commands {
         json: bool,
     },
 
-    /// View an agent's recent activity (messages and output)
+    /// View recent activity for an agent, or the broader message log for "user"
     Log {
-        /// Agent ID to inspect
+        /// Agent ID to inspect, or "user" to inspect the broader user message log
         target: String,
 
         /// Number of entries to show
-        #[arg(short = 'n', long = "last", default_value = "20")]
+        #[arg(
+            short = 'n',
+            long = "last",
+            visible_alias = "tail",
+            default_value = "20"
+        )]
         last: usize,
 
         /// Show only messages (sent and received)
@@ -291,6 +340,32 @@ async fn main() {
         }
         Commands::Send { target, message } => {
             if let Err(e) = cmd_send(&target, &message).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Inbox {
+            from,
+            to,
+            all,
+            last,
+            json,
+            search,
+            raw,
+            truncate,
+        } => {
+            let truncate = if raw { 0 } else { truncate };
+            if let Err(e) = cmd_inbox(
+                from.as_deref(),
+                all,
+                to.as_deref(),
+                last,
+                json,
+                truncate,
+                search.as_deref(),
+            )
+            .await
+            {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -674,6 +749,74 @@ async fn cmd_send(
     } else {
         return Err(response_error(resp).await);
     }
+    Ok(())
+}
+
+fn resolve_inbox_target(
+    to: Option<&str>,
+) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    match to {
+        Some("me") => swarm_agent_id()
+            .ok_or("SWARM_AGENT_ID is not set; use --to user or --to <agent-id>")
+            .map_err(Into::into),
+        Some(target) => Ok(target.to_string()),
+        None => Ok(swarm_agent_id().unwrap_or_else(|| "user".to_string())),
+    }
+}
+
+async fn cmd_inbox(
+    from: Option<&str>,
+    all: bool,
+    to: Option<&str>,
+    limit: usize,
+    json: bool,
+    truncate: usize,
+    search: Option<&str>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let from_agent = if all {
+        None
+    } else {
+        Some(from.ok_or("pass a source agent id, or use --all to read all inbox messages")?)
+    };
+    let target = resolve_inbox_target(to)?;
+    let socket = swarm_socket();
+    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/inbox"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("n", &limit.to_string());
+        if let Some(from_agent) = from_agent {
+            query.append_pair("from", from_agent);
+        }
+        if let Some(search) = search {
+            query.append_pair("q", search);
+        }
+    }
+
+    let resp = reqwest::get(url).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let resp: Vec<serde_json::Value> = resp.json().await?;
+
+    if wants_json(json) {
+        return print_json(&resp);
+    }
+
+    if resp.is_empty() {
+        let source = from_agent.unwrap_or("any agent");
+        println!("no inbox messages for {target} from {source}");
+        return Ok(());
+    }
+
+    for entry in &resp {
+        let ts = entry["timestamp"].as_str().unwrap_or("?");
+        let short_ts = if ts.len() > 19 { &ts[..19] } else { ts };
+        let peer = entry["peer"].as_str().unwrap_or("");
+        let content = entry["content"].as_str().unwrap_or("");
+        let display_content = truncate_for_display(content, truncate);
+        println!("{} from:{:<20} {}", short_ts, peer, display_content);
+    }
+
     Ok(())
 }
 

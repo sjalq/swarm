@@ -13,13 +13,15 @@ use tokio::task::JoinHandle;
 
 const SWARM_PREAMBLE: &str = "\
 You are a swarm agent running inside a multi-agent coordination session.
-The `swarm` CLI is available in this shell for coordination with the operator and other agents.
+The `swarm` CLI is available in this shell for coordination with the user and other agents.
 
 Commands:
   swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
   swarm peers --all [--json]           Include done agents.
-  swarm send <agent-id> \"message\"      Send a message to another agent.
-  swarm send user \"message\"            Notify the operator running the orchestrator.
+  swarm send <agent-id> \"message\"      Send a direct message to another agent.
+  swarm send user \"message\"            Send a direct message to the user.
+  swarm inbox <agent-id> [-n <count>]   Read direct messages sent to you by one agent (default: last 20).
+  swarm inbox --all [-n <count>]        Read all recent direct messages sent to you.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
                                        Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
   swarm spawn --role <name> --harness claude --model claude-sonnet-4-6 --worktree --prompt \"...\"
@@ -34,6 +36,7 @@ Commands:
   swarm log <agent-id> --raw           Show exact full log content in text output.
   swarm log <agent-id> --truncate <N>  Truncate text log content to N chars (default: 500; 0 disables).
   swarm log <agent-id> --messages      Show only messages (sent and received).
+  swarm log user --messages            Inspect the broader user message log.
   swarm log <agent-id> --output        Show only harness output.
   swarm status [--json]                Show your own agent status (includes model info).
   swarm done \"optional final message\"   Signal that you have finished your task. Sends a message to your parent and exits gracefully.
@@ -48,10 +51,13 @@ Runtime context:
 
 Communication guidelines:
 - Always reply via `swarm send` when the sender asks a question or directly requests a result.
+- If you are the top-level orchestrator, send conclusions, blockers, and questions to the user with `swarm send user \"message\"`. Do not rely on harness stdout as the direct response path.
+- If another agent asked for the work, send conclusions, blockers, and questions back to that calling agent with `swarm send <agent-id> \"message\"`.
+- Use `swarm inbox <agent-id>` to read recent direct messages sent to you by one agent. Use `swarm inbox --all` only when you need all recent direct messages sent to you.
 - Never reply to status broadcasts or FYI progress updates unless they ask for action.
 - Keep swarm messages under 300 words unless the requester explicitly asks for more.
 - All swarm commands are idempotent and safe to retry.
-- Use `swarm send user \"message\"` when you need to notify the human operator directly.
+- Use `swarm send user \"message\"` when you need to notify the user directly.
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
 - Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
 - Use `swarm brief <agent-id>` first when checking delegated agents. Use `swarm log <agent-id> --search <text>` for targeted follow-up, and `swarm log <agent-id> --raw` only when exact transcript details matter.
@@ -480,6 +486,11 @@ impl Orchestrator {
         limit: usize,
         filter: LogFilter,
     ) -> Result<Vec<LogEntry>> {
+        if agent_id == "user" {
+            return self
+                .db
+                .search_user_log_for_project(&self.project_key, limit, filter, None);
+        }
         self.get_agent(agent_id)?
             .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
         self.db.get_agent_log(agent_id, limit, filter)
@@ -492,9 +503,35 @@ impl Orchestrator {
         filter: LogFilter,
         query: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
+        if agent_id == "user" {
+            return self
+                .db
+                .search_user_log_for_project(&self.project_key, limit, filter, query);
+        }
         self.get_agent(agent_id)?
             .ok_or_else(|| SwarmError::AgentNotFound(agent_id.to_string()))?;
         self.db.search_agent_log(agent_id, limit, filter, query)
+    }
+
+    pub fn search_inbox(
+        &self,
+        target: &str,
+        from_agent: Option<&str>,
+        limit: usize,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        if target == "user" {
+            return self.db.search_user_inbox_for_project(
+                &self.project_key,
+                from_agent,
+                limit,
+                query,
+            );
+        }
+
+        self.get_agent(target)?
+            .ok_or_else(|| SwarmError::AgentNotFound(target.to_string()))?;
+        self.db.search_agent_inbox(target, from_agent, limit, query)
     }
 
     pub fn agent_brief(

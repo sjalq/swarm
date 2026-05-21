@@ -2,10 +2,7 @@ use crate::state::{SortDirection, SortField, SortState};
 use leptos::prelude::*;
 
 #[component]
-pub fn SortControls(
-    sort: RwSignal<SortState>,
-    show_done: RwSignal<bool>,
-) -> impl IntoView {
+pub fn SortControls(sort: RwSignal<SortState>, show_done: RwSignal<bool>) -> impl IntoView {
     let on_sort_created = move |_| {
         sort.set(sort.get_untracked().toggle_field(SortField::CreatedAt));
     };

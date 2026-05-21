@@ -1,5 +1,5 @@
 use crate::error::{Result, SwarmError};
-use rusqlite::Connection;
+use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -94,6 +94,22 @@ fn escape_like(query: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn query_log_entries(conn: &Connection, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<LogEntry>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt
+        .query_map(params, |row| {
+            Ok(LogEntry {
+                timestamp: row.get(0)?,
+                kind: row.get(1)?,
+                peer: row.get(2)?,
+                content: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.reverse();
+    Ok(rows)
 }
 
 impl Db {
@@ -743,6 +759,149 @@ impl Db {
         };
         rows.reverse();
         Ok(rows)
+    }
+
+    pub fn search_user_log_for_project(
+        &self,
+        project_dir: &str,
+        limit: usize,
+        filter: LogFilter,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        if matches!(filter, LogFilter::Output) {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn()?;
+        let base = "SELECT timestamp, kind, peer, content FROM (
+            SELECT m.created_at AS timestamp, 'recv' AS kind, m.from_agent AS peer, m.content
+            FROM messages m
+            INNER JOIN agents a ON a.id = m.from_agent
+            WHERE m.to_agent = 'user' AND a.project_dir = ?1
+            UNION ALL
+            SELECT m.created_at AS timestamp, 'sent' AS kind, m.to_agent AS peer, m.content
+            FROM messages m
+            INNER JOIN agents a ON a.id = m.to_agent
+            WHERE m.from_agent = 'user' AND a.project_dir = ?1
+        )";
+
+        let mut sql = base.to_string();
+        let pattern = query.map(|q| format!("%{}%", escape_like(q)));
+        if pattern.is_some() {
+            sql.push_str(" WHERE LOWER(content) LIKE LOWER(?2) ESCAPE '\\'");
+            sql.push_str(" ORDER BY timestamp DESC LIMIT ?3");
+        } else {
+            sql.push_str(" ORDER BY timestamp DESC LIMIT ?2");
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = if let Some(pattern) = pattern {
+            stmt.query_map(rusqlite::params![project_dir, pattern, limit], |row| {
+                Ok(LogEntry {
+                    timestamp: row.get(0)?,
+                    kind: row.get(1)?,
+                    peer: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![project_dir, limit], |row| {
+                Ok(LogEntry {
+                    timestamp: row.get(0)?,
+                    kind: row.get(1)?,
+                    peer: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        rows.reverse();
+        Ok(rows)
+    }
+
+    pub fn search_agent_inbox(
+        &self,
+        agent_id: &str,
+        from_agent: Option<&str>,
+        limit: usize,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
+             FROM messages WHERE to_agent = ?1",
+        );
+        let agent_id = agent_id.to_string();
+        let from_agent = from_agent.map(str::to_string);
+        let pattern = query.map(|q| format!("%{}%", escape_like(q)));
+        let limit = limit as i64;
+        let mut next_param = 2;
+
+        if from_agent.is_some() {
+            sql.push_str(&format!(" AND from_agent = ?{next_param}"));
+            next_param += 1;
+        }
+        if pattern.is_some() {
+            sql.push_str(&format!(
+                " AND LOWER(content) LIKE LOWER(?{next_param}) ESCAPE '\\'"
+            ));
+            next_param += 1;
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ?{next_param}"));
+
+        let mut params: Vec<&dyn ToSql> = vec![&agent_id];
+        if let Some(from_agent) = from_agent.as_ref() {
+            params.push(from_agent);
+        }
+        if let Some(pattern) = pattern.as_ref() {
+            params.push(pattern);
+        }
+        params.push(&limit);
+        query_log_entries(&conn, &sql, &params)
+    }
+
+    pub fn search_user_inbox_for_project(
+        &self,
+        project_dir: &str,
+        from_agent: Option<&str>,
+        limit: usize,
+        query: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "SELECT m.created_at AS timestamp, 'recv' AS kind, m.from_agent AS peer, m.content
+             FROM messages m
+             INNER JOIN agents a ON a.id = m.from_agent
+             WHERE m.to_agent = 'user' AND a.project_dir = ?1",
+        );
+        let project_dir = project_dir.to_string();
+        let from_agent = from_agent.map(str::to_string);
+        let pattern = query.map(|q| format!("%{}%", escape_like(q)));
+        let limit = limit as i64;
+        let mut next_param = 2;
+
+        if from_agent.is_some() {
+            sql.push_str(&format!(" AND m.from_agent = ?{next_param}"));
+            next_param += 1;
+        }
+        if pattern.is_some() {
+            sql.push_str(&format!(
+                " AND LOWER(m.content) LIKE LOWER(?{next_param}) ESCAPE '\\'"
+            ));
+            next_param += 1;
+        }
+        sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT ?{next_param}"));
+
+        let mut params: Vec<&dyn ToSql> = vec![&project_dir];
+        if let Some(from_agent) = from_agent.as_ref() {
+            params.push(from_agent);
+        }
+        if let Some(pattern) = pattern.as_ref() {
+            params.push(pattern);
+        }
+        params.push(&limit);
+        query_log_entries(&conn, &sql, &params)
     }
 
     pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {

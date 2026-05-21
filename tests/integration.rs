@@ -405,7 +405,7 @@ async fn message_to_nonexistent_agent_fails() {
 }
 
 #[tokio::test]
-async fn user_is_valid_message_target_for_operator_notifications() {
+async fn user_is_valid_message_target_for_direct_messages() {
     let (_dir, orch) = setup();
 
     let agent = orch
@@ -415,20 +415,20 @@ async fn user_is_valid_message_target_for_operator_notifications() {
 
     let mut rx = orch.subscribe();
     let msg = orch
-        .send_message(&agent.id, "user", "operator heads up")
+        .send_message(&agent.id, "user", "user heads up")
         .await
         .unwrap();
 
     assert_eq!(msg.from_agent, agent.id);
     assert_eq!(msg.to_agent, "user");
-    assert_eq!(msg.content, "operator heads up");
+    assert_eq!(msg.content, "user heads up");
     assert!(msg.delivered);
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
                 Ok(SwarmEvent::UserNotification { from, content })
-                    if from == agent.id && content == "operator heads up" =>
+                    if from == agent.id && content == "user heads up" =>
                 {
                     return;
                 }
@@ -445,10 +445,34 @@ async fn user_is_valid_message_target_for_operator_notifications() {
         .unwrap();
     assert!(
         log.iter().any(|entry| {
-            entry.kind == "sent" && entry.peer == "user" && entry.content == "operator heads up"
+            entry.kind == "sent" && entry.peer == "user" && entry.content == "user heads up"
         }),
-        "agent log should include the persisted operator notification"
+        "agent log should include the persisted user notification"
     );
+
+    let user_log = orch.get_agent_log("user", 50, LogFilter::Messages).unwrap();
+    assert!(
+        user_log.iter().any(|entry| {
+            entry.kind == "recv" && entry.peer == agent.id && entry.content == "user heads up"
+        }),
+        "user log should include direct responses sent to the user"
+    );
+
+    let user_matches = orch
+        .search_agent_log("user", 50, LogFilter::Messages, Some("heads up"))
+        .unwrap();
+    assert_eq!(user_matches.len(), 1);
+
+    let user_inbox = orch
+        .search_inbox("user", Some(&agent.id), 50, None)
+        .unwrap();
+    assert_eq!(user_inbox.len(), 1);
+    assert_eq!(user_inbox[0].kind, "recv");
+    assert_eq!(user_inbox[0].peer, agent.id);
+    assert_eq!(user_inbox[0].content, "user heads up");
+
+    let user_output = orch.get_agent_log("user", 50, LogFilter::Output).unwrap();
+    assert!(user_output.is_empty());
 
     let agent_events = orch.list_events(None, Some(&agent.id), 1000).unwrap();
     let notifications: Vec<_> = agent_events
@@ -460,7 +484,7 @@ async fn user_is_valid_message_target_for_operator_notifications() {
     let payload: serde_json::Value = serde_json::from_str(&notifications[0].payload).unwrap();
     assert_eq!(payload["type"], "user_notification");
     assert_eq!(payload["from"], agent.id);
-    assert_eq!(payload["content"], "operator heads up");
+    assert_eq!(payload["content"], "user heads up");
 }
 
 #[tokio::test]
@@ -1100,6 +1124,46 @@ async fn http_api_agent_log() {
     assert!(msgs
         .iter()
         .all(|e| e["kind"] == "recv" || e["kind"] == "sent"));
+
+    let resp = client
+        .post(format!("{addr}/api/messages"))
+        .json(&serde_json::json!({
+            "from": agent_id,
+            "to": "user",
+            "content": "http user reply"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(format!("{addr}/api/agents/user/log?type=messages"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let user_msgs: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(
+        user_msgs.iter().any(|entry| {
+            entry["kind"] == "recv"
+                && entry["peer"] == agent_id
+                && entry["content"] == "http user reply"
+        }),
+        "user log should include direct responses sent through the HTTP API"
+    );
+
+    let resp = client
+        .get(format!("{addr}/api/agents/user/inbox?from={agent_id}&n=5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let user_inbox: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(user_inbox.len(), 1);
+    assert_eq!(user_inbox[0]["kind"], "recv");
+    assert_eq!(user_inbox[0]["peer"], agent_id);
+    assert_eq!(user_inbox[0]["content"], "http user reply");
 
     // Test limit param
     let resp = client

@@ -1,7 +1,7 @@
 use crate::components::agent_node::{AgentNode, AgentNodeProps};
-use crate::state::{build_tree, sort_tree, Agent, SortState};
+use crate::state::{build_tree, sort_tree, Agent, LogEntry, SortState};
 use leptos::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[component]
 pub fn TopicTree(
@@ -12,6 +12,11 @@ pub fn TopicTree(
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
 ) -> impl IntoView {
+    let expanded_agents = RwSignal::new(HashSet::<String>::new());
+    let log_tabs = RwSignal::new(HashSet::<String>::new());
+    let log_scroll_positions = RwSignal::new(HashMap::<String, i32>::new());
+    let log_cache = RwSignal::new(HashMap::<String, Vec<LogEntry>>::new());
+
     move || {
         if loading.get() {
             return view! { <div class="tree-loading">"loading agents..."</div> }.into_any();
@@ -43,7 +48,13 @@ pub fn TopicTree(
             <div class="topic-tree">
                 {nodes
                     .into_iter()
-                    .map(|node| AgentNode(AgentNodeProps { node }))
+                    .map(|node| AgentNode(AgentNodeProps {
+                        node,
+                        expanded_agents,
+                        log_tabs,
+                        log_scroll_positions,
+                        log_cache,
+                    }))
                     .collect::<Vec<_>>()}
             </div>
         }

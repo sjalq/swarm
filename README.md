@@ -185,6 +185,17 @@ Send a message to another agent.
 
 ```bash
 swarm send <AGENT_ID> "<MESSAGE>"
+swarm send user "<MESSAGE>"
+```
+
+### `swarm inbox`
+
+Read direct messages sent to the user/calling agent from one source agent. Outside an agent, the default recipient is `user`; inside an agent, the default recipient is `SWARM_AGENT_ID`.
+
+```bash
+swarm inbox <FROM_AGENT_ID> [-n <COUNT>]
+swarm inbox <FROM_AGENT_ID> --to user
+swarm inbox --all [-n <COUNT>]
 ```
 
 ### `swarm spawn`
@@ -221,15 +232,16 @@ swarm models
 
 ### `swarm log`
 
-View an agent's recent activity.
+View recent activity for an agent, or inspect the broader user message log.
 
 ```bash
 swarm log <AGENT_ID> [-n <COUNT>] [--messages] [--output] [--search <TEXT>] [--raw]
+swarm log user --messages
 ```
 
 Options:
-- `-n <COUNT>` : Number of entries to show (default: `20`)
-- `--messages` : Show only messages (sent and received)
+- `-n <COUNT>` / `--tail <COUNT>` : Number of entries to show (default: `20`)
+- `--messages` : Show only messages (sent and received). Use `swarm inbox <FROM_AGENT_ID>` when you only want messages sent to you from one agent.
 - `--output` : Show only harness output
 - `--search <TEXT>` : Search log content case-insensitively before applying the limit
 - `--raw` : Disable text truncation and show exact full log entries

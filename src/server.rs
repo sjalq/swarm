@@ -77,6 +77,14 @@ fn default_log_limit() -> usize {
 }
 
 #[derive(Deserialize)]
+pub struct InboxQuery {
+    #[serde(default = "default_log_limit")]
+    pub n: usize,
+    pub from: Option<String>,
+    pub q: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct CleanupQuery {
     #[serde(default)]
     pub delete_branch: bool,
@@ -197,6 +205,7 @@ pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) ->
         .route("/api/agents/{id}/brief", get(get_agent_brief))
         .route("/api/agents/{id}/done", post(done_agent))
         .route("/api/agents/{id}/cleanup", post(cleanup_agent))
+        .route("/api/agents/{id}/inbox", get(get_agent_inbox))
         .route("/api/agents/{id}/log", get(get_agent_log))
         .route("/api/agents/{id}/worktree", get(get_agent_worktree))
         .route("/api/messages", post(send_message))
@@ -360,6 +369,22 @@ async fn get_agent_log(
     match blocking_orchestrator("get agent log", {
         let id = id.clone();
         move || orch.search_agent_log(&id, params.n, filter, params.q.as_deref())
+    })
+    .await
+    {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn get_agent_inbox(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<InboxQuery>,
+) -> impl IntoResponse {
+    match blocking_orchestrator("get agent inbox", {
+        let id = id.clone();
+        move || orch.search_inbox(&id, params.from.as_deref(), params.n, params.q.as_deref())
     })
     .await
     {

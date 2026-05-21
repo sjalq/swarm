@@ -129,6 +129,8 @@ pub struct LogEntry {
 impl LogEntry {
     pub fn bubble_class(&self) -> &str {
         match self.kind.as_str() {
+            "recv" if self.peer == "user" => "chat-bubble incoming external",
+            "sent" if self.peer == "user" => "chat-bubble outgoing external",
             "recv" => "chat-bubble incoming",
             "sent" => "chat-bubble outgoing",
             _ => "chat-bubble system",
@@ -137,8 +139,14 @@ impl LogEntry {
 
     pub fn label(&self) -> String {
         match self.kind.as_str() {
-            "recv" => format!("from {}", self.peer),
-            "sent" => format!("to {}", self.peer),
+            "recv" if self.peer.is_empty() => "received".into(),
+            "recv" => format!("received from {}", self.peer),
+            "sent" if self.peer.is_empty() => "sent".into(),
+            "sent" => format!("sent to {}", self.peer),
+            "output" => "agent output".into(),
+            "interrupted" => "interrupted output".into(),
+            "error" => "error".into(),
+            "timeout" => "timeout".into(),
             _ => self.kind.clone(),
         }
     }
@@ -366,15 +374,24 @@ pub fn apply_event(
 }
 
 pub fn format_timestamp(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| {
-            if ts.len() >= 19 {
-                ts[11..19].to_string()
-            } else {
-                ts.to_string()
-            }
-        })
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(ts));
+    if date.get_time().is_nan() {
+        return if ts.len() >= 19 {
+            ts[..19].replace('T', " ")
+        } else {
+            ts.to_string()
+        };
+    }
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
 }
 
 pub fn format_relative_time(ts: &str) -> String {
@@ -383,14 +400,23 @@ pub fn format_relative_time(ts: &str) -> String {
     };
     let now = chrono::Utc::now();
     let diff = now.signed_duration_since(dt);
+    let total_seconds = diff.num_seconds().max(0);
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds / 3_600) % 24;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
 
-    if diff.num_seconds() < 60 {
-        format!("{}s ago", diff.num_seconds())
-    } else if diff.num_minutes() < 60 {
-        format!("{}m ago", diff.num_minutes())
-    } else if diff.num_hours() < 24 {
-        format!("{}h ago", diff.num_hours())
-    } else {
-        format!("{}d ago", diff.num_days())
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
     }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    parts.push(format!("{seconds}s"));
+
+    parts.join(" ")
 }
