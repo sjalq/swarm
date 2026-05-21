@@ -60,8 +60,13 @@ pub async fn fetch_stats() -> Result<Stats, String> {
         .map_err(|e| format!("parse failed: {}", e))
 }
 
-pub async fn fetch_agent_log(agent_id: &str, limit: usize) -> Result<Vec<LogEntry>, String> {
-    let url = format!("{}/agents/{}/log?n={}", api_base(), agent_id, limit);
+pub async fn fetch_agent_messages(agent_id: &str, limit: usize) -> Result<Vec<LogEntry>, String> {
+    let url = format!(
+        "{}/agents/{}/log?n={}&type=messages",
+        api_base(),
+        agent_id,
+        limit
+    );
 
     let resp = Request::get(&url)
         .send()

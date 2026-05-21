@@ -1,7 +1,7 @@
 use crate::db::LogFilter;
 use crate::error::SwarmError;
 use crate::harness::CliKind;
-use crate::orchestrator::{DoneReport, Orchestrator};
+use crate::orchestrator::{DoneReport, Orchestrator, SpawnOptions};
 use axum::extract::ws;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -33,6 +33,9 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub worktree: bool,
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub user_launched: bool,
 }
 
 fn default_comms() -> String {
@@ -61,6 +64,7 @@ pub struct ListQuery {
     pub perspective: Option<String>,
     #[serde(default)]
     pub all: bool,
+    pub run: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +86,21 @@ pub struct InboxQuery {
     pub n: usize,
     pub from: Option<String>,
     pub q: Option<String>,
+    pub run: Option<String>,
+    #[serde(default)]
+    pub new: bool,
+    pub since: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateRunRequest {
+    pub task: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRunRequest {
+    pub root_agent_id: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +218,9 @@ pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) ->
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/brief", get(get_run_brief))
+        .route("/api/runs", post(create_run))
+        .route("/api/runs/current", get(get_current_run))
+        .route("/api/runs/{id}", post(update_run))
         .route("/api/stats", get(get_stats))
         .route("/api/agents", get(list_agents).post(spawn_agent))
         .route("/api/agents/{id}", get(get_agent).delete(kill_agent))
@@ -265,6 +287,59 @@ async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn create_run(
+    State(orch): State<AppState>,
+    Json(req): Json<CreateRunRequest>,
+) -> impl IntoResponse {
+    match blocking_orchestrator("create run", move || orch.create_run(&req.task)).await {
+        Ok(run) => (StatusCode::CREATED, Json(run)).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn get_current_run(State(orch): State<AppState>) -> impl IntoResponse {
+    match blocking_orchestrator("get current run", move || orch.current_run()).await {
+        Ok(Some(run)) => Json(run).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn update_run(
+    State(orch): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateRunRequest>,
+) -> impl IntoResponse {
+    match blocking_orchestrator("update run", {
+        let id = id.clone();
+        move || {
+            if let Some(root_agent_id) = req.root_agent_id.as_deref() {
+                orch.update_run_root_agent(&id, root_agent_id)?;
+            }
+            if let Some(status) = req.status.as_deref() {
+                orch.update_run_status(&id, status)?;
+            }
+            orch.current_run()
+        }
+    })
+    .await
+    {
+        Ok(run) => Json(run).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+fn resolve_run_filter(
+    orch: &Orchestrator,
+    run: Option<&str>,
+) -> Result<Option<String>, SwarmError> {
+    match run {
+        Some("current") => Ok(orch.current_run()?.map(|run| run.id)),
+        Some(run_id) if !run_id.is_empty() => Ok(Some(run_id.to_string())),
+        _ => Ok(None),
+    }
+}
+
 async fn get_run_brief(
     State(orch): State<AppState>,
     Query(params): Query<BriefQuery>,
@@ -283,22 +358,29 @@ async fn list_agents(
     State(orch): State<AppState>,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
+    let run_filter = match resolve_run_filter(&orch, params.run.as_deref()) {
+        Ok(run_filter) => run_filter,
+        Err(e) => return swarm_error_response(e),
+    };
     if let Some(perspective) = params.perspective {
         match blocking_orchestrator("list agents", move || {
-            orch.list_agents_with_perspective_all(&perspective, params.all)
+            orch.list_agents_with_perspective_all_for_run(
+                &perspective,
+                params.all,
+                run_filter.as_deref(),
+            )
         })
         .await
         {
             Ok(views) => Json(views).into_response(),
             Err(e) => swarm_error_response(e),
         }
-    } else if params.all {
-        match blocking_orchestrator("list agents", move || orch.list_all_agents()).await {
-            Ok(agents) => Json(agents).into_response(),
-            Err(e) => swarm_error_response(e),
-        }
     } else {
-        match blocking_orchestrator("list agents", move || orch.list_agents()).await {
+        match blocking_orchestrator("list agents", move || {
+            orch.list_agents_for_run(run_filter.as_deref(), params.all)
+        })
+        .await
+        {
             Ok(agents) => Json(agents).into_response(),
             Err(e) => swarm_error_response(e),
         }
@@ -323,14 +405,18 @@ async fn spawn_agent(
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
-        orch.spawn_agent_with_model(
+        orch.spawn_agent_with_options(
             &req.role,
             &req.harness,
-            req.model.as_deref(),
             &req.system_prompt,
-            req.parent_id.as_deref(),
-            &req.comms,
-            req.worktree,
+            SpawnOptions {
+                model: req.model.as_deref(),
+                parent_id: req.parent_id.as_deref(),
+                comms: &req.comms,
+                use_worktree: req.worktree,
+                run_id: req.run_id.as_deref(),
+                user_launched: req.user_launched,
+            },
         )
     })
     .await;
@@ -382,9 +468,23 @@ async fn get_agent_inbox(
     Path(id): Path<String>,
     Query(params): Query<InboxQuery>,
 ) -> impl IntoResponse {
+    let run_filter = match resolve_run_filter(&orch, params.run.as_deref()) {
+        Ok(run_filter) => run_filter,
+        Err(e) => return swarm_error_response(e),
+    };
     match blocking_orchestrator("get agent inbox", {
         let id = id.clone();
-        move || orch.search_inbox(&id, params.from.as_deref(), params.n, params.q.as_deref())
+        move || {
+            orch.search_inbox_scoped(
+                &id,
+                params.from.as_deref(),
+                params.n,
+                params.q.as_deref(),
+                run_filter.as_deref(),
+                params.new,
+                params.since.as_deref(),
+            )
+        }
     })
     .await
     {
@@ -503,8 +603,8 @@ async fn list_models() -> impl IntoResponse {
         .iter()
         .map(|kind| ModelsResponse {
             harness: kind.default_binary().to_string(),
-            default_model: kind.default_model().to_string(),
-            models: kind.known_models().iter().map(|s| s.to_string()).collect(),
+            default_model: "CLI default".to_string(),
+            models: Vec::new(),
         })
         .collect();
     Json(models)

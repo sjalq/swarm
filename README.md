@@ -156,10 +156,12 @@ On first run, swarm automatically appends `.swarm/` to the project's `.gitignore
 
 ### `swarm run`
 
-Start the orchestrator and root agent.
+Start the orchestrator and root agent, or start a tracked task run with a coordinator and optional teammates.
 
 ```bash
 swarm run [OPTIONS]
+swarm run "Investigate the failing checkout flow" --team claude,codex,grok
+swarm run "Summarize this repo" --team reviewer:claude,scanner:codex --detach
 ```
 
 Options:
@@ -168,16 +170,31 @@ Options:
 - `--harness <NAME>` : Harness for the root agent (default: `echo`)
 - `--prompt <TEXT>` : Initial prompt for the root agent
 - `--role <NAME>` : Role name for the root agent (default: `coordinator`)
+- `--team <HARNESS>` / `--teammates <HARNESS>` : Teammates for a task run, comma-separated or repeated. Use `role:harness` to name a teammate.
+- `--detach` : Start a tracked run and return immediately instead of watching direct responses.
+
+When a task argument or `--team` is present, `swarm run` creates a run record in SQLite, starts the daemon if needed, spawns a coordinator, spawns any teammates, and gives them prompts that include the report-back protocol.
+
+### `swarm serve`
+
+Start only the daemon/API server without spawning an agent.
+
+```bash
+swarm serve [OPTIONS]
+```
 
 ### `swarm peers`
 
 List all agents in the swarm visible to you (parent, siblings, descendants).
 
 ```bash
-swarm peers [--all]
+swarm peers [--all] [--run current]
+swarm peers --all-runs --all
 ```
 
 - `--all` : Include done agents.
+- `--run <RUN_ID|current>` : Show one run. Inside an agent, `current` resolves to `SWARM_RUN_ID`; outside an agent, it resolves to the latest run.
+- `--all-runs` : Include agents from every run in the current project.
 
 ### `swarm send`
 
@@ -195,7 +212,23 @@ Read direct messages sent to the user/calling agent from one source agent. Outsi
 ```bash
 swarm inbox <FROM_AGENT_ID> [-n <COUNT>]
 swarm inbox <FROM_AGENT_ID> --to user
-swarm inbox --all [-n <COUNT>]
+swarm inbox --all [-n <COUNT>] [--run current]
+swarm inbox --new --all
+```
+
+Inbox output shows full direct message bodies by default. Use `--truncate <COUNT>` if you want a shorter terminal view.
+
+- `--new` : Read only messages newer than the saved SQLite cursor for this recipient/run.
+- `--since <TIMESTAMP>` : Read messages after an RFC3339 timestamp.
+- `--run <RUN_ID|current>` : Scope user inbox reads to a run. Use `--all-runs` to inspect everything.
+
+### `swarm watch`
+
+Poll and print new direct responses sent to the user/current agent.
+
+```bash
+swarm watch --all --run current
+swarm watch <FROM_AGENT_ID> --to user --run <RUN_ID>
 ```
 
 ### `swarm spawn`
@@ -209,9 +242,9 @@ swarm spawn --role <NAME> --harness <HARNESS> [OPTIONS]
 Options:
 - `--role <NAME>` : Agent role name (required)
 - `--harness <NAME>` : Harness to use (default: `echo`)
-- `--prompt <TEXT>` : System prompt for the agent
+- `--prompt <TEXT>` : Task prompt for the agent. Include how it should report back, such as `swarm send <your-agent-id> "...summary..."`.
 - `--comms <MODE>` : Communication mode: `mesh` or `parent-only` (default: `mesh`)
-- `--model <MODEL>` : Model override (e.g. `claude-sonnet-4-6`, `o3`)
+- `--model <MODEL>` : Model override supported by the selected harness CLI.
 - `--worktree` : Give the agent its own git worktree (isolated branch)
 
 ### `swarm status`
@@ -224,7 +257,7 @@ swarm status
 
 ### `swarm models`
 
-List available models for each harness.
+Show harnesses and note that their CLIs choose default models.
 
 ```bash
 swarm models
@@ -245,6 +278,7 @@ Options:
 - `--output` : Show only harness output
 - `--search <TEXT>` : Search log content case-insensitively before applying the limit
 - `--raw` : Disable text truncation and show exact full log entries
+- `--truncate <COUNT>` : Limit text output length. Message-only logs default to full content; mixed logs and output logs default to 500 characters.
 
 ### `swarm brief`
 

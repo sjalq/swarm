@@ -5,14 +5,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 #[component]
-pub fn TopicLogPanel(
+pub fn ChatPanel(
     agent_id: String,
     scroll_positions: RwSignal<HashMap<String, i32>>,
     log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
@@ -26,6 +26,7 @@ pub fn TopicLogPanel(
     let sending = RwSignal::new(false);
     let loading = RwSignal::new(!has_cached_entries);
     let error = RwSignal::new(None::<String>);
+    let scroll_restore_token = Arc::new(AtomicU64::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_flag = cancelled.clone();
 
@@ -34,10 +35,18 @@ pub fn TopicLogPanel(
     });
 
     let id = agent_id.clone();
+    let initial_scroll_restore_token = scroll_restore_token.clone();
     spawn_local(async move {
-        match api::fetch_agent_log(&id, 200).await {
+        match api::fetch_agent_messages(&id, 200).await {
             Ok(log) => {
-                set_log_entries(entries, id.clone(), scroll_positions, log_cache, log);
+                set_log_entries(
+                    entries,
+                    id.clone(),
+                    scroll_positions,
+                    log_cache,
+                    initial_scroll_restore_token,
+                    log,
+                );
                 error.set(None);
             }
             Err(e) => error.set(Some(e)),
@@ -46,18 +55,20 @@ pub fn TopicLogPanel(
     });
 
     let poll_id = agent_id.clone();
+    let poll_scroll_restore_token = scroll_restore_token.clone();
     spawn_local(async move {
         loop {
             gloo_timers::future::TimeoutFuture::new(3_000).await;
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
-            if let Ok(log) = api::fetch_agent_log(&poll_id, 200).await {
+            if let Ok(log) = api::fetch_agent_messages(&poll_id, 200).await {
                 set_log_entries(
                     entries,
                     poll_id.clone(),
                     scroll_positions,
                     log_cache,
+                    poll_scroll_restore_token.clone(),
                     log,
                 );
             }
@@ -68,7 +79,7 @@ pub fn TopicLogPanel(
 
     move || {
         if loading.get() {
-            return view! { <div class="chat-loading">"loading topic log..."</div> }.into_any();
+            return view! { <div class="chat-loading">"loading chat..."</div> }.into_any();
         }
         if let Some(err) = error.get() {
             return view! { <div class="chat-error">{err}</div> }.into_any();
@@ -76,6 +87,7 @@ pub fn TopicLogPanel(
 
         let log = entries.get();
         let send_agent_id = form_agent_id.clone();
+        let send_scroll_restore_token = scroll_restore_token.clone();
         let on_send = move |ev: web_sys::SubmitEvent| {
             ev.prevent_default();
             if sending.get_untracked() {
@@ -90,16 +102,18 @@ pub fn TopicLogPanel(
 
             sending.set(true);
             let to_agent = send_agent_id.clone();
+            let restore_token = send_scroll_restore_token.clone();
             spawn_local(async move {
                 match api::send_user_message(&to_agent, &message).await {
                     Ok(()) => {
                         draft.set(String::new());
-                        if let Ok(log) = api::fetch_agent_log(&to_agent, 200).await {
+                        if let Ok(log) = api::fetch_agent_messages(&to_agent, 200).await {
                             set_log_entries(
                                 entries,
                                 to_agent.clone(),
                                 scroll_positions,
                                 log_cache,
+                                restore_token,
                                 log,
                             );
                         }
@@ -173,6 +187,7 @@ fn set_log_entries(
     agent_id: String,
     scroll_positions: RwSignal<HashMap<String, i32>>,
     log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
+    scroll_restore_token: Arc<AtomicU64>,
     log: Vec<LogEntry>,
 ) {
     let changed = entries.with_untracked(|current| current != &log);
@@ -180,26 +195,88 @@ fn set_log_entries(
         return;
     }
 
+    let scroll_restore = current_scroll_restore(&agent_id, scroll_positions);
     log_cache.update(|cache| {
         cache.insert(agent_id.clone(), log.clone());
     });
     entries.set(log);
-    restore_log_scroll(agent_id, scroll_positions);
+    let token = scroll_restore_token
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    restore_log_scroll(agent_id, scroll_restore, token, scroll_restore_token);
 }
 
-fn restore_log_scroll(agent_id: String, scroll_positions: RwSignal<HashMap<String, i32>>) {
-    let Some(scroll_top) = scroll_positions.with_untracked(|positions| {
-        positions.get(&agent_id).copied()
-    }) else {
+#[derive(Clone, Copy)]
+enum ScrollRestore {
+    Top(i32),
+    Bottom,
+}
+
+fn current_scroll_restore(
+    agent_id: &str,
+    scroll_positions: RwSignal<HashMap<String, i32>>,
+) -> Option<ScrollRestore> {
+    if let Some(element) = log_panel_element(agent_id) {
+        let scroll_top = element.scroll_top();
+        let distance_from_bottom = element
+            .scroll_height()
+            .saturating_sub(element.client_height())
+            .saturating_sub(scroll_top);
+
+        scroll_positions.update(|positions| {
+            positions.insert(agent_id.to_string(), scroll_top);
+        });
+
+        if distance_from_bottom <= 24 {
+            Some(ScrollRestore::Bottom)
+        } else {
+            Some(ScrollRestore::Top(scroll_top))
+        }
+    } else {
+        scroll_positions.with_untracked(|positions| {
+            positions
+                .get(agent_id)
+                .copied()
+                .map(ScrollRestore::Top)
+        })
+    }
+}
+
+fn restore_log_scroll(
+    agent_id: String,
+    scroll_restore: Option<ScrollRestore>,
+    token: u64,
+    latest_token: Arc<AtomicU64>,
+) {
+    let Some(scroll_restore) = scroll_restore else {
         return;
     };
 
     spawn_local(async move {
-        gloo_timers::future::TimeoutFuture::new(0).await;
-        if let Some(element) = log_panel_element(&agent_id) {
-            element.set_scroll_top(scroll_top);
-        }
+        restore_log_scroll_after_delay(&agent_id, scroll_restore, token, latest_token.clone(), 0)
+            .await;
+        restore_log_scroll_after_delay(&agent_id, scroll_restore, token, latest_token, 50).await;
     });
+}
+
+async fn restore_log_scroll_after_delay(
+    agent_id: &str,
+    scroll_restore: ScrollRestore,
+    token: u64,
+    latest_token: Arc<AtomicU64>,
+    delay_ms: u32,
+) {
+    gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+    if latest_token.load(Ordering::Relaxed) != token {
+        return;
+    }
+
+    if let Some(element) = log_panel_element(agent_id) {
+        match scroll_restore {
+            ScrollRestore::Top(scroll_top) => element.set_scroll_top(scroll_top),
+            ScrollRestore::Bottom => element.set_scroll_top(element.scroll_height()),
+        }
+    }
 }
 
 fn log_panel_element(agent_id: &str) -> Option<web_sys::HtmlElement> {

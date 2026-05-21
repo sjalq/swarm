@@ -7,7 +7,7 @@ use std::time::Duration;
 use swarm::db::{AgentRow, Db, LogFilter, MessageRow, OutputLogRow};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
-use swarm::orchestrator::{DoneReport, Orchestrator, SwarmEvent};
+use swarm::orchestrator::{DoneReport, Orchestrator, SpawnOptions, SwarmEvent};
 use tokio::sync::mpsc;
 
 struct ResumeProbeHarness;
@@ -217,6 +217,8 @@ async fn global_data_dir_scopes_agents_to_current_project() {
             ended_at: None,
             worktree_branch: None,
             project_dir: Some(project_dir.to_string_lossy().to_string()),
+            run_id: None,
+            user_launched: false,
         })
         .unwrap();
     }
@@ -1277,17 +1279,17 @@ async fn spawn_with_model_override() {
         .spawn_agent_with_model(
             "modeler",
             "echo",
-            Some("claude-sonnet-4-6"),
+            Some("harness-supported-model"),
             "test model",
             None,
             "mesh",
             false,
         )
         .unwrap();
-    assert_eq!(agent.model, "claude-sonnet-4-6");
+    assert_eq!(agent.model, "harness-supported-model");
 
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
-    assert_eq!(fetched.model, "claude-sonnet-4-6");
+    assert_eq!(fetched.model, "harness-supported-model");
 
     let default_agent = orch
         .spawn_agent("defaulter", "echo", "no model", None, "mesh")
@@ -1447,8 +1449,8 @@ async fn http_api_models_endpoint() {
     assert_eq!(models.len(), 4);
 
     let claude = models.iter().find(|m| m["harness"] == "claude").unwrap();
-    assert_eq!(claude["default_model"], "claude-opus-4-6");
-    assert!(claude["models"].as_array().unwrap().len() >= 3);
+    assert_eq!(claude["default_model"], "CLI default");
+    assert!(claude["models"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1549,14 +1551,14 @@ async fn http_api_spawn_with_model() {
             "harness": "echo",
             "system_prompt": "",
             "comms": "mesh",
-            "model": "claude-sonnet-4-6"
+            "model": "harness-supported-model"
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     let agent: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(agent["model"], "claude-sonnet-4-6");
+    assert_eq!(agent["model"], "harness-supported-model");
 }
 
 #[tokio::test]
@@ -1765,6 +1767,32 @@ async fn done_agent_without_parent_still_works() {
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
     assert_eq!(fetched.status, "done");
     assert!(fetched.ended_at.is_some(), "done should populate ended_at");
+}
+
+#[tokio::test]
+async fn done_root_agent_marks_run_done() {
+    let (_dir, orch) = setup();
+    let run = orch.create_run("tracked task").unwrap();
+    let root = orch
+        .spawn_agent_with_options(
+            "root",
+            "echo",
+            "",
+            SpawnOptions {
+                model: None,
+                parent_id: None,
+                comms: "mesh",
+                use_worktree: false,
+                run_id: Some(&run.id),
+                user_launched: true,
+            },
+        )
+        .unwrap();
+    orch.update_run_root_agent(&run.id, &root.id).unwrap();
+
+    orch.done_agent(&root.id, Some("done")).await.unwrap();
+
+    assert_eq!(orch.current_run().unwrap().unwrap().status.as_str(), "done");
 }
 
 #[tokio::test]

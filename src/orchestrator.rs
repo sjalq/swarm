@@ -1,5 +1,6 @@
 use crate::db::{
     AgentRow, Db, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow, OutputLogRow,
+    RunRow,
 };
 use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
@@ -18,17 +19,20 @@ The `swarm` CLI is available in this shell for coordination with the user and ot
 Commands:
   swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
   swarm peers --all [--json]           Include done agents.
+  swarm peers --run current [--json]   List agents from the current run. Use --all-runs to include older runs.
   swarm send <agent-id> \"message\"      Send a direct message to another agent.
   swarm send user \"message\"            Send a direct message to the user.
   swarm inbox <agent-id> [-n <count>]   Read direct messages sent to you by one agent (default: last 20).
   swarm inbox --all [-n <count>]        Read all recent direct messages sent to you.
+  swarm inbox --new --all              Read only messages you have not seen yet in this run.
+  swarm watch                          Stream new direct responses sent to you for this run.
   swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
-                                       Create a new child agent. Harnesses: claude, gemini, codex, grok, echo.
-  swarm spawn --role <name> --harness claude --model claude-sonnet-4-6 --worktree --prompt \"...\"
-                                       Spawn with a specific model and an isolated git worktree.
+                                       Create a child agent. Include the task and how it should report back.
+  swarm spawn --role <name> --harness claude --model <model> --worktree --prompt \"...\"
+                                       Spawn with a model override and an isolated git worktree.
   swarm cleanup <agent-id>             Remove a done agent's git worktree.
   swarm cleanup <agent-id> --delete-branch  Also delete the agent's branch.
-  swarm models [--json]                List available models for each harness.
+  swarm models [--json]                Show harnesses; harness CLIs choose default models.
   swarm brief [agent-id] [--json]      View a compact run or agent digest without raw transcript payloads.
   swarm log <agent-id> [--json]        View an agent's recent activity (messages sent/received and output).
   swarm log <agent-id> -n <count>      Show the last N entries (default: 20).
@@ -47,6 +51,7 @@ Commands:
 Runtime context:
 - Your agent ID, role, and project directory are shown below this preamble.
 - SWARM_AGENT_ID, SWARM_SOCKET, and SWARM_PROJECT_DIR are set for this process.
+- SWARM_RUN_ID is set when the agent belongs to a tracked run.
 - Run project work from the shown project directory. Use `swarm status` if you need to confirm your identity or runtime details.
 
 Communication guidelines:
@@ -54,8 +59,10 @@ Communication guidelines:
 - If you are the top-level orchestrator, send conclusions, blockers, and questions to the user with `swarm send user \"message\"`. Do not rely on harness stdout as the direct response path.
 - If another agent asked for the work, send conclusions, blockers, and questions back to that calling agent with `swarm send <agent-id> \"message\"`.
 - Use `swarm inbox <agent-id>` to read recent direct messages sent to you by one agent. Use `swarm inbox --all` only when you need all recent direct messages sent to you.
+- When you spawn an agent, put both the task and the report-back path in `--prompt`, for example: `when done, send your conclusion to <your-agent-id> with swarm send <your-agent-id> \"...\"`.
 - Never reply to status broadcasts or FYI progress updates unless they ask for action.
 - Keep swarm messages under 300 words unless the requester explicitly asks for more.
+- Treat every `swarm send` as context-expensive for the recipient: send concise conclusions by default, and move long detail into files, commits, or logs unless the requester asked for the full detail inline.
 - All swarm commands are idempotent and safe to retry.
 - Use `swarm send user \"message\"` when you need to notify the user directly.
 - For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
@@ -133,6 +140,16 @@ pub struct DoneReport {
     pub checks: Option<String>,
     pub risk: Option<String>,
     pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions<'a> {
+    pub model: Option<&'a str>,
+    pub parent_id: Option<&'a str>,
+    pub comms: &'a str,
+    pub use_worktree: bool,
+    pub run_id: Option<&'a str>,
+    pub user_launched: bool,
 }
 
 impl DoneReport {
@@ -213,6 +230,7 @@ struct WorkerConfig {
     topic_dir: PathBuf,
     project_dir: PathBuf,
     swarm_addr: String,
+    run_id: Option<String>,
     event_tx: broadcast::Sender<SwarmEvent>,
     resume_conversation: bool,
 }
@@ -390,6 +408,19 @@ impl Orchestrator {
         }
     }
 
+    fn mark_run_done_if_root(db: &Db, agent: &AgentRow) -> Result<()> {
+        let Some(run_id) = agent.run_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(run) = db.get_run(run_id)? else {
+            return Ok(());
+        };
+        if run.root_agent_id.as_deref() == Some(agent.id.as_str()) {
+            db.update_run_status(run_id, "done")?;
+        }
+        Ok(())
+    }
+
     fn start_worker_for_agent(&self, agent: &AgentRow, resume_conversation: bool) -> Result<bool> {
         if self.workers()?.contains_key(&agent.id) {
             return Ok(false);
@@ -421,6 +452,7 @@ impl Orchestrator {
                 topic_dir,
                 project_dir: agent_project_dir,
                 swarm_addr: self.addr.clone(),
+                run_id: agent.run_id.clone(),
                 event_tx: self.event_tx.clone(),
                 resume_conversation,
             },
@@ -473,6 +505,61 @@ impl Orchestrator {
         self.db.list_all_agents_for_project(&self.project_key)
     }
 
+    pub fn list_agents_for_run(
+        &self,
+        run_id: Option<&str>,
+        include_inactive: bool,
+    ) -> Result<Vec<AgentRow>> {
+        match run_id {
+            Some(run_id) => {
+                self.db
+                    .list_agents_for_project_run(&self.project_key, run_id, include_inactive)
+            }
+            None if include_inactive => self.list_all_agents(),
+            None => self.list_agents(),
+        }
+    }
+
+    pub fn create_run(&self, task: &str) -> Result<RunRow> {
+        let run = RunRow {
+            id: format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            project_dir: self.project_key.clone(),
+            task: task.to_string(),
+            root_agent_id: None,
+            status: "active".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            ended_at: None,
+        };
+        self.db.insert_run(&run)?;
+        Ok(run)
+    }
+
+    pub fn update_run_root_agent(&self, run_id: &str, root_agent_id: &str) -> Result<()> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .filter(|run| run.project_dir == self.project_key)
+            .ok_or_else(|| SwarmError::InvalidRequest(format!("run not found: {run_id}")))?;
+        let _ = run;
+        self.db.update_run_root_agent(run_id, root_agent_id)
+    }
+
+    pub fn update_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+        self.db
+            .get_run(run_id)?
+            .filter(|run| run.project_dir == self.project_key)
+            .ok_or_else(|| SwarmError::InvalidRequest(format!("run not found: {run_id}")))?;
+        self.db.update_run_status(run_id, status)
+    }
+
+    pub fn current_run(&self) -> Result<Option<RunRow>> {
+        self.db.latest_run_for_project(&self.project_key)
+    }
+
+    pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRow>> {
+        self.db.list_runs_for_project(&self.project_key, limit)
+    }
+
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
         Ok(self
             .db
@@ -520,18 +607,56 @@ impl Orchestrator {
         limit: usize,
         query: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
+        self.search_inbox_scoped(target, from_agent, limit, query, None, false, None)
+    }
+
+    pub fn search_inbox_scoped(
+        &self,
+        target: &str,
+        from_agent: Option<&str>,
+        limit: usize,
+        query: Option<&str>,
+        run_id: Option<&str>,
+        only_new: bool,
+        since: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
+        let cursor = if only_new {
+            self.db.get_inbox_cursor(target, run_id)?
+        } else {
+            None
+        };
+        let since = since.or(cursor.as_deref());
+
         if target == "user" {
-            return self.db.search_user_inbox_for_project(
+            let entries = self.db.search_user_inbox_for_project(
                 &self.project_key,
                 from_agent,
                 limit,
                 query,
-            );
+                run_id,
+                since,
+            )?;
+            if only_new {
+                if let Some(last) = entries.last() {
+                    self.db
+                        .set_inbox_cursor(target, run_id, last.timestamp.as_str())?;
+                }
+            }
+            return Ok(entries);
         }
 
         self.get_agent(target)?
             .ok_or_else(|| SwarmError::AgentNotFound(target.to_string()))?;
-        self.db.search_agent_inbox(target, from_agent, limit, query)
+        let entries = self
+            .db
+            .search_agent_inbox(target, from_agent, limit, query, since)?;
+        if only_new {
+            if let Some(last) = entries.last() {
+                self.db
+                    .set_inbox_cursor(target, run_id, last.timestamp.as_str())?;
+            }
+        }
+        Ok(entries)
     }
 
     pub fn agent_brief(
@@ -659,7 +784,16 @@ impl Orchestrator {
         perspective_id: &str,
         include_inactive: bool,
     ) -> Result<Vec<AgentView>> {
-        let all = self.list_all_agents()?;
+        self.list_agents_with_perspective_all_for_run(perspective_id, include_inactive, None)
+    }
+
+    pub fn list_agents_with_perspective_all_for_run(
+        &self,
+        perspective_id: &str,
+        include_inactive: bool,
+        run_id: Option<&str>,
+    ) -> Result<Vec<AgentView>> {
+        let all = self.list_agents_for_run(run_id, true)?;
         let self_parent: Option<String> = all
             .iter()
             .find(|a| a.id == perspective_id)
@@ -739,6 +873,32 @@ impl Orchestrator {
         comms: &str,
         use_worktree: bool,
     ) -> Result<AgentRow> {
+        let inherited_run_id = match parent_id {
+            Some(parent) => self.get_agent(parent)?.and_then(|agent| agent.run_id),
+            None => None,
+        };
+        self.spawn_agent_with_options(
+            role,
+            harness_name,
+            prompt,
+            SpawnOptions {
+                model,
+                parent_id,
+                comms,
+                use_worktree,
+                run_id: inherited_run_id.as_deref(),
+                user_launched: parent_id.is_none(),
+            },
+        )
+    }
+
+    pub fn spawn_agent_with_options(
+        &self,
+        role: &str,
+        harness_name: &str,
+        prompt: &str,
+        options: SpawnOptions<'_>,
+    ) -> Result<AgentRow> {
         Self::validate_role(role)?;
 
         let _harness = self
@@ -752,32 +912,36 @@ impl Orchestrator {
         Self::validate_agent_id(&id)?;
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
-        let worktree_branch = use_worktree.then(|| Self::worktree_branch_name(&id));
+        let worktree_branch = options
+            .use_worktree
+            .then(|| Self::worktree_branch_name(&id));
 
-        if use_worktree {
+        if options.use_worktree {
             self.create_worktree(&id)?;
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let model_str = model.unwrap_or("").to_string();
+        let model_str = options.model.unwrap_or("").to_string();
         let agent = AgentRow {
             id: id.clone(),
             role: role.to_string(),
             harness: harness_name.to_string(),
             model: model_str.clone(),
             status: "idle".to_string(),
-            parent_id: parent_id.map(String::from),
+            parent_id: options.parent_id.map(String::from),
             system_prompt: prompt.to_string(),
             work_dir: topic_dir.to_string_lossy().to_string(),
-            comms: comms.to_string(),
+            comms: options.comms.to_string(),
             created_at: now,
             ended_at: None,
             worktree_branch,
             project_dir: Some(self.project_dir.to_string_lossy().to_string()),
+            run_id: options.run_id.map(String::from),
+            user_launched: options.user_launched,
         };
 
         if let Err(e) = self.db.insert_agent(&agent) {
-            if use_worktree {
+            if options.use_worktree {
                 if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
                     tracing::error!(
                         "failed to clean up worktree after spawn failure: {cleanup_err}"
@@ -788,7 +952,7 @@ impl Orchestrator {
         }
 
         if let Err(e) = self.start_worker_for_agent(&agent, false) {
-            if use_worktree {
+            if options.use_worktree {
                 if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
                     tracing::error!(
                         "failed to clean up worktree after worker start failure: {cleanup_err}"
@@ -807,7 +971,7 @@ impl Orchestrator {
 
         // Auto-send prompt as first message if non-empty
         if !prompt.is_empty() {
-            let from = parent_id.unwrap_or("user").to_string();
+            let from = options.parent_id.unwrap_or("user").to_string();
             let msg = MessageRow {
                 id: uuid::Uuid::new_v4().to_string(),
                 from_agent: from.clone(),
@@ -1213,6 +1377,13 @@ impl Orchestrator {
         })
         .await?;
 
+        let db = self.db.clone();
+        let root_agent = agent.clone();
+        Self::blocking_db("mark run done", move || {
+            Self::mark_run_done_if_root(&db, &root_agent)
+        })
+        .await?;
+
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
@@ -1246,6 +1417,13 @@ impl Orchestrator {
         })
         .await?;
 
+        let db = self.db.clone();
+        let root_agent = agent.clone();
+        Self::blocking_db("mark run done", move || {
+            Self::mark_run_done_if_root(&db, &root_agent)
+        })
+        .await?;
+
         let worker = self.workers()?.remove(id);
         if let Some(worker) = worker {
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
@@ -1269,7 +1447,14 @@ impl Orchestrator {
             let db = self.db.clone();
             let status_agent_id = agent_id.clone();
             Self::blocking_db("mark agent done", move || {
+                let agent = db.get_agent(&status_agent_id)?;
                 db.update_agent_status(&status_agent_id, "done")
+                    .and_then(|_| {
+                        if let Some(agent) = agent.as_ref() {
+                            Self::mark_run_done_if_root(&db, agent)?;
+                        }
+                        Ok(())
+                    })
             })
             .await?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
@@ -1298,6 +1483,7 @@ impl Orchestrator {
             topic_dir,
             project_dir,
             swarm_addr,
+            run_id,
             event_tx,
             resume_conversation,
         } = config;
@@ -1389,6 +1575,9 @@ impl Orchestrator {
                 "SWARM_PROJECT_DIR".to_string(),
                 project_dir.to_string_lossy().to_string(),
             );
+            if let Some(run_id) = run_id.as_ref() {
+                env.insert("SWARM_RUN_ID".to_string(), run_id.clone());
+            }
 
             let (tx, mut rx) = mpsc::channel(100);
             let h = harness.clone();

@@ -1,4 +1,4 @@
-use crate::components::chat_panel::TopicLogPanel;
+use crate::components::chat_panel::ChatPanel;
 use crate::state::{format_relative_time, format_timestamp, AgentTreeNode, LogEntry};
 use leptos::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +71,9 @@ pub fn AgentNode(
             expanded_agents.update(|agents| {
                 agents.insert(click_id.clone());
             });
+            log_tabs.update(|agents| {
+                agents.insert(click_id.clone());
+            });
         }
     };
 
@@ -97,18 +100,18 @@ pub fn AgentNode(
             return view! { <div style="display:none"></div> }.into_any();
         }
 
-        let details_id = tab_agent_id.clone();
-        let on_tab_details = move |ev: web_sys::MouseEvent| {
-            ev.stop_propagation();
-            log_tabs.update(|agents| {
-                agents.remove(&details_id);
-            });
-        };
         let chat_id = tab_agent_id.clone();
         let on_tab_chat = move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
             log_tabs.update(|agents| {
                 agents.insert(chat_id.clone());
+            });
+        };
+        let details_id = tab_agent_id.clone();
+        let on_tab_details = move |ev: web_sys::MouseEvent| {
+            ev.stop_propagation();
+            log_tabs.update(|agents| {
+                agents.remove(&details_id);
             });
         };
 
@@ -131,7 +134,7 @@ pub fn AgentNode(
             if show_chat.get() {
                 let aid = detail_agent_id.get();
                 view! {
-                    <TopicLogPanel
+                    <ChatPanel
                         agent_id=aid
                         scroll_positions=log_scroll_positions
                         log_cache=log_cache
@@ -174,8 +177,8 @@ pub fn AgentNode(
         view! {
             <div class="agent-detail">
                 <div class="chat-tab-bar">
+                    <button class=chat_tab_class on:click=on_tab_chat>"Chat"</button>
                     <button class=details_tab_class on:click=on_tab_details>"details"</button>
-                    <button class=chat_tab_class on:click=on_tab_chat>"topic log"</button>
                 </div>
                 {content}
             </div>
@@ -206,8 +209,10 @@ pub fn AgentNode(
         None
     };
 
+    let node_agent_id = id.clone();
+
     view! {
-        <div class="agent-node">
+        <div class="agent-node" data-agent-id=node_agent_id>
             <div class=card_class on:click=on_click>
                 <div class={format!("agent-status-indicator {}", status_class)}></div>
                 <div class="agent-identity">

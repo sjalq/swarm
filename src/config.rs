@@ -147,7 +147,7 @@ mod tests {
         let toml_str = r#"
             default_harness = "claude"
             default_port = 9801
-            default_model = "claude-opus-4-6"
+            default_model = "harness-supported-model"
             claude_bin = "/usr/local/bin/claude"
         "#;
         let cfg: SwarmConfig = toml::from_str(toml_str).unwrap();

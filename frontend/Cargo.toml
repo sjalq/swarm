@@ -15,10 +15,13 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "console",
     "Document",
+    "DomRect",
     "Element",
     "HtmlElement",
     "Window",
     "Location",
+    "Node",
+    "NodeList",
 ] }
 js-sys = "0.3"
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }

@@ -26,8 +26,8 @@ fn models_offline_succeeds_without_server() {
             .iter()
             .find(|entry| entry["harness"] == harness)
             .unwrap_or_else(|| panic!("should list {harness} models"));
-        assert!(entry["default_model"].as_str().is_some());
-        assert!(entry["models"].as_array().unwrap().len() >= 2);
+        assert_eq!(entry["default_model"], "CLI default");
+        assert!(entry["models"].as_array().unwrap().is_empty());
     }
 }
 

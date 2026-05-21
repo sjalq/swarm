@@ -101,29 +101,11 @@ impl CliKind {
     }
 
     pub fn default_model(&self) -> &'static str {
-        match self {
-            Self::Claude => "claude-opus-4-6",
-            Self::Gemini => "gemini-3.1-pro-preview",
-            Self::Codex => "gpt-5.5",
-            Self::Grok => "grok-3",
-        }
+        ""
     }
 
     pub fn known_models(&self) -> &[&str] {
-        match self {
-            Self::Claude => &[
-                "claude-opus-4-6",
-                "claude-sonnet-4-6",
-                "claude-haiku-4-5-20251001",
-            ],
-            Self::Gemini => &[
-                "gemini-3.1-pro-preview",
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-            ],
-            Self::Codex => &["gpt-5.5", "o3", "o4-mini"],
-            Self::Grok => &["grok-3", "grok-build"],
-        }
+        &[]
     }
 
     pub fn all_kinds() -> &'static [CliKind] {
@@ -172,7 +154,7 @@ impl CliKind {
             Self::Gemini => {
                 let mut args = vec!["-p".into(), prompt.into()];
                 if continue_conversation {
-                    args.push("-c".into());
+                    args.extend_from_slice(&["--resume".into(), "latest".into()]);
                 }
                 if let Some(m) = model {
                     args.extend_from_slice(&["-m".into(), m.into()]);
@@ -245,11 +227,10 @@ pub struct CliHarness {
 impl CliHarness {
     pub fn new(kind: CliKind) -> Self {
         let binary = kind.resolved_binary();
-        let model = kind.default_model().to_string();
         Self {
             kind,
             binary,
-            model,
+            model: String::new(),
             timeout_ms: 21_600_000,
         }
     }
@@ -574,6 +555,43 @@ mod tests {
     fn cli_kind_all_kinds() {
         let kinds = CliKind::all_kinds();
         assert_eq!(kinds.len(), 4);
+    }
+
+    #[test]
+    fn gemini_resume_uses_resume_latest_not_c_flag() {
+        let args = CliKind::Gemini.build_args(
+            "follow up",
+            None,
+            true,
+            Path::new("/tmp/swarm-test"),
+            &HashMap::new(),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--resume", "latest"]),
+            "Gemini resume should use --resume latest; args: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "-c"),
+            "Gemini CLI 0.42 rejects -c; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn gemini_first_turn_does_not_resume() {
+        let args = CliKind::Gemini.build_args(
+            "first turn",
+            None,
+            false,
+            Path::new("/tmp/swarm-test"),
+            &HashMap::new(),
+        );
+
+        assert!(
+            !args.iter().any(|arg| arg == "--resume" || arg == "-c"),
+            "Gemini first turn should not request resume; args: {args:?}"
+        );
     }
 
     #[test]

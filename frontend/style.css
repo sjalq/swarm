@@ -226,6 +226,7 @@ html, body {
 .main-content {
     flex: 1;
     overflow-y: auto;
+    overflow-anchor: none;
     padding: 16px 20px;
 }
 
@@ -515,13 +516,14 @@ html, body {
     border-bottom-color: var(--accent);
 }
 
-/* ── Topic log ── */
+/* ── Chat ── */
 
 .chat-panel {
     display: flex;
     flex-direction: column;
     max-height: 400px;
     overflow-y: auto;
+    overflow-anchor: none;
 }
 
 .chat-messages {

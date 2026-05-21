@@ -116,6 +116,9 @@ pub struct Agent {
     pub ended_at: Option<String>,
     pub worktree_branch: Option<String>,
     pub project_dir: Option<String>,
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub user_launched: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
