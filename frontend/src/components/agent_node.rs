@@ -25,7 +25,7 @@ pub fn AgentNode(
     let harness_class = agent.harness_class().to_string();
     let model_display = agent.display_model().to_string();
     let harness_display = agent.harness.clone();
-    let role = agent.role.clone();
+    let label = agent.label.clone();
     let id = agent.id.clone();
     let created_at = agent.created_at.clone();
     let expanded_id = id.clone();
@@ -85,7 +85,7 @@ pub fn AgentNode(
     };
 
     let child_prefix = if has_children { "^ " } else { "" };
-    let role_display = format!("{}{}", child_prefix, role);
+    let label_display = format!("{}{}", child_prefix, label);
 
     let detail_agent_id = RwSignal::new(agent.id.clone());
     let detail_prompt = RwSignal::new(agent.system_prompt.clone());
@@ -216,7 +216,7 @@ pub fn AgentNode(
             <div class=card_class on:click=on_click>
                 <div class={format!("agent-status-indicator {}", status_class)}></div>
                 <div class="agent-identity">
-                    <span class="agent-role">{role_display}</span>
+                    <span class="agent-label">{label_display}</span>
                     <span class="agent-id">{id}</span>
                 </div>
                 <div class="agent-badges">

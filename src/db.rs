@@ -1,104 +1,13 @@
 use crate::error::{Result, SwarmError};
+pub use crate::types::{
+    AgentRow, CommsMode, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow,
+    OutputLogRow, SqlEnum, TopicStatus,
+};
 use rusqlite::{Connection, ToSql};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-const AGENT_SELECT_COLUMNS: &str = "id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, run_id, user_launched";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentRow {
-    pub id: String,
-    pub role: String,
-    pub harness: String,
-    pub model: String,
-    pub status: String,
-    pub parent_id: Option<String>,
-    pub system_prompt: String,
-    pub work_dir: String,
-    pub comms: String,
-    pub created_at: String,
-    pub ended_at: Option<String>,
-    pub worktree_branch: Option<String>,
-    pub project_dir: Option<String>,
-    pub run_id: Option<String>,
-    pub user_launched: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunRow {
-    pub id: String,
-    pub project_dir: String,
-    pub task: String,
-    pub root_agent_id: Option<String>,
-    pub status: String,
-    pub created_at: String,
-    pub ended_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventRow {
-    pub id: String,
-    pub event_type: String,
-    pub agent_id: Option<String>,
-    pub payload: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageRow {
-    pub id: String,
-    pub from_agent: String,
-    pub to_agent: String,
-    pub content: String,
-    pub delivered: bool,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputLogRow {
-    pub id: String,
-    pub agent_id: String,
-    pub content: String,
-    pub kind: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandoverRow {
-    pub id: String,
-    pub agent_id: String,
-    pub summary: Option<String>,
-    pub outcome: Option<String>,
-    pub deliverable: Option<String>,
-    pub checks: Option<String>,
-    pub risk: Option<String>,
-    pub next_action: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogEntry {
-    pub timestamp: String,
-    pub kind: String,
-    pub peer: String,
-    pub content: String,
-}
-
-pub enum LogFilter {
-    All,
-    Messages,
-    Output,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbStats {
-    pub total: u64,
-    pub alive: u64,
-    pub done: u64,
-    pub messages: u64,
-    pub errors: u64,
-}
+const AGENT_SELECT_COLUMNS: &str = "id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -149,7 +58,7 @@ impl Db {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
-                role TEXT NOT NULL,
+                label TEXT NOT NULL,
                 harness TEXT NOT NULL,
                 model TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'idle',
@@ -161,26 +70,12 @@ impl Db {
                 ended_at TEXT NULL,
                 worktree_branch TEXT NULL,
                 project_dir TEXT NULL,
-                run_id TEXT NULL,
                 user_launched INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS runs (
-                id TEXT PRIMARY KEY,
-                project_dir TEXT NOT NULL,
-                task TEXT NOT NULL,
-                root_agent_id TEXT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                ended_at TEXT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_runs_project_created
-                ON runs(project_dir, created_at);
             CREATE TABLE IF NOT EXISTS inbox_cursors (
-                recipient TEXT NOT NULL,
-                run_id TEXT NOT NULL DEFAULT '',
+                recipient TEXT PRIMARY KEY,
                 last_seen_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (recipient, run_id)
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
@@ -230,11 +125,12 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_handovers_agent
                 ON handovers(agent_id, created_at);",
         )?;
+        Self::migrate_agent_label_column(&conn)?;
         Self::ensure_agents_column(&conn, "ended_at", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "worktree_branch", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "project_dir", "TEXT NULL")?;
-        Self::ensure_agents_column(&conn, "run_id", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "user_launched", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::migrate_inbox_cursors(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_agents_status
                 ON agents(status, created_at);
@@ -242,10 +138,11 @@ impl Db {
                 ON agents(parent_id, status);
             CREATE INDEX IF NOT EXISTS idx_agents_project_status
                 ON agents(project_dir, status, created_at);
-            CREATE INDEX IF NOT EXISTS idx_agents_project_run_status
-                ON agents(project_dir, run_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_agents_project_user_created
                 ON agents(project_dir, user_launched, created_at);
+            DROP INDEX IF EXISTS idx_agents_project_run_status;
+            DROP INDEX IF EXISTS idx_runs_project_created;
+            DROP TABLE IF EXISTS runs;
             UPDATE agents
                 SET status = 'done',
                     ended_at = COALESCE(
@@ -257,13 +154,66 @@ impl Db {
         Ok(())
     }
 
-    fn ensure_agents_column(conn: &Connection, column: &str, definition: &str) -> Result<()> {
-        let exists = {
-            let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
+    fn agent_column_names(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn migrate_agent_label_column(conn: &Connection) -> Result<()> {
+        let columns = Self::agent_column_names(conn)?;
+        let has_label = columns.iter().any(|name| name == "label");
+        let has_role = columns.iter().any(|name| name == "role");
+
+        if !has_label && has_role {
+            conn.execute_batch("ALTER TABLE agents RENAME COLUMN role TO label;")?;
+        } else if !has_label {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN label TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_inbox_cursors(conn: &Connection) -> Result<()> {
+        let has_run_id = {
+            let mut stmt = conn.prepare("PRAGMA table_info(inbox_cursors)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             let columns = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-            columns.iter().any(|name| name == column)
+            columns.iter().any(|name| name == "run_id")
         };
+
+        if has_run_id {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS inbox_cursors_new (
+                    recipient TEXT PRIMARY KEY,
+                    last_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT OR REPLACE INTO inbox_cursors_new (recipient, last_seen_at, updated_at)
+                    SELECT c.recipient, c.last_seen_at, c.updated_at
+                    FROM inbox_cursors c
+                    INNER JOIN (
+                        SELECT recipient, MAX(updated_at) AS updated_at
+                        FROM inbox_cursors
+                        GROUP BY recipient
+                    ) latest
+                    ON latest.recipient = c.recipient
+                    AND latest.updated_at = c.updated_at;
+                DROP TABLE inbox_cursors;
+                ALTER TABLE inbox_cursors_new RENAME TO inbox_cursors;",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_agents_column(conn: &Connection, column: &str, definition: &str) -> Result<()> {
+        let exists = Self::agent_column_names(conn)?
+            .iter()
+            .any(|name| name == column);
 
         if !exists {
             conn.execute(
@@ -276,34 +226,37 @@ impl Db {
     }
 
     fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
+        let status_text: String = row.get(4)?;
+        let status = TopicStatus::from_sql(&status_text).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        })?;
+        let comms_text: String = row.get(8)?;
+        let comms = CommsMode::from_sql(&comms_text).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+            )
+        })?;
         Ok(AgentRow {
             id: row.get(0)?,
-            role: row.get(1)?,
+            label: row.get(1)?,
             harness: row.get(2)?,
             model: row.get(3)?,
-            status: row.get(4)?,
+            status,
             parent_id: row.get(5)?,
             system_prompt: row.get(6)?,
             work_dir: row.get(7)?,
-            comms: row.get(8)?,
+            comms,
             created_at: row.get(9)?,
             ended_at: row.get(10)?,
             worktree_branch: row.get(11)?,
             project_dir: row.get(12)?,
-            run_id: row.get(13)?,
-            user_launched: row.get::<_, bool>(14)?,
-        })
-    }
-
-    fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
-        Ok(RunRow {
-            id: row.get(0)?,
-            project_dir: row.get(1)?,
-            task: row.get(2)?,
-            root_agent_id: row.get(3)?,
-            status: row.get(4)?,
-            created_at: row.get(5)?,
-            ended_at: row.get(6)?,
+            user_launched: row.get::<_, bool>(13)?,
         })
     }
 
@@ -319,23 +272,22 @@ impl Db {
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO agents (id, role, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, run_id, user_launched)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agents (id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 agent.id,
-                agent.role,
+                agent.label,
                 agent.harness,
                 agent.model,
-                agent.status,
+                agent.status.as_sql(),
                 agent.parent_id,
                 agent.system_prompt,
                 agent.work_dir,
-                agent.comms,
+                agent.comms.as_sql(),
                 agent.created_at,
                 agent.ended_at,
                 agent.worktree_branch,
                 agent.project_dir,
-                agent.run_id,
                 agent.user_launched as i32,
             ],
         )?;
@@ -398,123 +350,6 @@ impl Db {
             .query_map([project_dir], Self::agent_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(agents)
-    }
-
-    pub fn list_agents_for_project_run(
-        &self,
-        project_dir: &str,
-        run_id: &str,
-        include_done: bool,
-    ) -> Result<Vec<AgentRow>> {
-        let conn = self.conn()?;
-        let status_clause = if include_done {
-            ""
-        } else {
-            " AND status != 'done'"
-        };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_SELECT_COLUMNS}
-             FROM agents
-             WHERE project_dir = ?1 AND run_id = ?2{status_clause}
-             ORDER BY created_at"
-        ))?;
-        let agents = stmt
-            .query_map(rusqlite::params![project_dir, run_id], Self::agent_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(agents)
-    }
-
-    pub fn insert_run(&self, run: &RunRow) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO runs (id, project_dir, task, root_agent_id, status, created_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                run.id,
-                run.project_dir,
-                run.task,
-                run.root_agent_id,
-                run.status,
-                run.created_at,
-                run.ended_at,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_run_root_agent(&self, run_id: &str, root_agent_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE runs SET root_agent_id = ?2 WHERE id = ?1",
-            rusqlite::params![run_id, root_agent_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_run_status(&self, run_id: &str, status: &str) -> Result<()> {
-        let conn = self.conn()?;
-        let ended_at = (status != "active").then(|| chrono::Utc::now().to_rfc3339());
-        conn.execute(
-            "UPDATE runs
-                SET status = ?2,
-                    ended_at = CASE
-                        WHEN ?2 = 'active' THEN NULL
-                        ELSE COALESCE(ended_at, ?3)
-                    END
-              WHERE id = ?1",
-            rusqlite::params![run_id, status, ended_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_run(&self, run_id: &str) -> Result<Option<RunRow>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, project_dir, task, root_agent_id, status, created_at, ended_at
-             FROM runs WHERE id = ?1",
-        )?;
-        let result = stmt.query_row([run_id], Self::run_from_row);
-        match result {
-            Ok(run) => Ok(Some(run)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn latest_run_for_project(&self, project_dir: &str) -> Result<Option<RunRow>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, project_dir, task, root_agent_id, status, created_at, ended_at
-             FROM runs
-             WHERE project_dir = ?1
-             ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
-                      created_at DESC
-             LIMIT 1",
-        )?;
-        let result = stmt.query_row([project_dir], Self::run_from_row);
-        match result {
-            Ok(run) => Ok(Some(run)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn list_runs_for_project(&self, project_dir: &str, limit: usize) -> Result<Vec<RunRow>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, project_dir, task, root_agent_id, status, created_at, ended_at
-             FROM runs
-             WHERE project_dir = ?1
-             ORDER BY created_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![project_dir, limit as i64],
-                Self::run_from_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
     }
 
     pub fn insert_event(&self, event: &EventRow) -> Result<()> {
@@ -663,9 +498,10 @@ impl Db {
         Ok(count)
     }
 
-    pub fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
+    pub fn update_agent_status(&self, id: &str, status: TopicStatus) -> Result<()> {
         let conn = self.conn()?;
-        let ended_at = (status == "done").then(|| chrono::Utc::now().to_rfc3339());
+        let status_text = status.as_sql();
+        let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
         conn.execute(
             "UPDATE agents
                 SET status = ?1,
@@ -674,14 +510,15 @@ impl Db {
                         ELSE NULL
                     END
                 WHERE id = ?2",
-            rusqlite::params![status, id, ended_at],
+            rusqlite::params![status_text, id, ended_at],
         )?;
         Ok(())
     }
 
-    pub fn update_agent_status_if_active(&self, id: &str, status: &str) -> Result<bool> {
+    pub fn update_agent_status_if_active(&self, id: &str, status: TopicStatus) -> Result<bool> {
         let conn = self.conn()?;
-        let ended_at = (status == "done").then(|| chrono::Utc::now().to_rfc3339());
+        let status_text = status.as_sql();
+        let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
         let updated = conn.execute(
             "UPDATE agents
                 SET status = ?1,
@@ -690,7 +527,7 @@ impl Db {
                         ELSE NULL
                     END
                 WHERE id = ?2 AND status != 'done'",
-            rusqlite::params![status, id, ended_at],
+            rusqlite::params![status_text, id, ended_at],
         )?;
         Ok(updated > 0)
     }
@@ -1047,7 +884,6 @@ impl Db {
         from_agent: Option<&str>,
         limit: usize,
         query: Option<&str>,
-        run_id: Option<&str>,
         since: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
         let conn = self.conn()?;
@@ -1060,17 +896,12 @@ impl Db {
         let project_dir = project_dir.to_string();
         let from_agent = from_agent.map(str::to_string);
         let pattern = query.map(|q| format!("%{}%", escape_like(q)));
-        let run_id = run_id.map(str::to_string);
         let since = since.map(str::to_string);
         let limit = limit as i64;
         let mut next_param = 2;
 
         if from_agent.is_some() {
             sql.push_str(&format!(" AND m.from_agent = ?{next_param}"));
-            next_param += 1;
-        }
-        if run_id.is_some() {
-            sql.push_str(&format!(" AND a.run_id = ?{next_param}"));
             next_param += 1;
         }
         if since.is_some() {
@@ -1089,9 +920,6 @@ impl Db {
         if let Some(from_agent) = from_agent.as_ref() {
             params.push(from_agent);
         }
-        if let Some(run_id) = run_id.as_ref() {
-            params.push(run_id);
-        }
         if let Some(since) = since.as_ref() {
             params.push(since);
         }
@@ -1102,16 +930,11 @@ impl Db {
         query_log_entries(&conn, &sql, &params)
     }
 
-    pub fn get_inbox_cursor(
-        &self,
-        recipient: &str,
-        run_id: Option<&str>,
-    ) -> Result<Option<String>> {
+    pub fn get_inbox_cursor(&self, recipient: &str) -> Result<Option<String>> {
         let conn = self.conn()?;
-        let run_key = run_id.unwrap_or("");
         let result = conn.query_row(
-            "SELECT last_seen_at FROM inbox_cursors WHERE recipient = ?1 AND run_id = ?2",
-            rusqlite::params![recipient, run_key],
+            "SELECT last_seen_at FROM inbox_cursors WHERE recipient = ?1",
+            rusqlite::params![recipient],
             |row| row.get(0),
         );
         match result {
@@ -1121,22 +944,16 @@ impl Db {
         }
     }
 
-    pub fn set_inbox_cursor(
-        &self,
-        recipient: &str,
-        run_id: Option<&str>,
-        last_seen_at: &str,
-    ) -> Result<()> {
+    pub fn set_inbox_cursor(&self, recipient: &str, last_seen_at: &str) -> Result<()> {
         let conn = self.conn()?;
-        let run_key = run_id.unwrap_or("");
         let updated_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO inbox_cursors (recipient, run_id, last_seen_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(recipient, run_id)
+            "INSERT INTO inbox_cursors (recipient, last_seen_at, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(recipient)
              DO UPDATE SET last_seen_at = excluded.last_seen_at,
                            updated_at = excluded.updated_at",
-            rusqlite::params![recipient, run_key, last_seen_at, updated_at],
+            rusqlite::params![recipient, last_seen_at, updated_at],
         )?;
         Ok(())
     }
@@ -1278,19 +1095,18 @@ mod tests {
     fn test_agent(id: &str, status: &str) -> AgentRow {
         AgentRow {
             id: id.into(),
-            role: "tester".into(),
+            label: "tester".into(),
             harness: "echo".into(),
             model: String::new(),
-            status: status.into(),
+            status: TopicStatus::from_sql(status).unwrap(),
             parent_id: None,
             system_prompt: "you are a tester".into(),
             work_dir: "/tmp/test".into(),
-            comms: "mesh".into(),
+            comms: CommsMode::Mesh,
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
             worktree_branch: None,
             project_dir: None,
-            run_id: None,
             user_launched: false,
         }
     }
@@ -1321,17 +1137,16 @@ mod tests {
         assert!(columns.contains(&"ended_at".to_string()));
         assert!(columns.contains(&"worktree_branch".to_string()));
         assert!(columns.contains(&"project_dir".to_string()));
-        assert!(columns.contains(&"run_id".to_string()));
         assert!(columns.contains(&"user_launched".to_string()));
 
         let indexes = agent_indexes(&db);
         assert!(indexes.contains(&"idx_agents_status".to_string()));
         assert!(indexes.contains(&"idx_agents_parent_status".to_string()));
-        assert!(indexes.contains(&"idx_agents_project_run_status".to_string()));
+        assert!(indexes.contains(&"idx_agents_project_status".to_string()));
     }
 
     #[test]
-    fn migrates_legacy_agents_table_metadata_columns() {
+    fn migrates_legacy_agents_table_metadata_and_label_columns() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("swarm.db");
         {
@@ -1357,11 +1172,14 @@ mod tests {
 
         let db = Db::open(&db_path).unwrap();
         let columns = agent_columns(&db);
+        assert!(columns.contains(&"label".to_string()));
+        assert!(!columns.contains(&"role".to_string()));
         assert!(columns.contains(&"ended_at".to_string()));
         assert!(columns.contains(&"worktree_branch".to_string()));
 
         let agent = db.get_agent("legacy-agent").unwrap().unwrap();
-        assert_eq!(agent.status, "idle");
+        assert_eq!(agent.label, "worker");
+        assert_eq!(agent.status, TopicStatus::Idle);
         assert_eq!(agent.ended_at, None);
         assert_eq!(agent.worktree_branch, None);
     }
@@ -1373,71 +1191,28 @@ mod tests {
         db.insert_agent(&agent).unwrap();
 
         let fetched = db.get_agent("test-1234").unwrap().unwrap();
-        assert_eq!(fetched.role, "tester");
+        assert_eq!(fetched.label, "tester");
         assert_eq!(fetched.harness, "echo");
 
         let agents = db.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
 
-        db.update_agent_status("test-1234", "working").unwrap();
+        db.update_agent_status("test-1234", TopicStatus::Working)
+            .unwrap();
         let updated = db.get_agent("test-1234").unwrap().unwrap();
-        assert_eq!(updated.status, "working");
+        assert_eq!(updated.status, TopicStatus::Working);
 
         db.delete_agent("test-1234").unwrap();
         assert!(db.get_agent("test-1234").unwrap().is_none());
     }
 
     #[test]
-    fn run_crud_and_agent_scoping() {
-        let db = test_db();
-        let run = RunRow {
-            id: "run-abc123".into(),
-            project_dir: "/tmp/project".into(),
-            task: "test task".into(),
-            root_agent_id: None,
-            status: "active".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            ended_at: None,
-        };
-        db.insert_run(&run).unwrap();
-        db.update_run_root_agent(&run.id, "root-1").unwrap();
-
-        let fetched = db.get_run(&run.id).unwrap().unwrap();
-        assert_eq!(fetched.root_agent_id.as_deref(), Some("root-1"));
-        assert_eq!(
-            db.latest_run_for_project("/tmp/project")
-                .unwrap()
-                .unwrap()
-                .id,
-            run.id
-        );
-
-        let mut agent = test_agent("test-run-agent", "idle");
-        agent.project_dir = Some("/tmp/project".into());
-        agent.run_id = Some("run-abc123".into());
-        agent.user_launched = true;
-        db.insert_agent(&agent).unwrap();
-
-        let scoped = db
-            .list_agents_for_project_run("/tmp/project", "run-abc123", false)
-            .unwrap();
-        assert_eq!(scoped.len(), 1);
-        assert!(scoped[0].user_launched);
-    }
-
-    #[test]
     fn inbox_cursor_round_trips() {
         let db = test_db();
-        assert!(db
-            .get_inbox_cursor("user", Some("run-1"))
-            .unwrap()
-            .is_none());
-        db.set_inbox_cursor("user", Some("run-1"), "2026-01-01T00:00:00Z")
-            .unwrap();
+        assert!(db.get_inbox_cursor("user").unwrap().is_none());
+        db.set_inbox_cursor("user", "2026-01-01T00:00:00Z").unwrap();
         assert_eq!(
-            db.get_inbox_cursor("user", Some("run-1"))
-                .unwrap()
-                .as_deref(),
+            db.get_inbox_cursor("user").unwrap().as_deref(),
             Some("2026-01-01T00:00:00Z")
         );
     }
@@ -1618,9 +1393,12 @@ mod tests {
         db.insert_agent(&agent).unwrap();
 
         assert!(!db
-            .update_agent_status_if_active("done-agent", "idle")
+            .update_agent_status_if_active("done-agent", TopicStatus::Idle)
             .unwrap());
-        assert_eq!(db.get_agent("done-agent").unwrap().unwrap().status, "done");
+        assert_eq!(
+            db.get_agent("done-agent").unwrap().unwrap().status,
+            TopicStatus::Paused
+        );
 
         let msg = MessageRow {
             id: "msg-terminal".into(),
@@ -1639,17 +1417,19 @@ mod tests {
         let db = test_db();
         db.insert_agent(&test_agent("agent-1", "idle")).unwrap();
 
-        db.update_agent_status("agent-1", "done").unwrap();
+        db.update_agent_status("agent-1", TopicStatus::Paused)
+            .unwrap();
         let done_agent = db.get_agent("agent-1").unwrap().unwrap();
-        assert_eq!(done_agent.status, "done");
+        assert_eq!(done_agent.status, TopicStatus::Paused);
         assert!(
             done_agent.ended_at.is_some(),
             "done transition should set ended_at"
         );
 
-        db.update_agent_status("agent-1", "idle").unwrap();
+        db.update_agent_status("agent-1", TopicStatus::Idle)
+            .unwrap();
         let active_agent = db.get_agent("agent-1").unwrap().unwrap();
-        assert_eq!(active_agent.status, "idle");
+        assert_eq!(active_agent.status, TopicStatus::Idle);
         assert_eq!(active_agent.ended_at, None);
     }
 }

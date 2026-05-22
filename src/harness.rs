@@ -45,17 +45,84 @@ impl Harness for EchoHarness {
         _model: Option<&str>,
         _continue: bool,
         _work_dir: &Path,
-        _env: HashMap<String, String>,
+        env: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        let response = format!("(echo) {}", prompt.trim());
+        let messages = parse_echo_messages(prompt);
         Box::pin(async move {
-            tx.send(HarnessOutput::Complete(response))
-                .await
-                .map_err(|e| SwarmError::Internal(e.to_string()))?;
+            let Some(socket) = env.get("SWARM_SOCKET").cloned() else {
+                return Ok(());
+            };
+            let Some(agent_id) = env.get("SWARM_AGENT_ID").cloned() else {
+                return Ok(());
+            };
+            let client = reqwest::Client::new();
+            for (sender, content) in messages {
+                let response = format!("(echo) {}", echo_payload(&content));
+                let resp = client
+                    .post(format!("{socket}/api/messages"))
+                    .json(&serde_json::json!({
+                        "from": agent_id,
+                        "to": sender,
+                        "content": response,
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| SwarmError::Internal(format!("echo send failed: {e}")))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SwarmError::Internal(format!(
+                        "echo send failed: {status} {}",
+                        body.trim()
+                    )));
+                }
+            }
+            drop(tx);
             Ok(())
         })
     }
+}
+
+fn parse_echo_messages(prompt: &str) -> Vec<(String, String)> {
+    let mut messages = Vec::new();
+    let mut sender: Option<String> = None;
+    let mut content = String::new();
+
+    for line in prompt.lines() {
+        if let Some(from) = line
+            .strip_prefix("[from: ")
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            if let Some(sender) = sender.replace(from.to_string()) {
+                messages.push((sender, content.trim().to_string()));
+                content.clear();
+            }
+            continue;
+        }
+
+        if sender.is_some() {
+            content.push_str(line);
+            content.push('\n');
+        }
+    }
+
+    if let Some(sender) = sender {
+        messages.push((sender, content.trim().to_string()));
+    }
+
+    messages
+}
+
+fn echo_payload(message: &str) -> &str {
+    let Some((_, after_task)) = message.rsplit_once("\nTask:\n") else {
+        return message.trim();
+    };
+    after_task
+        .split_once("\n\nWork independently.")
+        .map(|(task, _)| task)
+        .unwrap_or(after_task)
+        .trim()
 }
 
 // -- Generic CLI harness -----------------------------------------------------
@@ -297,7 +364,7 @@ impl Harness for CliHarness {
 
             let mut child = cmd
                 .spawn()
-                .map_err(|e| SwarmError::Process(format!("failed to spawn {binary}: {e}")))?;
+                .map_err(|e| SwarmError::Process(format!("failed to start {binary}: {e}")))?;
 
             if needs_stdin {
                 if let Some(mut stdin) = child.stdin.take() {
@@ -517,20 +584,20 @@ mod tests {
         assert!(reg.get("nonexistent").is_none());
     }
 
-    #[tokio::test]
-    async fn echo_harness_returns_prompt() {
-        let harness = EchoHarness;
-        let (tx, mut rx) = mpsc::channel(10);
-        let dir = std::env::temp_dir();
-        harness
-            .run("hello world", None, false, &dir, HashMap::new(), tx)
-            .await
-            .unwrap();
-        let output = rx.recv().await.unwrap();
-        match output {
-            HarnessOutput::Complete(text) => assert_eq!(text, "(echo) hello world"),
-            other => panic!("expected Complete, got {:?}", other),
-        }
+    #[test]
+    fn echo_parses_received_messages() {
+        let messages = parse_echo_messages("[from: user]\nhello world");
+        assert_eq!(
+            messages,
+            vec![("user".to_string(), "hello world".to_string())]
+        );
+    }
+
+    #[test]
+    fn echo_extracts_task_from_swarm_task_message() {
+        let message =
+            "You are topic t.\n\nTask:\nhello from task\n\nWork independently. report back";
+        assert_eq!(echo_payload(message), "hello from task");
     }
 
     #[test]

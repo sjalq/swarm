@@ -1,7 +1,8 @@
 use crate::db::LogFilter;
 use crate::error::SwarmError;
 use crate::harness::CliKind;
-use crate::orchestrator::{DoneReport, Orchestrator, SpawnOptions};
+use crate::orchestrator::{DoneReport, Orchestrator, StartTopicOptions};
+use crate::types::{CommsMode, SqlEnum, SWARM_PROTOCOL_VERSION};
 use axum::extract::ws;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -19,11 +20,11 @@ use tower_http::services::{ServeDir, ServeFile};
 struct DashboardAssets;
 
 type AppState = Arc<Orchestrator>;
-const PEERS_HINT: &str = "run swarm peers to list agents";
+const PEERS_HINT: &str = "run swarm peers to list topics";
 
 #[derive(Deserialize)]
-pub struct SpawnRequest {
-    pub role: String,
+pub struct StartTopicRequest {
+    pub label: String,
     pub harness: String,
     #[serde(default)]
     pub system_prompt: String,
@@ -33,7 +34,6 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub worktree: bool,
-    pub run_id: Option<String>,
     #[serde(default)]
     pub user_launched: bool,
 }
@@ -64,7 +64,6 @@ pub struct ListQuery {
     pub perspective: Option<String>,
     #[serde(default)]
     pub all: bool,
-    pub run: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,21 +85,9 @@ pub struct InboxQuery {
     pub n: usize,
     pub from: Option<String>,
     pub q: Option<String>,
-    pub run: Option<String>,
     #[serde(default)]
     pub new: bool,
     pub since: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct CreateRunRequest {
-    pub task: String,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateRunRequest {
-    pub root_agent_id: Option<String>,
-    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +129,7 @@ struct ModelsResponse {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    protocol: &'static str,
     uptime: u64,
     version: &'static str,
     data_dir: String,
@@ -169,18 +157,18 @@ fn swarm_error_response(error: SwarmError) -> Response {
     match error {
         SwarmError::AgentNotFound(id) => json_error(
             StatusCode::NOT_FOUND,
-            format!("agent not found: {id}"),
+            format!("topic not found: {id}"),
             PEERS_HINT,
         ),
         SwarmError::AgentInactive { id, status } => json_error(
             StatusCode::CONFLICT,
-            format!("agent {id} is not accepting messages; status is {status}"),
+            format!("topic {id} is not accepting messages; status is {status}"),
             PEERS_HINT,
         ),
         SwarmError::InvalidInput(message) => json_error(
             StatusCode::BAD_REQUEST,
             message,
-            "use only letters, numbers, underscores, and hyphens for role names and agent IDs",
+            "use only letters, numbers, underscores, and hyphens for labels and topic IDs",
         ),
         SwarmError::InvalidRequest(message) => json_error(
             StatusCode::BAD_REQUEST,
@@ -217,12 +205,9 @@ pub fn router(state: AppState) -> Router {
 pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
-        .route("/api/brief", get(get_run_brief))
-        .route("/api/runs", post(create_run))
-        .route("/api/runs/current", get(get_current_run))
-        .route("/api/runs/{id}", post(update_run))
+        .route("/api/brief", get(get_swarm_brief))
         .route("/api/stats", get(get_stats))
-        .route("/api/agents", get(list_agents).post(spawn_agent))
+        .route("/api/agents", get(list_agents).post(start_topic))
         .route("/api/agents/{id}", get(get_agent).delete(kill_agent))
         .route("/api/agents/{id}/brief", get(get_agent_brief))
         .route("/api/agents/{id}/done", post(done_agent))
@@ -273,6 +258,7 @@ async fn serve_embedded(uri: axum::http::Uri) -> impl IntoResponse {
 async fn health(State(orch): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
+        protocol: SWARM_PROTOCOL_VERSION,
         uptime: orch.uptime_seconds(),
         version: env!("CARGO_PKG_VERSION"),
         data_dir: orch.data_dir().to_string_lossy().to_string(),
@@ -287,65 +273,12 @@ async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn create_run(
-    State(orch): State<AppState>,
-    Json(req): Json<CreateRunRequest>,
-) -> impl IntoResponse {
-    match blocking_orchestrator("create run", move || orch.create_run(&req.task)).await {
-        Ok(run) => (StatusCode::CREATED, Json(run)).into_response(),
-        Err(e) => swarm_error_response(e),
-    }
-}
-
-async fn get_current_run(State(orch): State<AppState>) -> impl IntoResponse {
-    match blocking_orchestrator("get current run", move || orch.current_run()).await {
-        Ok(Some(run)) => Json(run).into_response(),
-        Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => swarm_error_response(e),
-    }
-}
-
-async fn update_run(
-    State(orch): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateRunRequest>,
-) -> impl IntoResponse {
-    match blocking_orchestrator("update run", {
-        let id = id.clone();
-        move || {
-            if let Some(root_agent_id) = req.root_agent_id.as_deref() {
-                orch.update_run_root_agent(&id, root_agent_id)?;
-            }
-            if let Some(status) = req.status.as_deref() {
-                orch.update_run_status(&id, status)?;
-            }
-            orch.current_run()
-        }
-    })
-    .await
-    {
-        Ok(run) => Json(run).into_response(),
-        Err(e) => swarm_error_response(e),
-    }
-}
-
-fn resolve_run_filter(
-    orch: &Orchestrator,
-    run: Option<&str>,
-) -> Result<Option<String>, SwarmError> {
-    match run {
-        Some("current") => Ok(orch.current_run()?.map(|run| run.id)),
-        Some(run_id) if !run_id.is_empty() => Ok(Some(run_id.to_string())),
-        _ => Ok(None),
-    }
-}
-
-async fn get_run_brief(
+async fn get_swarm_brief(
     State(orch): State<AppState>,
     Query(params): Query<BriefQuery>,
 ) -> impl IntoResponse {
-    match blocking_orchestrator("get run brief", move || {
-        orch.run_brief(params.limit, params.q.as_deref())
+    match blocking_orchestrator("get project brief", move || {
+        orch.swarm_brief(params.limit, params.q.as_deref())
     })
     .await
     {
@@ -358,17 +291,9 @@ async fn list_agents(
     State(orch): State<AppState>,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let run_filter = match resolve_run_filter(&orch, params.run.as_deref()) {
-        Ok(run_filter) => run_filter,
-        Err(e) => return swarm_error_response(e),
-    };
     if let Some(perspective) = params.perspective {
         match blocking_orchestrator("list agents", move || {
-            orch.list_agents_with_perspective_all_for_run(
-                &perspective,
-                params.all,
-                run_filter.as_deref(),
-            )
+            orch.list_agents_with_perspective_all(&perspective, params.all)
         })
         .await
         {
@@ -377,7 +302,11 @@ async fn list_agents(
         }
     } else {
         match blocking_orchestrator("list agents", move || {
-            orch.list_agents_for_run(run_filter.as_deref(), params.all)
+            if params.all {
+                orch.list_all_agents()
+            } else {
+                orch.list_agents()
+            }
         })
         .await
         {
@@ -400,21 +329,24 @@ async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl
     }
 }
 
-async fn spawn_agent(
+async fn start_topic(
     State(orch): State<AppState>,
-    Json(req): Json<SpawnRequest>,
+    Json(req): Json<StartTopicRequest>,
 ) -> impl IntoResponse {
+    let comms = match CommsMode::from_sql(&req.comms) {
+        Ok(comms) => comms,
+        Err(err) => return swarm_error_response(SwarmError::InvalidInput(err)),
+    };
     let result = tokio::task::spawn_blocking(move || {
-        orch.spawn_agent_with_options(
-            &req.role,
+        orch.start_topic_with_options(
+            &req.label,
             &req.harness,
             &req.system_prompt,
-            SpawnOptions {
+            StartTopicOptions {
                 model: req.model.as_deref(),
                 parent_id: req.parent_id.as_deref(),
-                comms: &req.comms,
+                comms,
                 use_worktree: req.worktree,
-                run_id: req.run_id.as_deref(),
                 user_launched: req.user_launched,
             },
         )
@@ -426,7 +358,7 @@ async fn spawn_agent(
         Ok(Err(e)) => swarm_error_response(e),
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn task failed: {e}"),
+            format!("topic start task failed: {e}"),
             "check the swarm server logs and retry the request",
         ),
     }
@@ -452,7 +384,7 @@ async fn get_agent_log(
         Some("output") => LogFilter::Output,
         _ => LogFilter::All,
     };
-    match blocking_orchestrator("get agent log", {
+    match blocking_orchestrator("get topic log", {
         let id = id.clone();
         move || orch.search_agent_log(&id, params.n, filter, params.q.as_deref())
     })
@@ -468,10 +400,6 @@ async fn get_agent_inbox(
     Path(id): Path<String>,
     Query(params): Query<InboxQuery>,
 ) -> impl IntoResponse {
-    let run_filter = match resolve_run_filter(&orch, params.run.as_deref()) {
-        Ok(run_filter) => run_filter,
-        Err(e) => return swarm_error_response(e),
-    };
     match blocking_orchestrator("get agent inbox", {
         let id = id.clone();
         move || {
@@ -480,7 +408,6 @@ async fn get_agent_inbox(
                 params.from.as_deref(),
                 params.n,
                 params.q.as_deref(),
-                run_filter.as_deref(),
                 params.new,
                 params.since.as_deref(),
             )
@@ -523,7 +450,7 @@ async fn get_agent_worktree(
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
             format!("worktree not found for agent: {id}"),
-            "spawn the agent with --worktree or check swarm peers --all",
+            "start the topic with --worktree or check swarm peers --all",
         ),
         Err(e) => swarm_error_response(e),
     }

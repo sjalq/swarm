@@ -7,13 +7,13 @@ fn port_conflict_detected() {
     let port = listener.local_addr().unwrap().port();
 
     let child = Command::new("cargo")
-        .args(["run", "--", "run", "--port", &port.to_string()])
+        .args(["run", "--", "serve", "--port", &port.to_string()])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("SWARM_SOCKET")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("failed to spawn swarm run");
+        .expect("failed to start swarm serve");
 
     let output = child.wait_with_output().expect("failed to wait");
 

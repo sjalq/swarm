@@ -4,10 +4,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use swarm::db::{AgentRow, Db, LogFilter, MessageRow, OutputLogRow};
+use swarm::db::{AgentRow, CommsMode, Db, LogFilter, MessageRow, OutputLogRow, TopicStatus};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
-use swarm::orchestrator::{DoneReport, Orchestrator, SpawnOptions, SwarmEvent};
+use swarm::orchestrator::{DoneReport, Orchestrator, SwarmEvent};
 use tokio::sync::mpsc;
 
 struct ResumeProbeHarness;
@@ -120,6 +120,10 @@ async fn wait_for_agent_output(
 }
 
 fn setup_with_git() -> (tempfile::TempDir, Arc<Orchestrator>) {
+    setup_with_git_registry(HarnessRegistry::new())
+}
+
+fn setup_with_git_registry(registry: HarnessRegistry) -> (tempfile::TempDir, Arc<Orchestrator>) {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -156,7 +160,6 @@ fn setup_with_git() -> (tempfile::TempDir, Arc<Orchestrator>) {
     std::fs::create_dir_all(data_dir.join("agents")).unwrap();
 
     let db = Arc::new(Db::open(&data_dir.join("swarm.db")).unwrap());
-    let registry = HarnessRegistry::new();
     let orch = Arc::new(Orchestrator::new(
         db,
         registry,
@@ -168,18 +171,19 @@ fn setup_with_git() -> (tempfile::TempDir, Arc<Orchestrator>) {
 }
 
 #[tokio::test]
-async fn spawn_and_list_agents() {
+async fn start_topic_and_list_agents() {
     let (_dir, orch) = setup();
 
     let a = orch
-        .spawn_agent("researcher", "echo", "find things", None, "mesh")
+        .start_topic("researcher", "echo", "find things", None, "mesh")
         .unwrap();
     assert!(a.id.starts_with("researcher-"));
     assert_eq!(a.harness, "echo");
-    assert_eq!(a.status, "idle");
+    assert_eq!(a.status, TopicStatus::Idle);
+    assert_eq!(a.parent_id.as_deref(), Some("user"));
 
     let b = orch
-        .spawn_agent("writer", "echo", "write things", Some(&a.id), "mesh")
+        .start_topic("writer", "echo", "write things", Some(&a.id), "mesh")
         .unwrap();
     assert_eq!(b.parent_id.as_deref(), Some(a.id.as_str()));
 
@@ -201,10 +205,10 @@ async fn global_data_dir_scopes_agents_to_current_project() {
     for (id, project_dir) in [("worker-a", &project_a), ("worker-b", &project_b)] {
         db.insert_agent(&AgentRow {
             id: id.into(),
-            role: "worker".into(),
+            label: "worker".into(),
             harness: "echo".into(),
             model: String::new(),
-            status: "idle".into(),
+            status: TopicStatus::Idle,
             parent_id: None,
             system_prompt: String::new(),
             work_dir: data_dir
@@ -212,12 +216,11 @@ async fn global_data_dir_scopes_agents_to_current_project() {
                 .join(id)
                 .to_string_lossy()
                 .to_string(),
-            comms: "mesh".into(),
+            comms: CommsMode::Mesh,
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
             worktree_branch: None,
             project_dir: Some(project_dir.to_string_lossy().to_string()),
-            run_id: None,
             user_launched: false,
         })
         .unwrap();
@@ -272,24 +275,24 @@ async fn global_data_dir_scopes_agents_to_current_project() {
 
 #[tokio::test]
 async fn echo_agent_processes_message() {
-    let (_dir, orch) = setup();
+    let (_dir, orch, _addr) = setup_http_server().await;
 
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("tester", "echo", "", None, "mesh")
+        .start_topic("tester", "echo", "", None, "mesh")
         .unwrap();
 
     orch.send_message("user", &agent.id, "hello world")
         .await
         .unwrap();
 
-    // Wait for the echo harness to process and emit output
-    let saw_output = tokio::time::timeout(Duration::from_secs(5), async {
+    // Wait for the echo harness to route its reply back to the sender.
+    let saw_reply = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentOutput { text, .. }) => {
-                    if text.contains("hello world") {
+                Ok(SwarmEvent::UserNotification { from, content }) => {
+                    if from == agent.id && content == "(echo) hello world" {
                         return true;
                     }
                 }
@@ -301,22 +304,22 @@ async fn echo_agent_processes_message() {
     .await;
 
     assert_eq!(
-        saw_output,
+        saw_reply,
         Ok(true),
-        "echo agent should process the message"
+        "echo agent should route the message back to the sender"
     );
 }
 
 #[tokio::test]
 async fn agent_status_transitions() {
-    let (_dir, orch) = setup();
+    let (_dir, orch, _addr) = setup_http_server().await;
 
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("worker", "echo", "", None, "mesh")
+        .start_topic("worker", "echo", "", None, "mesh")
         .unwrap();
-    assert_eq!(agent.status, "idle");
+    assert_eq!(agent.status, TopicStatus::Idle);
 
     orch.send_message("user", &agent.id, "do something")
         .await
@@ -329,10 +332,10 @@ async fn agent_status_transitions() {
         loop {
             match rx.recv().await {
                 Ok(SwarmEvent::AgentStatus { status, .. }) => {
-                    if status == "working" {
+                    if status == TopicStatus::Working {
                         saw_working = true;
                     }
-                    if status == "idle" && saw_working {
+                    if status == TopicStatus::Idle && saw_working {
                         saw_idle_after = true;
                         return;
                     }
@@ -356,7 +359,7 @@ async fn kill_agent() {
     let (_dir, orch) = setup();
 
     let agent = orch
-        .spawn_agent("doomed", "echo", "", None, "mesh")
+        .start_topic("doomed", "echo", "", None, "mesh")
         .unwrap();
     assert_eq!(orch.list_agents().unwrap().len(), 1);
 
@@ -367,7 +370,7 @@ async fn kill_agent() {
 
     // But still fetchable directly
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
-    assert_eq!(fetched.status, "done");
+    assert_eq!(fetched.status, TopicStatus::Paused);
     assert!(fetched.ended_at.is_some(), "kill should populate ended_at");
 }
 
@@ -375,9 +378,9 @@ async fn kill_agent() {
 async fn parent_only_comms_enforced() {
     let (_dir, orch) = setup();
 
-    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let parent = orch.start_topic("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
-        .spawn_agent("worker", "echo", "", Some(&parent.id), "parent-only")
+        .start_topic("worker", "echo", "", Some(&parent.id), "parent-only")
         .unwrap();
 
     // Parent can message child
@@ -386,7 +389,7 @@ async fn parent_only_comms_enforced() {
 
     // Create a sibling that tries to message the child
     let sibling = orch
-        .spawn_agent("sibling", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("sibling", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let result = orch.send_message(&sibling.id, &child.id, "hey").await;
     assert!(
@@ -411,7 +414,7 @@ async fn user_is_valid_message_target_for_direct_messages() {
     let (_dir, orch) = setup();
 
     let agent = orch
-        .spawn_agent("notifier", "echo", "", None, "mesh")
+        .start_topic("notifier", "echo", "", None, "mesh")
         .unwrap();
     assert!(orch.get_agent("user").unwrap().is_none());
 
@@ -487,16 +490,25 @@ async fn user_is_valid_message_target_for_direct_messages() {
     assert_eq!(payload["type"], "user_notification");
     assert_eq!(payload["from"], agent.id);
     assert_eq!(payload["content"], "user heads up");
+
+    let routed = agent_events
+        .iter()
+        .find(|event| event.event_type == "message_routed")
+        .expect("user-directed sends should also emit a routing event");
+    let payload: serde_json::Value = serde_json::from_str(&routed.payload).unwrap();
+    assert_eq!(payload["type"], "message_routed");
+    assert_eq!(payload["from"], agent.id);
+    assert_eq!(payload["to"], "user");
 }
 
 #[tokio::test]
 async fn multiple_messages_processed_in_order() {
-    let (_dir, orch) = setup();
+    let (_dir, orch, _addr) = setup_http_server().await;
 
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("orderer", "echo", "", None, "mesh")
+        .start_topic("orderer", "echo", "", None, "mesh")
         .unwrap();
 
     // Send 3 messages quickly
@@ -506,16 +518,16 @@ async fn multiple_messages_processed_in_order() {
             .unwrap();
     }
 
-    // Collect output (messages may be batched into fewer outputs)
-    let mut all_output = String::new();
+    // Collect routed replies (messages may be batched into fewer harness turns).
+    let mut all_replies = String::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentOutput { text, .. }) => {
-                    all_output.push_str(&text);
-                    if all_output.contains("msg-0")
-                        && all_output.contains("msg-1")
-                        && all_output.contains("msg-2")
+                Ok(SwarmEvent::UserNotification { from, content }) if from == agent.id => {
+                    all_replies.push_str(&content);
+                    if all_replies.contains("msg-0")
+                        && all_replies.contains("msg-1")
+                        && all_replies.contains("msg-2")
                     {
                         return;
                     }
@@ -527,33 +539,19 @@ async fn multiple_messages_processed_in_order() {
     })
     .await;
 
-    assert!(all_output.contains("msg-0"), "should contain msg-0");
-    assert!(all_output.contains("msg-1"), "should contain msg-1");
-    assert!(all_output.contains("msg-2"), "should contain msg-2");
+    assert!(all_replies.contains("msg-0"), "should contain msg-0");
+    assert!(all_replies.contains("msg-1"), "should contain msg-1");
+    assert!(all_replies.contains("msg-2"), "should contain msg-2");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_interrupts_running_agent() {
-    let (_dir, orch) = setup();
+    let (_dir, orch, _addr) = setup_http_server().await;
     let mut rx = orch.subscribe();
 
-    // Use a slow harness (claude with nonexistent binary) that takes time to fail
-    // Instead, use echo with a system prompt to get it working, then send interrupt
     let agent = orch
-        .spawn_agent("worker", "echo", "initial task", None, "mesh")
+        .start_topic("worker", "echo", "", None, "mesh")
         .unwrap();
-
-    // Wait for the first message to be processed
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
-                Err(_) => return,
-                _ => continue,
-            }
-        }
-    })
-    .await;
 
     // Now send a message, then quickly send another to interrupt
     orch.send_message("user", &agent.id, "first task")
@@ -567,14 +565,14 @@ async fn message_interrupts_running_agent() {
         .await
         .unwrap();
 
-    // Collect all output - both messages should eventually produce output
-    let mut all_output = String::new();
+    // Collect routed replies.
+    let mut all_replies = String::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentOutput { text, .. }) => {
-                    all_output.push_str(&text);
-                    if all_output.contains("interrupt!") {
+                Ok(SwarmEvent::UserNotification { from, content }) if from == agent.id => {
+                    all_replies.push_str(&content);
+                    if all_replies.contains("interrupt!") {
                         return;
                     }
                 }
@@ -586,13 +584,13 @@ async fn message_interrupts_running_agent() {
     .await;
 
     assert!(
-        all_output.contains("interrupt!"),
+        all_replies.contains("interrupt!"),
         "interrupt message should be processed"
     );
 }
 
 #[tokio::test]
-async fn http_api_spawn_and_list() {
+async fn http_api_start_topic_and_list() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("swarm.db");
     let agents_dir = dir.path().join("agents");
@@ -624,11 +622,11 @@ async fn http_api_spawn_and_list() {
 
     let client = reqwest::Client::new();
 
-    // Spawn via HTTP
+    // Start topic via HTTP
     let resp = client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "tester",
+            "label": "tester",
             "harness": "echo",
             "system_prompt": "test agent",
             "comms": "mesh"
@@ -640,6 +638,7 @@ async fn http_api_spawn_and_list() {
     let agent: serde_json::Value = resp.json().await.unwrap();
     let agent_id = agent["id"].as_str().unwrap().to_string();
     assert!(agent_id.starts_with("tester-"));
+    assert_eq!(agent["parent_id"].as_str(), Some("user"));
 
     // List via HTTP
     let resp = client
@@ -734,8 +733,8 @@ async fn http_api_stats_returns_counts() {
     ));
     let addr = start_http_server(orch.clone()).await;
 
-    let alive = orch.spawn_agent("alive", "echo", "", None, "mesh").unwrap();
-    let done = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    let alive = orch.start_topic("alive", "echo", "", None, "mesh").unwrap();
+    let done = orch.start_topic("done", "echo", "", None, "mesh").unwrap();
     orch.done_agent(&done.id, None).await.unwrap();
 
     db.enqueue_message(&MessageRow {
@@ -778,7 +777,7 @@ async fn http_api_agent_worktree_returns_git_details() {
     let addr = start_http_server(orch.clone()).await;
 
     let agent = orch
-        .spawn_agent_with_model("editor", "echo", None, "", None, "mesh", true)
+        .start_topic_with_model("editor", "echo", None, "", None, "mesh", true)
         .unwrap();
     let worktree = orch
         .worktree_dir(&agent.id)
@@ -812,32 +811,32 @@ async fn http_api_agent_worktree_returns_git_details() {
 }
 
 #[tokio::test]
-async fn agent_preamble_includes_reply_limits_and_retry_guidance() {
-    let (_dir, orch) = setup();
+async fn agent_preamble_is_concise_and_topic_focused() {
+    let mut registry = HarnessRegistry::new();
+    registry.register(ResumeProbeHarness);
+    let (_dir, orch) = setup_with_registry(registry);
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("probe", "echo", "inspect preamble", None, "mesh")
+        .start_topic("probe", "resume-probe", "inspect preamble", None, "mesh")
         .unwrap();
 
     let output = wait_for_agent_output(
         &mut rx,
         &agent.id,
-        "The `swarm` CLI is available in this shell",
+        "Use the `swarm` CLI for replies and coordination",
     )
     .await;
-    assert!(
-        output.contains("You are a swarm agent running inside a multi-agent coordination session")
-    );
-    assert!(output.contains("Runtime context:"));
-    assert!(
-        output.contains("Your agent ID, role, and project directory are shown below this preamble")
-    );
-    assert!(output.contains("SWARM_AGENT_ID, SWARM_SOCKET, and SWARM_PROJECT_DIR"));
-    assert!(output.contains("Always reply via `swarm send`"));
-    assert!(output.contains("Never reply to status broadcasts"));
-    assert!(output.contains("Keep swarm messages under 300 words"));
-    assert!(output.contains("All swarm commands are idempotent and safe to retry"));
+    assert!(output.contains(
+        "You are a durable swarm topic running inside an inter-harness coordination session"
+    ));
+    assert!(output.contains("Runtime:"));
+    assert!(output.contains("Your topic ID, label, parent, and project directory are shown below"));
+    assert!(output.contains("SWARM_AGENT_ID is your topic ID"));
+    assert!(output.contains("`swarm send parent"));
+    assert!(output.contains("swarm <command> --help"));
+    assert!(output.contains("Your parent: user"));
+    assert!(output.contains("Keep swarm messages concise"));
 }
 
 #[tokio::test]
@@ -877,7 +876,7 @@ async fn http_api_missing_agent_returns_json_error() {
 
     assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "agent not found: missing-agent");
+    assert_eq!(body["error"], "topic not found: missing-agent");
     assert!(body["hint"].as_str().unwrap().contains("swarm peers"));
 }
 
@@ -894,8 +893,8 @@ async fn http_api_agent_not_found_returns_json_error() {
 
     assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "agent not found: missing-agent");
-    assert_eq!(body["hint"], "run swarm peers to list agents");
+    assert_eq!(body["error"], "topic not found: missing-agent");
+    assert_eq!(body["hint"], "run swarm peers to list topics");
 }
 
 #[tokio::test]
@@ -903,7 +902,7 @@ async fn http_api_send_to_done_agent_reactivates_it() {
     let (_dir, orch, addr) = setup_http_server().await;
     let client = reqwest::Client::new();
 
-    let done_agent = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    let done_agent = orch.start_topic("done", "echo", "", None, "mesh").unwrap();
     orch.done_agent(&done_agent.id, None).await.unwrap();
 
     let resp = client
@@ -920,13 +919,13 @@ async fn http_api_send_to_done_agent_reactivates_it() {
     assert!(resp.status().is_success());
 
     let fetched = orch.get_agent(&done_agent.id).unwrap().unwrap();
-    assert_ne!(fetched.status, "done");
+    assert_ne!(fetched.status, TopicStatus::Paused);
 }
 
 #[tokio::test]
 async fn cli_send_to_done_agent_succeeds() {
     let (_dir, orch, addr) = setup_http_server().await;
-    let agent = orch.spawn_agent("done", "echo", "", None, "mesh").unwrap();
+    let agent = orch.start_topic("done", "echo", "", None, "mesh").unwrap();
     orch.done_agent(&agent.id, None).await.unwrap();
     let agent_id = agent.id.clone();
 
@@ -952,21 +951,21 @@ async fn cli_send_to_done_agent_succeeds() {
 #[tokio::test]
 async fn unknown_harness_rejected() {
     let (_dir, orch) = setup();
-    let result = orch.spawn_agent("test", "nonexistent-harness", "", None, "mesh");
+    let result = orch.start_topic("test", "nonexistent-harness", "", None, "mesh");
     assert!(result.is_err());
 }
 
 #[tokio::test]
-async fn spawn_rejects_unsafe_roles() {
+async fn start_topic_rejects_unsafe_labels() {
     let (dir, orch) = setup();
 
-    for role in ["../../../etc/passwd", "foo;rm -rf /", ""] {
+    for label in ["../../../etc/passwd", "foo;rm -rf /", ""] {
         let err = orch
-            .spawn_agent(role, "echo", "", None, "mesh")
-            .expect_err("unsafe role should be rejected");
+            .start_topic(label, "echo", "", None, "mesh")
+            .expect_err("unsafe label should be rejected");
         assert!(
-            err.to_string().contains("invalid input: role"),
-            "unexpected error for role {role:?}: {err}"
+            err.to_string().contains("invalid input: label"),
+            "unexpected error for label {label:?}: {err}"
         );
     }
 
@@ -975,18 +974,18 @@ async fn spawn_rejects_unsafe_roles() {
             .unwrap()
             .next()
             .is_none(),
-        "invalid roles should not create agent topic dirs"
+        "invalid labels should not create topic dirs"
     );
 }
 
 #[tokio::test]
-async fn echo_agent_log_captures_messages_and_output() {
-    let (_dir, orch) = setup();
+async fn echo_agent_log_captures_received_and_sent_messages() {
+    let (_dir, orch, _addr) = setup_http_server().await;
 
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("logger", "echo", "", None, "mesh")
+        .start_topic("logger", "echo", "", None, "mesh")
         .unwrap();
 
     orch.send_message("user", &agent.id, "test message")
@@ -997,7 +996,7 @@ async fn echo_agent_log_captures_messages_and_output() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -1009,7 +1008,7 @@ async fn echo_agent_log_captures_messages_and_output() {
     let all = orch.get_agent_log(&agent.id, 50, LogFilter::All).unwrap();
     assert!(
         all.len() >= 2,
-        "should have at least a recv message and output, got {}",
+        "should have at least a recv and sent message, got {}",
         all.len()
     );
 
@@ -1018,9 +1017,10 @@ async fn echo_agent_log_captures_messages_and_output() {
     assert_eq!(recv_entries[0].content, "test message");
     assert_eq!(recv_entries[0].peer, "user");
 
-    let output_entries: Vec<_> = all.iter().filter(|e| e.kind == "output").collect();
-    assert_eq!(output_entries.len(), 1);
-    assert!(output_entries[0].content.contains("test message"));
+    let sent_entries: Vec<_> = all.iter().filter(|e| e.kind == "sent").collect();
+    assert_eq!(sent_entries.len(), 1);
+    assert_eq!(sent_entries[0].content, "(echo) test message");
+    assert_eq!(sent_entries[0].peer, "user");
 
     // Check messages-only filter
     let msgs = orch
@@ -1032,9 +1032,7 @@ async fn echo_agent_log_captures_messages_and_output() {
     let outs = orch
         .get_agent_log(&agent.id, 50, LogFilter::Output)
         .unwrap();
-    assert!(outs
-        .iter()
-        .all(|e| e.kind == "output" || e.kind == "error" || e.kind == "timeout"));
+    assert!(outs.is_empty(), "echo should communicate via messages only");
 }
 
 #[tokio::test]
@@ -1068,11 +1066,11 @@ async fn http_api_agent_log() {
 
     let client = reqwest::Client::new();
 
-    // Spawn agent
+    // Start topic
     let resp = client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "logtest",
+            "label": "logtest",
             "harness": "echo",
             "system_prompt": "",
             "comms": "mesh"
@@ -1098,7 +1096,7 @@ async fn http_api_agent_log() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -1156,7 +1154,9 @@ async fn http_api_agent_log() {
     );
 
     let resp = client
-        .get(format!("{addr}/api/agents/user/inbox?from={agent_id}&n=5"))
+        .get(format!(
+            "{addr}/api/agents/user/inbox?from={agent_id}&n=5&q=http%20user%20reply"
+        ))
         .send()
         .await
         .unwrap();
@@ -1222,7 +1222,7 @@ async fn harness_error_surfaces_in_events_and_log() {
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent("failbot", "claude", "test", None, "mesh")
+        .start_topic("failbot", "claude", "test", None, "mesh")
         .unwrap();
 
     orch.send_message("user", &agent.id, "this will fail")
@@ -1237,12 +1237,12 @@ async fn harness_error_surfaces_in_events_and_log() {
             match rx.recv().await {
                 Ok(SwarmEvent::AgentError { error, .. }) => {
                     assert!(
-                        error.contains("harness failed") || error.contains("spawn"),
-                        "error should mention spawn failure, got: {error}"
+                        error.contains("harness failed") || error.contains("failed to start"),
+                        "error should mention topic start failure, got: {error}"
                     );
                     saw_error_event = true;
                 }
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "error" => {
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Error => {
                     saw_error_status = true;
                     if saw_error_event {
                         return;
@@ -1257,7 +1257,7 @@ async fn harness_error_surfaces_in_events_and_log() {
 
     assert!(
         saw_error_event,
-        "should emit AgentError event on spawn failure"
+        "should emit AgentError event on topic start failure"
     );
     assert!(
         saw_error_status,
@@ -1268,15 +1268,18 @@ async fn harness_error_surfaces_in_events_and_log() {
     let log = orch.get_agent_log(&agent.id, 50, LogFilter::All).unwrap();
     let errors: Vec<_> = log.iter().filter(|e| e.kind == "error").collect();
     assert!(!errors.is_empty(), "error should be recorded in agent log");
-    assert!(errors[0].content.contains("harness failed") || errors[0].content.contains("spawn"));
+    assert!(
+        errors[0].content.contains("harness failed")
+            || errors[0].content.contains("failed to start")
+    );
 }
 
 #[tokio::test]
-async fn spawn_with_model_override() {
+async fn start_topic_with_model_override() {
     let (_dir, orch) = setup();
 
     let agent = orch
-        .spawn_agent_with_model(
+        .start_topic_with_model(
             "modeler",
             "echo",
             Some("harness-supported-model"),
@@ -1292,7 +1295,7 @@ async fn spawn_with_model_override() {
     assert_eq!(fetched.model, "harness-supported-model");
 
     let default_agent = orch
-        .spawn_agent("defaulter", "echo", "no model", None, "mesh")
+        .start_topic("defaulter", "echo", "no model", None, "mesh")
         .unwrap();
     assert_eq!(default_agent.model, "");
 }
@@ -1302,22 +1305,22 @@ async fn perspective_shows_family_relations() {
     let (_dir, orch) = setup();
 
     let grandparent = orch
-        .spawn_agent("grandparent", "echo", "", None, "mesh")
+        .start_topic("grandparent", "echo", "", None, "mesh")
         .unwrap();
     let parent = orch
-        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .start_topic("parent", "echo", "", Some(&grandparent.id), "mesh")
         .unwrap();
     let child_a = orch
-        .spawn_agent("child-a", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child-a", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let child_b = orch
-        .spawn_agent("child-b", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child-b", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let grandchild = orch
-        .spawn_agent("grandchild", "echo", "", Some(&child_a.id), "mesh")
+        .start_topic("grandchild", "echo", "", Some(&child_a.id), "mesh")
         .unwrap();
     let unrelated = orch
-        .spawn_agent("unrelated", "echo", "", None, "mesh")
+        .start_topic("unrelated", "echo", "", None, "mesh")
         .unwrap();
 
     let views = orch.list_agents_with_perspective(&child_a.id).unwrap();
@@ -1342,15 +1345,15 @@ async fn perspective_shows_family_relations() {
 async fn perspective_hides_done_agents() {
     let (_dir, orch) = setup();
 
-    let alive = orch.spawn_agent("alive", "echo", "", None, "mesh").unwrap();
+    let alive = orch.start_topic("alive", "echo", "", None, "mesh").unwrap();
     let doomed = orch
-        .spawn_agent("doomed", "echo", "", None, "mesh")
+        .start_topic("doomed", "echo", "", None, "mesh")
         .unwrap();
     orch.kill_agent(&doomed.id).await.unwrap();
 
     let views = orch.list_agents_with_perspective(&alive.id).unwrap();
     assert!(
-        views.iter().all(|v| v.agent.status != "done"),
+        views.iter().all(|v| v.agent.status != TopicStatus::Paused),
         "perspective should not include done agents"
     );
     assert_eq!(views.len(), 1);
@@ -1361,7 +1364,7 @@ async fn events_are_persisted_and_queryable() {
     let (_dir, orch) = setup();
 
     let agent = orch
-        .spawn_agent("eventer", "echo", "", None, "mesh")
+        .start_topic("eventer", "echo", "", None, "mesh")
         .unwrap();
 
     orch.send_message("user", &agent.id, "event test")
@@ -1373,7 +1376,7 @@ async fn events_are_persisted_and_queryable() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == "idle" => return,
+                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -1384,15 +1387,15 @@ async fn events_are_persisted_and_queryable() {
     let all_events = orch.list_events(None, None, 1000).unwrap();
     assert!(
         all_events.len() >= 2,
-        "should have at least spawn + status events, got {}",
+        "should have at least topic start + status events, got {}",
         all_events.len()
     );
 
-    let spawn_events: Vec<_> = all_events
+    let topic_started_events: Vec<_> = all_events
         .iter()
-        .filter(|e| e.event_type == "agent_spawned")
+        .filter(|e| e.event_type == "topic_started")
         .collect();
-    assert_eq!(spawn_events.len(), 1);
+    assert_eq!(topic_started_events.len(), 1);
 
     let agent_events = orch.list_events(None, Some(&agent.id), 1000).unwrap();
     assert!(
@@ -1482,11 +1485,11 @@ async fn http_api_events_endpoint() {
 
     let client = reqwest::Client::new();
 
-    // Spawn an agent to generate events
+    // Start a topic to generate events
     client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "evt-test",
+            "label": "evt-test",
             "harness": "echo",
             "system_prompt": "",
             "comms": "mesh"
@@ -1516,7 +1519,7 @@ async fn http_api_events_endpoint() {
 }
 
 #[tokio::test]
-async fn http_api_spawn_with_model() {
+async fn http_api_start_topic_with_model() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("swarm.db");
     std::fs::create_dir_all(dir.path().join("agents")).unwrap();
@@ -1547,7 +1550,7 @@ async fn http_api_spawn_with_model() {
     let resp = client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "model-test",
+            "label": "model-test",
             "harness": "echo",
             "system_prompt": "",
             "comms": "mesh",
@@ -1590,11 +1593,11 @@ async fn http_api_perspective_query() {
 
     let client = reqwest::Client::new();
 
-    // Spawn parent and child
+    // Start parent and child topics
     let resp = client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "parent",
+            "label": "parent",
             "harness": "echo",
             "system_prompt": "",
             "comms": "mesh"
@@ -1608,7 +1611,7 @@ async fn http_api_perspective_query() {
     let resp = client
         .post(format!("{addr}/api/agents"))
         .json(&serde_json::json!({
-            "role": "child",
+            "label": "child",
             "harness": "echo",
             "system_prompt": "",
             "parent_id": parent_id,
@@ -1650,9 +1653,9 @@ async fn http_api_perspective_query() {
 async fn done_agent_sends_message_to_parent() {
     let (_dir, orch) = setup();
 
-    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let parent = orch.start_topic("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
-        .spawn_agent("worker", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("worker", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
     orch.done_agent(&child.id, Some("task complete"))
@@ -1660,7 +1663,7 @@ async fn done_agent_sends_message_to_parent() {
         .unwrap();
 
     let fetched = orch.get_agent(&child.id).unwrap().unwrap();
-    assert_eq!(fetched.status, "done");
+    assert_eq!(fetched.status, TopicStatus::Paused);
 
     let log = orch.get_agent_log(&parent.id, 50, LogFilter::All).unwrap();
     let recv: Vec<_> = log
@@ -1674,9 +1677,9 @@ async fn done_agent_sends_message_to_parent() {
 async fn done_agent_structured_report_is_available_in_brief() {
     let (_dir, orch) = setup();
 
-    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let parent = orch.start_topic("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
-        .spawn_agent(
+        .start_topic(
             "worker",
             "echo",
             "large prompt body",
@@ -1715,9 +1718,9 @@ async fn done_agent_structured_report_is_available_in_brief() {
 async fn done_agent_is_idempotent() {
     let (_dir, orch) = setup();
 
-    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let parent = orch.start_topic("boss", "echo", "", None, "mesh").unwrap();
     let child = orch
-        .spawn_agent("worker", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("worker", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
     orch.done_agent(&child.id, Some("first done"))
@@ -1728,7 +1731,7 @@ async fn done_agent_is_idempotent() {
         .unwrap();
 
     let fetched = orch.get_agent(&child.id).unwrap().unwrap();
-    assert_eq!(fetched.status, "done");
+    assert_eq!(fetched.status, TopicStatus::Paused);
 
     let log = orch.get_agent_log(&parent.id, 50, LogFilter::All).unwrap();
     let first_messages = log
@@ -1759,40 +1762,14 @@ async fn done_agent_without_parent_still_works() {
     let (_dir, orch) = setup();
 
     let agent = orch
-        .spawn_agent("orphan", "echo", "", None, "mesh")
+        .start_topic("orphan", "echo", "", None, "mesh")
         .unwrap();
 
     orch.done_agent(&agent.id, Some("finished")).await.unwrap();
 
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
-    assert_eq!(fetched.status, "done");
+    assert_eq!(fetched.status, TopicStatus::Paused);
     assert!(fetched.ended_at.is_some(), "done should populate ended_at");
-}
-
-#[tokio::test]
-async fn done_root_agent_marks_run_done() {
-    let (_dir, orch) = setup();
-    let run = orch.create_run("tracked task").unwrap();
-    let root = orch
-        .spawn_agent_with_options(
-            "root",
-            "echo",
-            "",
-            SpawnOptions {
-                model: None,
-                parent_id: None,
-                comms: "mesh",
-                use_worktree: false,
-                run_id: Some(&run.id),
-                user_launched: true,
-            },
-        )
-        .unwrap();
-    orch.update_run_root_agent(&run.id, &root.id).unwrap();
-
-    orch.done_agent(&root.id, Some("done")).await.unwrap();
-
-    assert_eq!(orch.current_run().unwrap().unwrap().status.as_str(), "done");
 }
 
 #[tokio::test]
@@ -1802,12 +1779,12 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
     let (_dir, orch) = setup_with_registry(registry);
     let mut rx = orch.subscribe();
 
-    let parent = orch.spawn_agent("boss", "echo", "", None, "mesh").unwrap();
+    let parent = orch.start_topic("boss", "echo", "", None, "mesh").unwrap();
     let agent = orch
-        .spawn_agent("worker", "resume-probe", "", Some(&parent.id), "mesh")
+        .start_topic("worker", "resume-probe", "", Some(&parent.id), "mesh")
         .unwrap();
     let child = orch
-        .spawn_agent("child", "echo", "", Some(&agent.id), "mesh")
+        .start_topic("child", "echo", "", Some(&agent.id), "mesh")
         .unwrap();
 
     orch.send_message("user", &agent.id, "first task")
@@ -1820,7 +1797,7 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
         .await
         .unwrap();
     let done_agent = orch.get_agent(&agent.id).unwrap().unwrap();
-    assert_eq!(done_agent.status, "done");
+    assert_eq!(done_agent.status, TopicStatus::Paused);
     assert!(
         done_agent.ended_at.is_some(),
         "done should populate ended_at"
@@ -1842,7 +1819,7 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
     assert!(resumed.contains("resume=true"), "{resumed}");
 
     let fetched = orch.get_agent(&agent.id).unwrap().unwrap();
-    assert_ne!(fetched.status, "done");
+    assert_ne!(fetched.status, TopicStatus::Paused);
     assert_eq!(
         fetched.ended_at.as_deref(),
         None,
@@ -1866,7 +1843,10 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
     orch.done_agent(&agent.id, Some("second done"))
         .await
         .unwrap();
-    assert_eq!(orch.get_agent(&agent.id).unwrap().unwrap().status, "done");
+    assert_eq!(
+        orch.get_agent(&agent.id).unwrap().unwrap().status,
+        TopicStatus::Paused
+    );
 
     let done_events = orch
         .list_events(None, Some(&agent.id), 1000)
@@ -1884,15 +1864,15 @@ async fn send_to_done_agent_resumes_conversation_and_can_done_again() {
 async fn kill_preserves_child_parent_links() {
     let (_dir, orch) = setup();
 
-    let grandparent = orch.spawn_agent("gp", "echo", "", None, "mesh").unwrap();
+    let grandparent = orch.start_topic("gp", "echo", "", None, "mesh").unwrap();
     let parent = orch
-        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .start_topic("parent", "echo", "", Some(&grandparent.id), "mesh")
         .unwrap();
     let child_a = orch
-        .spawn_agent("child-a", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child-a", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let child_b = orch
-        .spawn_agent("child-b", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child-b", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
     orch.kill_agent(&parent.id).await.unwrap();
@@ -1913,19 +1893,19 @@ async fn kill_preserves_child_parent_links() {
 
     let p = orch.get_agent(&parent.id).unwrap().unwrap();
     assert_eq!(p.parent_id.as_deref(), Some(grandparent.id.as_str()));
-    assert_eq!(p.status, "done");
+    assert_eq!(p.status, TopicStatus::Paused);
 }
 
 #[tokio::test]
 async fn done_preserves_child_parent_links() {
     let (_dir, orch) = setup();
 
-    let grandparent = orch.spawn_agent("gp", "echo", "", None, "mesh").unwrap();
+    let grandparent = orch.start_topic("gp", "echo", "", None, "mesh").unwrap();
     let parent = orch
-        .spawn_agent("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .start_topic("parent", "echo", "", Some(&grandparent.id), "mesh")
         .unwrap();
     let child = orch
-        .spawn_agent("child", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
     orch.done_agent(&parent.id, None).await.unwrap();
@@ -1939,16 +1919,16 @@ async fn done_preserves_child_parent_links() {
 
     let p = orch.get_agent(&parent.id).unwrap().unwrap();
     assert_eq!(p.parent_id.as_deref(), Some(grandparent.id.as_str()));
-    assert_eq!(p.status, "done");
+    assert_eq!(p.status, TopicStatus::Paused);
 }
 
 #[tokio::test]
 async fn kill_root_agent_preserves_child_parent_link() {
     let (_dir, orch) = setup();
 
-    let root = orch.spawn_agent("root", "echo", "", None, "mesh").unwrap();
+    let root = orch.start_topic("root", "echo", "", None, "mesh").unwrap();
     let child = orch
-        .spawn_agent("child", "echo", "", Some(&root.id), "mesh")
+        .start_topic("child", "echo", "", Some(&root.id), "mesh")
         .unwrap();
 
     orch.kill_agent(&root.id).await.unwrap();
@@ -1966,10 +1946,10 @@ async fn done_agent_hidden_from_active_views_until_message_reactivates() {
     let (_dir, orch) = setup();
 
     let parent = orch
-        .spawn_agent("parent", "echo", "", None, "mesh")
+        .start_topic("parent", "echo", "", None, "mesh")
         .unwrap();
     let child = orch
-        .spawn_agent("child", "echo", "", Some(&parent.id), "mesh")
+        .start_topic("child", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
 
     orch.done_agent(&child.id, None).await.unwrap();
@@ -1992,7 +1972,7 @@ async fn done_agent_hidden_from_active_views_until_message_reactivates() {
         .unwrap();
 
     let fetched = orch.get_agent(&child.id).unwrap().unwrap();
-    assert_ne!(fetched.status, "done");
+    assert_ne!(fetched.status, TopicStatus::Paused);
 }
 
 #[tokio::test]
@@ -2000,7 +1980,7 @@ async fn worktree_creates_isolated_branch() {
     let (_dir, orch) = setup_with_git();
 
     let agent = orch
-        .spawn_agent_with_model("editor", "echo", None, "edit files", None, "mesh", true)
+        .start_topic_with_model("editor", "echo", None, "edit files", None, "mesh", true)
         .unwrap();
     let branch_name = format!("swarm/{}", agent.id);
     assert_eq!(agent.worktree_branch.as_deref(), Some(branch_name.as_str()));
@@ -2014,7 +1994,10 @@ async fn worktree_creates_isolated_branch() {
     );
 
     let worktree = orch.worktree_dir(&agent.id).unwrap();
-    assert!(worktree.is_some(), "worktree dir should exist after spawn");
+    assert!(
+        worktree.is_some(),
+        "worktree dir should exist after topic start"
+    );
     let wt = worktree.unwrap();
     assert!(
         wt.join("README.md").exists(),
@@ -2037,11 +2020,13 @@ async fn worktree_creates_isolated_branch() {
 
 #[tokio::test]
 async fn resumed_agent_keeps_worktree_branch() {
-    let (_dir, orch) = setup_with_git();
+    let mut registry = HarnessRegistry::new();
+    registry.register(ResumeProbeHarness);
+    let (_dir, orch) = setup_with_git_registry(registry);
     let mut rx = orch.subscribe();
 
     let agent = orch
-        .spawn_agent_with_model("editor", "echo", None, "", None, "mesh", true)
+        .start_topic_with_model("editor", "resume-probe", None, "", None, "mesh", true)
         .unwrap();
 
     let worktree = orch
@@ -2076,14 +2061,14 @@ async fn no_worktree_by_default() {
     let (_dir, orch) = setup_with_git();
 
     let agent = orch
-        .spawn_agent("reviewer", "echo", "review code", None, "mesh")
+        .start_topic("reviewer", "echo", "review code", None, "mesh")
         .unwrap();
     assert_eq!(agent.worktree_branch, None);
 
     let worktree = orch.worktree_dir(&agent.id).unwrap();
     assert!(
         worktree.is_none(),
-        "no worktree should exist for default spawn"
+        "no worktree should exist for default topic start"
     );
 }
 
@@ -2092,7 +2077,7 @@ async fn cleanup_removes_worktree() {
     let (_dir, orch) = setup_with_git();
 
     let agent = orch
-        .spawn_agent_with_model("cleaner", "echo", None, "edit", None, "mesh", true)
+        .start_topic_with_model("cleaner", "echo", None, "edit", None, "mesh", true)
         .unwrap();
 
     assert!(orch.worktree_dir(&agent.id).unwrap().is_some());
@@ -2132,7 +2117,7 @@ async fn cleanup_with_branch_delete() {
     let (_dir, orch) = setup_with_git();
 
     let agent = orch
-        .spawn_agent_with_model("brancher", "echo", None, "edit", None, "mesh", true)
+        .start_topic_with_model("brancher", "echo", None, "edit", None, "mesh", true)
         .unwrap();
 
     let branch_name = format!("swarm/{}", agent.id);
@@ -2156,7 +2141,7 @@ async fn cleanup_with_branch_delete() {
 async fn cleanup_noop_without_worktree() {
     let (_dir, orch) = setup();
 
-    let agent = orch.spawn_agent("plain", "echo", "", None, "mesh").unwrap();
+    let agent = orch.start_topic("plain", "echo", "", None, "mesh").unwrap();
 
     // Should not error even though there's no worktree
     orch.cleanup_agent(&agent.id, false).unwrap();

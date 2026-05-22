@@ -1,26 +1,51 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use swarm::config::SwarmConfig;
 use swarm::db::Db;
+use swarm::guidance::{HELP_DISCOVERY_HINT, PARENT_REPLY_HINT};
 use swarm::harness::{CliKind, HarnessRegistry};
 use swarm::orchestrator::{Orchestrator, SwarmEvent};
+use swarm::types::{SWARM_PROTOCOL_VERSION, USER_TOPIC_ID};
 
 const CLI_ENTRY_SEPARATOR: &str = "------------";
 
 #[derive(Parser)]
 #[command(
     name = "swarm",
-    about = "Multi-agent CLI orchestrator",
-    long_about = "Multi-agent CLI orchestrator that coordinates Claude, Codex, Gemini, and Grok CLIs.\n\n\
-        Direct responses:\n  \
-        swarm inbox <agent-id>          Read messages sent to the user/calling agent from one agent\n  \
-        swarm inbox --all               Read all recent messages sent to the user/calling agent\n  \
-        swarm log user --messages       Inspect the broader user message log\n\n\
+    about = "Coordinate durable LLM topic streams across harness CLIs",
+    long_about = "Swarm coordinates durable topic streams backed by Claude, Codex, Gemini, Grok, or echo workers.\n\
+        A topic stream has an ID, label, parent, mailbox, status, log, and optional child topics.\n\n\
+        Mental model:\n  \
+        - `swarm run \"task\"` starts one topic, sends the task as its first direct message, then watches direct replies by default.\n  \
+        - Outside swarm, a new topic's parent is `user`; inside swarm, its parent is the current topic.\n  \
+        - Topics reply with `swarm send parent \"message\"`; harness stdout is process output, not the message path.\n  \
+        - Pressing Ctrl-C in the default `run` watcher stops only your local watch; the topic and daemon keep running.\n  \
+        - Topics can be paused with `swarm done` and resumed by sending them another message.\n\n\
+        Common LLM loop:\n  \
+        1. `swarm run --label worker --harness codex \"task\"`\n  \
+        2. Keep the default `run` watch open, or use `--detach` and later `swarm watch --all`\n  \
+        3. `swarm brief` before opening full logs\n  \
+        4. `swarm log <topic-id> --messages` when exact message history is needed\n\n\
+        Useful commands:\n  \
+        swarm run \"task\"              Start a topic in this context\n  \
+        swarm send parent \"message\"   Reply to whoever started this topic\n  \
+        swarm inbox --all             Read direct messages sent to you/current topic\n  \
+        swarm watch --all             Stream new direct messages without changing global read state\n  \
+        swarm peers --all             List visible topics, including paused/done topics\n  \
+        swarm brief [topic-id]        Read compact project/topic status\n  \
+        swarm log <topic-id>          Read historical topic activity\n  \
+        swarm done \"summary\"          Pause current topic and optionally report completion\n\n\
+        Use `swarm serve` only when you want the daemon/API without starting a topic.\n\n\
         Environment variables:\n  \
+        SWARM_SOCKET      Daemon HTTP URL, default http://127.0.0.1:9800\n  \
+        SWARM_AGENT_ID    Current topic ID, set inside harness processes\n  \
+        SWARM_PROJECT_DIR Project root, set inside harness processes\n  \
         SWARM_CLAUDE_BIN  Override the claude binary path\n  \
         SWARM_CODEX_BIN   Override the codex binary path\n  \
         SWARM_GEMINI_BIN  Override the gemini binary path\n  \
@@ -33,27 +58,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the orchestrator and parent agent
+    /// Start a topic in the current context
+    #[command(
+        about = "Start a topic in the current context",
+        long_about = "Start one durable topic and send TASK as its first direct message.\n\n\
+            What happens:\n  \
+            - Starts the background daemon if needed.\n  \
+            - Creates one topic with an ID like <label>-<short-id>.\n  \
+            - Sets parent=user outside swarm, or parent=current topic inside swarm.\n  \
+            - Sends TASK plus any --prompt text to the topic.\n  \
+            - Prints topic ID, parent ID, and dashboard URL.\n  \
+            - By default, stays in watch mode and prints direct replies from the new topic to its parent.\n\n\
+            Default watch mode:\n  \
+            - `swarm run \"task\"` does not return after creating the topic; it keeps polling for direct replies.\n  \
+            - Press Ctrl-C to stop only the local watcher. The topic and daemon keep running.\n  \
+            - Use --detach to return immediately. Later monitor with `swarm watch --to <parent> <topic-id>`, `swarm inbox`, `swarm brief`, or `swarm log`.\n\n\
+            Key options and accepted values:\n  \
+            --label <LABEL>       Human-readable prefix for the topic ID. Default: coordinator.\n  \
+            --harness <HARNESS>   One of: claude, codex, gemini, grok, echo. Default: config default_harness, else echo.\n  \
+            --model <MODEL>       Free-form model string passed through to harnesses that support model selection.\n  \
+            --comms <MODE>        One of: mesh, parent-only. Default: config default_comms, else mesh.\n  \
+            --worktree            Give the topic an isolated git worktree and branch.\n  \
+            --detach              Return after creating the topic; use watch/inbox/brief/log later.\n  \
+            --prompt <TEXT>       Extra task text appended after positional TASK, or used as TASK if no positional TASK is given.\n  \
+            --project-dir <PATH>  Project root for daemon and topic work. Default: current directory.\n  \
+            --data-dir <PATH>     SQLite/log/worktree storage. Default: platform data directory.\n  \
+            --port <PORT>         Daemon port. Default: config port, else 9800.\n\n\
+            Examples:\n  \
+            swarm run \"say hi\"\n  \
+            swarm run --label reviewer --harness codex \"Review the current branch\"\n  \
+            swarm run --label editor --harness claude --worktree \"Implement the parser cleanup\"\n  \
+            swarm run --detach --label monitor \"Watch for messages and summarize blockers\""
+    )]
     Run {
-        /// Project directory (agents work here)
+        /// Project directory where topics work
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
 
-        /// Server port
+        /// Daemon port. Default comes from config, else 9800.
         #[arg(long)]
         port: Option<u16>,
 
-        /// Harness for the parent agent (claude, gemini, codex, grok, echo)
-        #[arg(long)]
+        /// Harness for the topic worker
+        #[arg(long, value_parser = ["claude", "gemini", "codex", "grok", "echo"])]
         harness: Option<String>,
 
-        /// Initial prompt for the parent agent
+        /// Extra task text appended to TASK; if TASK is omitted, this is the task
         #[arg(long, default_value = "")]
         prompt: String,
 
-        /// Role name for the parent agent
+        /// Readable label for the topic
         #[arg(long, default_value = "coordinator")]
-        role: String,
+        label: String,
 
         /// Skip automatic .gitignore update
         #[arg(long)]
@@ -67,26 +123,46 @@ enum Commands {
         #[arg(long)]
         dashboard: Option<PathBuf>,
 
-        /// Teammate harnesses to spawn for a task run, comma-separated or repeated
-        #[arg(long, visible_alias = "teammates", value_delimiter = ',')]
-        team: Vec<String>,
+        /// Communication mode
+        #[arg(long, value_parser = ["mesh", "parent-only"])]
+        comms: Option<String>,
 
-        /// Start the run and return immediately instead of watching direct responses
+        /// Free-form model override passed to the selected harness CLI
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Give the topic its own git worktree (isolated branch)
+        #[arg(long)]
+        worktree: bool,
+
+        /// Return immediately instead of staying in default watch mode
         #[arg(long)]
         detach: bool,
 
-        /// Task to run. When provided, swarm uses a tracked run and auto-starts the daemon if needed.
+        /// Task to run. Uses parent=user outside swarm, or parent=current topic inside swarm.
         #[arg(value_name = "TASK", trailing_var_arg = true)]
         task: Vec<String>,
     },
 
-    /// Start only the swarm daemon/API server
+    /// Start only the background daemon/API server
+    #[command(
+        about = "Start only the background daemon/API server",
+        long_about = "Start the daemon, HTTP API, dashboard, and worker resume loop without creating a topic.\n\n\
+            Use this when you want the UI/API available before starting topics, or when another process will call the API directly.\n\n\
+            Most users and LLM callers should prefer `swarm run \"task\"`, because it starts the daemon automatically when needed.\n\n\
+            Options:\n  \
+            --project-dir <PATH>  Project root served by this daemon. Default: current directory.\n  \
+            --port <PORT>         Daemon port. Default: config port, else 9800.\n  \
+            --data-dir <PATH>     SQLite/log/worktree storage. Default: platform data directory.\n  \
+            --dashboard <PATH>    Override dashboard dist directory for development.\n  \
+            --no-gitignore        Do not add .swarm/ to the project .gitignore."
+    )]
     Serve {
-        /// Project directory (agents work here)
+        /// Project directory served by this daemon
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
 
-        /// Server port
+        /// Daemon port. Default comes from config, else 9800.
         #[arg(long)]
         port: Option<u16>,
 
@@ -103,40 +179,85 @@ enum Commands {
         dashboard: Option<PathBuf>,
     },
 
-    /// List all agents in the swarm
+    /// List topic streams
+    #[command(
+        about = "List topic streams",
+        long_about = "List topics visible from the current context.\n\n\
+            Outside swarm, this lists project topics. Inside a topic, it lists the visible family tree: parent, siblings, and children. By default paused/done topics are hidden.\n\n\
+            Options:\n  \
+            --all   Include paused/done topics.\n  \
+            --json  Emit machine-readable JSON. Commands also emit JSON automatically when stdout is piped.\n\n\
+            Examples:\n  \
+            swarm peers\n  \
+            swarm peers --all\n  \
+            swarm peers --all --json"
+    )]
     Peers {
-        /// Include done agents
+        /// Include paused/done topics
         #[arg(long)]
         all: bool,
 
-        /// Show a specific run id, or "current" (default)
-        #[arg(long, default_value = "current")]
-        run: String,
-
-        /// Include agents from every run in this project
-        #[arg(long, conflicts_with = "run")]
-        all_runs: bool,
-
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
     },
 
-    /// Send a direct message to an agent or user
+    /// Send a direct message to a topic, parent, or user
+    #[command(
+        about = "Send a direct message to a topic, parent, or user",
+        long_about = "Send one direct message through the swarm mailbox.\n\n\
+            Sender behavior:\n  \
+            - Outside swarm, the sender is `user`.\n  \
+            - Inside a topic, the sender is SWARM_AGENT_ID.\n\n\
+            Targets:\n  \
+            <topic-id>  Send to a specific topic.\n  \
+            parent      Inside a topic, resolves to whoever started the current topic.\n  \
+            user        Send to the root user mailbox.\n\n\
+            This command only confirms that the message was queued. Use `watch`, `inbox`, `brief`, or `log` to observe replies.\n\n\
+            Examples:\n  \
+            swarm send parent \"I found the issue\"\n  \
+            swarm send reviewer-1234abcd \"Please review this branch\"\n  \
+            swarm send user \"Blocked: missing credentials\""
+    )]
     Send {
-        /// Target agent ID, or "user" to notify the user
+        /// Target topic ID, "parent" for the current topic's parent, or "user"
         target: String,
         /// Message content
         message: String,
     },
 
-    /// Read direct messages sent to the user/calling agent from one agent
+    /// Read direct messages sent to the user/current topic
+    #[command(
+        about = "Read direct messages sent to the user/current topic",
+        long_about = "Read a snapshot of mailbox messages for a recipient.\n\n\
+            Default recipient:\n  \
+            - Outside swarm: user.\n  \
+            - Inside a topic: current topic (SWARM_AGENT_ID).\n\n\
+            Source selection:\n  \
+            - Pass a FROM topic ID to read messages from one source.\n  \
+            - Use --all to read messages from any source.\n\n\
+            Cursor behavior:\n  \
+            --new reads only messages newer than the saved cursor and then advances that cursor for the recipient.\n  \
+            --since reads messages after a timestamp without using the saved cursor.\n\n\
+            Output behavior:\n  \
+            Text output shows full message bodies by default. Use --truncate <N> for shorter text. Use --json for tools. JSON is also automatic when stdout is piped.\n\n\
+            Accepted values:\n  \
+            --to <TO>       `user`, `me` inside a topic, or a topic ID.\n  \
+            --last <N>      Positive integer count. Default: 20. Alias: --tail.\n  \
+            --truncate <N>  Character count. 0 disables truncation.\n\n\
+            Examples:\n  \
+            swarm inbox --all\n  \
+            swarm inbox reviewer-1234abcd\n  \
+            swarm inbox --new --all\n  \
+            swarm inbox --all --to user\n  \
+            swarm inbox --all --search blocker --json"
+    )]
     Inbox {
-        /// Source agent ID to read messages from; omit only with --all
+        /// Source topic ID to read messages from; omit only with --all
         #[arg(conflicts_with = "all")]
         from: Option<String>,
 
-        /// Recipient to inspect (default: current agent when SWARM_AGENT_ID is set, otherwise "user"; use "me" for the current agent)
+        /// Recipient: user, me, or topic ID. Default: current topic inside swarm, else user.
         #[arg(long)]
         to: Option<String>,
 
@@ -144,21 +265,13 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Show only messages newer than the saved inbox cursor for this recipient/run
+        /// Show only messages newer than the saved inbox cursor for this recipient
         #[arg(long)]
         new: bool,
 
         /// Show messages after an RFC3339 timestamp instead of using the saved cursor
         #[arg(long, conflicts_with = "new")]
         since: Option<String>,
-
-        /// Scope user inbox reads to a run id, or "current" (default)
-        #[arg(long, default_value = "current")]
-        run: String,
-
-        /// Include messages from every run
-        #[arg(long, conflicts_with = "run")]
-        all_runs: bool,
 
         /// Number of recent messages to show
         #[arg(
@@ -169,7 +282,7 @@ enum Commands {
         )]
         last: usize,
 
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
 
@@ -186,58 +299,40 @@ enum Commands {
         truncate: Option<usize>,
     },
 
-    /// Spawn a new child agent
-    Spawn {
-        /// Agent role name
-        #[arg(long)]
-        role: String,
-
-        /// Harness to use (claude, gemini, codex, grok, echo)
-        #[arg(long)]
-        harness: Option<String>,
-
-        /// Task prompt for the agent; include how it should report back, e.g. `swarm send <your-id> "..."`
-        #[arg(long, default_value = "")]
-        prompt: String,
-
-        /// Communication mode: mesh or parent-only
-        #[arg(long)]
-        comms: Option<String>,
-
-        /// Model override supported by the selected harness CLI
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Give the agent its own git worktree (isolated branch)
-        #[arg(long)]
-        worktree: bool,
-
-        /// Attach the agent to a run id; defaults to SWARM_RUN_ID when present
-        #[arg(long)]
-        run: Option<String>,
-    },
-
-    /// Watch new direct responses sent to the user/current agent
+    /// Watch new direct messages sent to the user/current topic without marking them read globally
+    #[command(
+        about = "Watch new direct messages sent to the user/current topic",
+        long_about = "Poll for new mailbox messages and print them as they arrive.\n\n\
+            `watch` is session-local: it remembers what this invocation has already printed, but it does not advance the saved inbox cursor used by `inbox --new`.\n\n\
+            Default recipient:\n  \
+            - Outside swarm: user.\n  \
+            - Inside a topic: current topic (SWARM_AGENT_ID).\n\n\
+            Source selection:\n  \
+            - Pass a FROM topic ID to watch one source.\n  \
+            - Use --all to watch messages from any source.\n\n\
+            Stop with Ctrl-C.\n\n\
+            Accepted values:\n  \
+            --to <TO>           `user`, `me` inside a topic, or a topic ID.\n  \
+            --last <N>          Positive integer count fetched per poll. Default: 20. Alias: --tail.\n  \
+            --interval-ms <MS>  Poll interval in milliseconds. Default: 2000. Minimum effective value: 250.\n\n\
+            Examples:\n  \
+            swarm watch --all\n  \
+            swarm watch reviewer-1234abcd --to user\n  \
+            swarm watch --all --interval-ms 500\n  \
+            swarm watch --all --json"
+    )]
     Watch {
-        /// Recipient to inspect (default: current agent when SWARM_AGENT_ID is set, otherwise "user")
+        /// Recipient: user, me, or topic ID. Default: current topic inside swarm, else user.
         #[arg(long)]
         to: Option<String>,
 
-        /// Source agent ID to watch; omit with --all
+        /// Source topic ID to watch; omit with --all
         #[arg(conflicts_with = "all")]
         from: Option<String>,
 
-        /// Watch all source agents
+        /// Watch all source topics
         #[arg(long)]
         all: bool,
-
-        /// Scope user inbox reads to a run id, or "current" (default)
-        #[arg(long, default_value = "current")]
-        run: String,
-
-        /// Include messages from every run
-        #[arg(long, conflicts_with = "run")]
-        all_runs: bool,
 
         /// Number of messages to fetch per poll
         #[arg(
@@ -252,28 +347,65 @@ enum Commands {
         #[arg(long, default_value = "2000")]
         interval_ms: u64,
 
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
     },
 
     /// Show harness model behavior (harness CLIs choose their own defaults)
+    #[command(
+        about = "Show harness model behavior",
+        long_about = "List available harness kinds and their default model behavior.\n\n\
+            Swarm usually lets each harness CLI choose its own default model. Use `swarm run --model <MODEL>` when you need an explicit model and the selected harness supports it.\n\n\
+            Accepted values:\n  \
+            --model values are not listed by swarm; each harness CLI owns its supported model names.\n\n\
+            Examples:\n  \
+            swarm models\n  \
+            swarm models --json"
+    )]
     Models {
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
     },
 
-    /// Show own agent status
+    /// Show current topic status
+    #[command(
+        about = "Show current topic status",
+        long_about = "Show identity and runtime state for the current topic.\n\n\
+            This command requires SWARM_AGENT_ID, so it is mainly useful inside a running harness/topic process. It does not show children; use `swarm peers` for visible parent, sibling, and child topics.\n\n\
+            Output includes topic ID, label, harness, model, status, parent, and comms mode.\n\n\
+            Examples:\n  \
+            swarm status\n  \
+            swarm status --json"
+    )]
     Status {
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
     },
 
-    /// View recent activity for an agent, or the broader message log for "user"
+    /// View recent topic activity, or the broader user message log
+    #[command(
+        about = "View recent topic activity, or the broader user message log",
+        long_about = "Read historical activity for one topic, or the broader user message log with `swarm log user`.\n\n\
+            Use `brief` first for compact context. Use `log` when you need recent transcript details.\n\n\
+            Filters and values:\n  \
+            --messages  Show only sent/received messages.\n  \
+            --output    Show only harness stdout/stderr style output.\n  \
+            --search    Case-insensitive content search before applying the limit.\n  \
+            --raw       Disable default truncation.\n  \
+            --last <N>  Positive integer count. Default: 20. Alias: --tail.\n  \
+            --truncate <N>  Character count; 0 disables truncation.\n\n\
+            Examples:\n  \
+            swarm log reviewer-1234abcd\n  \
+            swarm log reviewer-1234abcd --messages\n  \
+            swarm log user --messages --search blocker\n  \
+            swarm log reviewer-1234abcd --raw -n 100\n  \
+            swarm log reviewer-1234abcd --json"
+    )]
     Log {
-        /// Agent ID to inspect, or "user" to inspect the broader user message log
+        /// Topic ID to inspect, or "user" to inspect the broader user message log
         target: String,
 
         /// Number of entries to show
@@ -293,7 +425,7 @@ enum Commands {
         #[arg(long, conflicts_with = "messages")]
         output: bool,
 
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
 
@@ -310,27 +442,53 @@ enum Commands {
         truncate: Option<usize>,
     },
 
-    /// Show a compact digest for a run or one agent
+    /// Show a compact digest for the project or one topic
+    #[command(
+        about = "Show a compact digest for the project or one topic",
+        long_about = "Show deterministic, low-noise status without dumping full transcripts.\n\n\
+            Project brief (`swarm brief`) includes topic counts, recent topics, prompt sizes, statuses, and recent structured handovers.\n\n\
+            Topic brief (`swarm brief <topic-id>`) includes metadata, latest handover, and compact recent log previews. Previews are not LLM summaries; they are deterministic truncations of stored log entries.\n\n\
+            Use `swarm done --outcome ... --deliverable ... --checks ...` to make future briefs more useful.\n\n\
+            Options and values:\n  \
+            --last <N>      Positive integer count for recent topics/log entries. Default: 20.\n  \
+            --search <TEXT> Case-insensitive search over compact fields or topic log content.\n  \
+            --json          Machine-readable output; also automatic when stdout is piped.\n\n\
+            Examples:\n  \
+            swarm brief\n  \
+            swarm brief reviewer-1234abcd\n  \
+            swarm brief --search blocked\n  \
+            swarm brief reviewer-1234abcd --json"
+    )]
     Brief {
-        /// Agent ID to inspect. Omit for run-level summary.
+        /// Topic ID to inspect. Omit for project summary.
         target: Option<String>,
 
-        /// Number of recent agents/log entries to show
+        /// Number of recent topics/log entries to show
         #[arg(short = 'n', long = "last", default_value = "20")]
         last: usize,
 
-        /// Search compact run fields or agent log content
+        /// Search compact topic fields or topic log content
         #[arg(long, alias = "grep")]
         search: Option<String>,
 
-        /// Output JSON
+        /// Output JSON; also automatic when stdout is piped
         #[arg(long)]
         json: bool,
     },
 
-    /// Clean up an agent's worktree and optionally its branch
+    /// Clean up a topic worktree and optionally its branch
+    #[command(
+        about = "Clean up a topic worktree and optionally its branch",
+        long_about = "Remove the git worktree created for a topic started with --worktree.\n\n\
+            This does not delete the topic record, mailbox, or logs. Use it after reviewing or merging worktree changes.\n\n\
+            Options:\n  \
+            --delete-branch  Also delete the topic branch after removing the worktree.\n\n\
+            Examples:\n  \
+            swarm cleanup editor-1234abcd\n  \
+            swarm cleanup editor-1234abcd --delete-branch"
+    )]
     Cleanup {
-        /// Agent ID to clean up
+        /// Topic ID to clean up
         target: String,
 
         /// Also delete the git branch
@@ -338,7 +496,20 @@ enum Commands {
         delete_branch: bool,
     },
 
-    /// Signal that you have finished your task (self-termination)
+    /// Pause this topic and optionally report to parent
+    #[command(
+        about = "Pause this topic and optionally report to parent",
+        long_about = "Mark the current topic paused/done, optionally send a final message to the parent, and store structured handover fields for future briefs.\n\n\
+            This command requires SWARM_AGENT_ID, so it is for use inside a running topic. A paused topic can be resumed later by sending it another message.\n\n\
+            Good LLM usage:\n  \
+            - Put the concise final answer in MESSAGE.\n  \
+            - Use --outcome, --deliverable, --checks, --risk, and --next-action to make `swarm brief` useful.\n\n\
+            Suggested outcome values are free-form but should usually be: done, partial, blocked, failed.\n\n\
+            Examples:\n  \
+            swarm done \"Implemented parser cleanup\"\n  \
+            swarm done \"Blocked on credentials\" --outcome blocked --risk \"Cannot verify API call\" --next-action \"Provide API token\"\n  \
+            swarm done \"Review complete\" --outcome done --checks \"cargo test passed\" --deliverable \"review notes in parent message\""
+    )]
     Done {
         /// Optional final message to send to your parent
         message: Option<String>,
@@ -364,22 +535,51 @@ enum Commands {
         next_action: Option<String>,
     },
 
-    /// Stop an agent and mark it done
+    /// Stop a topic worker and mark the topic paused/done
+    #[command(
+        about = "Stop a topic worker and mark the topic paused/done",
+        long_about = "Stop a running topic worker from outside or inside swarm.\n\n\
+            This marks the topic paused/done. It does not delete logs, messages, or worktrees. If a topic has a worktree, use `swarm cleanup <topic-id>` separately after reviewing any work.\n\n\
+            Example:\n  \
+            swarm kill reviewer-1234abcd"
+    )]
     Kill {
-        /// Agent ID to terminate
+        /// Topic ID to stop
         target: String,
     },
 
     /// Check harness availability, versions, and API keys
+    #[command(
+        about = "Check harness availability, versions, and API keys",
+        long_about = "Check whether configured harness CLIs are available and whether expected API key environment variables are present.\n\n\
+            This is a local diagnostic. It does not start a topic.\n\n\
+            Example:\n  \
+            swarm doctor"
+    )]
     Doctor,
 
     /// Print shell completion script to stdout
+    #[command(
+        about = "Print shell completion script to stdout",
+        long_about = "Generate shell autocomplete code for swarm commands and flags.\n\n\
+            This prints the script to stdout. Redirect it into the completion location for your shell.\n\n\
+            Examples:\n  \
+            swarm completions zsh > ~/.zfunc/_swarm\n  \
+            swarm completions bash > ~/.local/share/bash-completion/completions/swarm\n  \
+            swarm completions fish > ~/.config/fish/completions/swarm.fish"
+    )]
     Completions {
         /// Target shell
         shell: ShellArg,
     },
 
     /// Print roff manpage to stdout
+    #[command(
+        about = "Print roff manpage to stdout",
+        long_about = "Generate a roff manpage for swarm and print it to stdout.\n\n\
+            Example:\n  \
+            swarm manpage > swarm.1"
+    )]
     Manpage,
 }
 
@@ -401,11 +601,13 @@ async fn main() {
             port,
             harness,
             prompt,
-            role,
+            label,
             no_gitignore,
             data_dir,
             dashboard,
-            team,
+            comms,
+            model,
+            worktree,
             detach,
             task,
         } => {
@@ -417,6 +619,12 @@ async fn main() {
                     .clone()
                     .unwrap_or_else(|| "echo".into())
             });
+            let comms = comms.unwrap_or_else(|| {
+                config
+                    .default_comms
+                    .clone()
+                    .unwrap_or_else(|| "mesh".into())
+            });
 
             let resolved_data_dir = SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
 
@@ -426,36 +634,22 @@ async fn main() {
             }
 
             let task_text = task.join(" ").trim().to_string();
-            let result = if task_text.is_empty() && team.is_empty() {
-                run_orchestrator(
-                    project_dir,
-                    resolved_data_dir,
-                    port,
-                    Some(ParentSpec {
-                        harness,
-                        prompt,
-                        role,
-                    }),
-                    no_gitignore,
-                    dashboard,
-                )
-                .await
-            } else {
-                run_task_swarm(
-                    project_dir,
-                    resolved_data_dir,
-                    port,
-                    harness,
-                    role,
-                    prompt,
-                    team,
-                    task_text,
-                    detach,
-                    no_gitignore,
-                    dashboard,
-                )
-                .await
-            };
+            let result = run_task_swarm(
+                project_dir,
+                resolved_data_dir,
+                port,
+                harness,
+                label,
+                prompt,
+                comms,
+                model,
+                worktree,
+                task_text,
+                detach,
+                no_gitignore,
+                dashboard,
+            )
+            .await;
 
             if let Err(e) = result {
                 eprintln!("error: {e}");
@@ -477,7 +671,6 @@ async fn main() {
                 project_dir,
                 resolved_data_dir,
                 port,
-                None,
                 no_gitignore,
                 dashboard,
             )
@@ -487,15 +680,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Peers {
-            all,
-            run,
-            all_runs,
-            json,
-        } => {
-            let effective_run = effective_run_arg(&run);
-            let run = (!all_runs).then_some(effective_run.as_str());
-            if let Err(e) = cmd_peers(all, run, json).await {
+        Commands::Peers { all, json } => {
+            if let Err(e) = cmd_peers(all, json).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -512,8 +698,6 @@ async fn main() {
             all,
             new,
             since,
-            run,
-            all_runs,
             last,
             json,
             search,
@@ -521,13 +705,10 @@ async fn main() {
             truncate,
         } => {
             let truncate = if raw { 0 } else { truncate.unwrap_or(0) };
-            let effective_run = effective_run_arg(&run);
-            let run = (!all_runs).then_some(effective_run.as_str());
             if let Err(e) = cmd_inbox(
                 from.as_deref(),
                 all,
                 to.as_deref(),
-                run,
                 new,
                 since.as_deref(),
                 last,
@@ -541,70 +722,16 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Spawn {
-            role,
-            harness,
-            prompt,
-            comms,
-            model,
-            worktree,
-            run,
-        } => {
-            let config = SwarmConfig::load(None);
-            let harness = harness.unwrap_or_else(|| {
-                config
-                    .default_harness
-                    .clone()
-                    .unwrap_or_else(|| "echo".into())
-            });
-            let comms = comms.unwrap_or_else(|| {
-                config
-                    .default_comms
-                    .clone()
-                    .unwrap_or_else(|| "mesh".into())
-            });
-
-            if let Err(msg) = swarm::harness::preflight_check(&harness) {
-                eprintln!("{msg}");
-                std::process::exit(1);
-            }
-
-            if let Err(e) = cmd_spawn(
-                &role,
-                &harness,
-                &prompt,
-                &comms,
-                model.as_deref(),
-                worktree,
-                run.as_deref(),
-            )
-            .await
-            {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
         Commands::Watch {
             to,
             from,
             all,
-            run,
-            all_runs,
             last,
             interval_ms,
             json,
         } => {
-            let effective_run = effective_run_arg(&run);
-            if let Err(e) = cmd_watch(
-                from.as_deref(),
-                all,
-                to.as_deref(),
-                (!all_runs).then_some(effective_run.as_str()),
-                last,
-                interval_ms,
-                json,
-            )
-            .await
+            if let Err(e) =
+                cmd_watch(from.as_deref(), all, to.as_deref(), last, interval_ms, json).await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -710,17 +837,10 @@ async fn main() {
     }
 }
 
-struct ParentSpec {
-    harness: String,
-    prompt: String,
-    role: String,
-}
-
 async fn run_orchestrator(
     project_dir: PathBuf,
     data_dir: PathBuf,
     port: u16,
-    parent: Option<ParentSpec>,
     no_gitignore: bool,
     dashboard: Option<PathBuf>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -785,7 +905,7 @@ async fn run_orchestrator(
     ));
     let resumed = orch.resume_existing_workers()?;
     if resumed > 0 {
-        tracing::info!("resumed {resumed} existing agent worker(s)");
+        tracing::info!("resumed {resumed} existing topic worker(s)");
     }
 
     // Start HTTP server
@@ -799,17 +919,6 @@ async fn run_orchestrator(
         }
     });
 
-    if let Some(parent_spec) = parent {
-        let parent = orch.spawn_agent(
-            &parent_spec.role,
-            &parent_spec.harness,
-            &parent_spec.prompt,
-            None,
-            "mesh",
-        )?;
-        tracing::info!("parent agent: {} ({})", parent.id, parent.harness);
-    }
-
     // Stream events to stdout
     let mut rx = orch.subscribe();
     let event_loop = tokio::spawn(async move {
@@ -822,10 +931,10 @@ async fn run_orchestrator(
                     SwarmEvent::AgentError { agent_id, error } => {
                         eprintln!("[{agent_id}] ERROR: {error}");
                     }
-                    SwarmEvent::AgentSpawned { agent } => {
+                    SwarmEvent::TopicStarted { agent } => {
                         println!(
-                            "[swarm] spawned: {} ({}, {})",
-                            agent.id, agent.harness, agent.role
+                            "[swarm] topic: {} ({}, {})",
+                            agent.id, agent.harness, agent.label
                         );
                     }
                     SwarmEvent::AgentDone { agent_id, message } => {
@@ -876,9 +985,11 @@ async fn run_task_swarm(
     data_dir: PathBuf,
     port: u16,
     harness: String,
-    role: String,
+    label: String,
     prompt: String,
-    team: Vec<String>,
+    comms: String,
+    model: Option<String>,
+    worktree: bool,
     task: String,
     detach: bool,
     no_gitignore: bool,
@@ -895,89 +1006,90 @@ async fn run_task_swarm(
         return Err("provide a task argument or --prompt for swarm run".into());
     }
 
-    for spec in &team {
-        let (_, teammate_harness) = parse_team_spec(spec)?;
-        if let Err(msg) = swarm::harness::preflight_check(&teammate_harness) {
-            return Err(msg.into());
+    let parent_id = runtime_parent_id();
+    let user_launched = parent_id == USER_TOPIC_ID;
+    let socket = match std::env::var("SWARM_SOCKET") {
+        Ok(socket) if !socket.trim().is_empty() => {
+            ensure_socket_protocol(&socket).await?;
+            socket
         }
-    }
-
-    let socket = ensure_daemon(project_dir, data_dir, port, no_gitignore, dashboard).await?;
-    let run = create_run_http(&socket, &task).await?;
-    let run_id = run["id"].as_str().ok_or("create run returned no id")?;
-
-    let coordinator = spawn_agent_http(
+        _ => ensure_daemon(project_dir, data_dir, port, no_gitignore, dashboard).await?,
+    };
+    let topic = create_topic_http(
         &socket,
-        SpawnHttpRequest {
-            role: &role,
+        CreateTopicHttpRequest {
+            label: &label,
             harness: &harness,
             prompt: "",
-            parent_id: None,
-            comms: "mesh",
-            model: None,
-            worktree: false,
-            run_id: Some(run_id),
-            user_launched: true,
+            parent_id: Some(&parent_id),
+            comms: &comms,
+            model: model.as_deref(),
+            worktree,
+            user_launched,
         },
     )
     .await?;
-    let coordinator_id = coordinator["id"]
+    let topic_id = topic["id"]
         .as_str()
-        .ok_or("coordinator spawn returned no id")?
+        .ok_or("topic create returned no id")?
         .to_string();
 
-    update_run_root_http(&socket, run_id, &coordinator_id).await?;
+    let topic_prompt = topic_prompt(&task, &topic_id, &parent_id);
+    send_message_http(&socket, &parent_id, &topic_id, &topic_prompt).await?;
 
-    let mut teammates = Vec::new();
-    for (idx, spec) in team.iter().enumerate() {
-        let (role_hint, teammate_harness) = parse_team_spec(spec)?;
-        let teammate_role = sanitize_role(&format!("mate{}-{}", idx + 1, role_hint));
-        let teammate_prompt = teammate_prompt(&task, run_id, &coordinator_id, &teammate_role);
-        let agent = spawn_agent_http(
-            &socket,
-            SpawnHttpRequest {
-                role: &teammate_role,
-                harness: &teammate_harness,
-                prompt: &teammate_prompt,
-                parent_id: Some(&coordinator_id),
-                comms: "mesh",
-                model: None,
-                worktree: false,
-                run_id: Some(run_id),
-                user_launched: false,
-            },
-        )
-        .await?;
-        teammates.push(agent);
-    }
-
-    let coordinator_prompt = coordinator_prompt(&task, run_id, &coordinator_id, &teammates);
-    send_message_http(&socket, "user", &coordinator_id, &coordinator_prompt).await?;
-
-    println!("run: {run_id}");
-    println!("coordinator: {coordinator_id}");
-    if !teammates.is_empty() {
-        println!("teammates:");
-        for teammate in &teammates {
-            println!(
-                "  {:<26} {:<10} {}",
-                teammate["id"].as_str().unwrap_or("?"),
-                teammate["harness"].as_str().unwrap_or("?"),
-                teammate["role"].as_str().unwrap_or("?")
-            );
-        }
-    }
+    println!("topic: {topic_id}");
+    println!("parent: {parent_id}");
     println!("dashboard: {socket}");
     println!("{CLI_ENTRY_SEPARATOR}");
     std::env::set_var("SWARM_SOCKET", &socket);
 
     if detach {
-        println!("detached. watch responses with: swarm watch --run {run_id} --all");
+        println!("detached. watch responses with: swarm watch --to {parent_id} {topic_id}");
         return Ok(());
     }
 
-    println!("watching direct responses for run {run_id}; press Ctrl-C to stop");
-    cmd_watch(None, true, Some("user"), Some(run_id), 20, 2_000, false).await
+    println!(
+        "watching direct responses from {}; press Ctrl-C to stop",
+        topic_id
+    );
+    watch_started_topic_responses(&parent_id, &topic_id, 20, 2_000).await
+}
+
+async fn watch_started_topic_responses(
+    target: &str,
+    from_agent: &str,
+    limit: usize,
+    interval_ms: u64,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let interval_ms = interval_ms.max(250);
+    let mut seen = HashSet::new();
+
+    loop {
+        let entries =
+            fetch_inbox_entries(target, Some(from_agent), false, None, limit, None).await?;
+        let mut new_entries = entries
+            .into_iter()
+            .filter(|entry| seen.insert(inbox_entry_key(entry)))
+            .collect::<Vec<_>>();
+
+        if !new_entries.is_empty() {
+            new_entries.reverse();
+            print_inbox_entries(&new_entries, 0);
+            println!("{CLI_ENTRY_SEPARATOR}");
+            std::io::stdout().flush()?;
+        }
+
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+fn inbox_entry_key(entry: &serde_json::Value) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        entry["timestamp"].as_str().unwrap_or(""),
+        entry["peer"].as_str().unwrap_or(""),
+        entry["content"].as_str().unwrap_or("")
+    )
 }
 
 async fn ensure_daemon(
@@ -988,8 +1100,17 @@ async fn ensure_daemon(
     dashboard: Option<PathBuf>,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
     let socket = format!("http://127.0.0.1:{port}");
-    if daemon_healthy(&socket).await {
-        return Ok(socket);
+    match daemon_health(&socket).await {
+        Some(health) if daemon_matches(&health, &project_dir, &data_dir) => return Ok(socket),
+        Some(health) => {
+            return Err(format!(
+                "daemon already running at {socket} for project {} with data dir {}. Stop it or pass --port <other>.",
+                health["project_dir"].as_str().unwrap_or("?"),
+                health["data_dir"].as_str().unwrap_or("?")
+            )
+            .into());
+        }
+        None => {}
     }
 
     let exe = std::env::current_exe()?;
@@ -1018,7 +1139,7 @@ async fn ensure_daemon(
     cmd.spawn()?;
 
     for _ in 0..80 {
-        if daemon_healthy(&socket).await {
+        if daemon_health(&socket).await.is_some() {
             return Ok(socket);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1027,83 +1148,91 @@ async fn ensure_daemon(
     Err(format!("daemon did not become healthy at {socket}").into())
 }
 
-async fn daemon_healthy(socket: &str) -> bool {
+async fn ensure_socket_protocol(
+    socket: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    match daemon_health(socket).await {
+        Some(health) if health["protocol"].as_str() == Some(SWARM_PROTOCOL_VERSION) => Ok(()),
+        Some(health) => Err(format!(
+            "daemon at {socket} uses protocol {} but this CLI expects {SWARM_PROTOCOL_VERSION}. Restart the daemon.",
+            health["protocol"].as_str().unwrap_or("unknown")
+        )
+        .into()),
+        None => Err(format!("no swarm daemon responded at {socket}").into()),
+    }
+}
+
+async fn daemon_health(socket: &str) -> Option<serde_json::Value> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(400))
         .build()
     {
         Ok(client) => client,
-        Err(_) => return false,
+        Err(_) => return None,
     };
-    client
+    let resp = client
         .get(format!("{socket}/api/health"))
         .send()
         .await
-        .map(|resp| resp.status().is_success())
-        .unwrap_or(false)
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
 }
 
-struct SpawnHttpRequest<'a> {
-    role: &'a str,
+fn daemon_matches(
+    health: &serde_json::Value,
+    project_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> bool {
+    if health["protocol"].as_str() != Some(SWARM_PROTOCOL_VERSION) {
+        return false;
+    }
+    let Some(daemon_project) = health["project_dir"].as_str() else {
+        return false;
+    };
+    let Some(daemon_data) = health["data_dir"].as_str() else {
+        return false;
+    };
+
+    paths_equivalent(daemon_project, project_dir) && paths_equivalent(daemon_data, data_dir)
+}
+
+fn paths_equivalent(left: impl AsRef<std::path::Path>, right: impl AsRef<std::path::Path>) -> bool {
+    let left = left.as_ref();
+    let right = right.as_ref();
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+struct CreateTopicHttpRequest<'a> {
+    label: &'a str,
     harness: &'a str,
     prompt: &'a str,
     parent_id: Option<&'a str>,
     comms: &'a str,
     model: Option<&'a str>,
     worktree: bool,
-    run_id: Option<&'a str>,
     user_launched: bool,
 }
 
-async fn create_run_http(
+async fn create_topic_http(
     socket: &str,
-    task: &str,
-) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{socket}/api/runs"))
-        .json(&serde_json::json!({ "task": task }))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(response_error(resp).await);
-    }
-    Ok(resp.json().await?)
-}
-
-async fn update_run_root_http(
-    socket: &str,
-    run_id: &str,
-    root_agent_id: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{socket}/api/runs/{run_id}"))
-        .json(&serde_json::json!({ "root_agent_id": root_agent_id }))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(response_error(resp).await);
-    }
-    Ok(())
-}
-
-async fn spawn_agent_http(
-    socket: &str,
-    req: SpawnHttpRequest<'_>,
+    req: CreateTopicHttpRequest<'_>,
 ) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{socket}/api/agents"))
         .json(&serde_json::json!({
-            "role": req.role,
+            "label": req.label,
             "harness": req.harness,
             "system_prompt": req.prompt,
             "parent_id": req.parent_id,
             "comms": req.comms,
             "model": req.model,
             "worktree": req.worktree,
-            "run_id": req.run_id,
             "user_launched": req.user_launched,
         }))
         .send()
@@ -1136,69 +1265,9 @@ async fn send_message_http(
     Ok(())
 }
 
-fn parse_team_spec(
-    spec: &str,
-) -> std::result::Result<(String, String), Box<dyn std::error::Error>> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Err("empty teammate spec".into());
-    }
-    if let Some((role, harness)) = spec.split_once(':') {
-        let harness = harness.trim().to_string();
-        let role = role
-            .trim()
-            .is_empty()
-            .then(|| harness.clone())
-            .unwrap_or_else(|| role.trim().to_string());
-        Ok((role, harness))
-    } else {
-        Ok((spec.to_string(), spec.to_string()))
-    }
-}
-
-fn sanitize_role(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
-            out.push(b as char);
-        } else {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-fn teammate_prompt(task: &str, run_id: &str, coordinator_id: &str, role: &str) -> String {
+fn topic_prompt(task: &str, topic_id: &str, parent_id: &str) -> String {
     format!(
-        "You are {role} in swarm run {run_id}.\n\nTask:\n{task}\n\nWork independently, send concise progress or conclusions to coordinator {coordinator_id} with `swarm send {coordinator_id} \"...\"`, then call `swarm done \"summary\"` when finished. Keep direct messages under 300 words unless asked for more."
-    )
-}
-
-fn coordinator_prompt(
-    task: &str,
-    run_id: &str,
-    coordinator_id: &str,
-    teammates: &[serde_json::Value],
-) -> String {
-    let teammate_lines = if teammates.is_empty() {
-        "No teammates were pre-spawned; do the task directly or spawn more if useful.".to_string()
-    } else {
-        teammates
-            .iter()
-            .map(|agent| {
-                format!(
-                    "- {} ({}, {})",
-                    agent["id"].as_str().unwrap_or("?"),
-                    agent["harness"].as_str().unwrap_or("?"),
-                    agent["role"].as_str().unwrap_or("?")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    format!(
-        "You are the top-level orchestrator {coordinator_id} for swarm run {run_id}.\n\nTask:\n{task}\n\nTeammates:\n{teammate_lines}\n\nCoordinate the teammates, monitor their replies with `swarm inbox --new --all --run {run_id}`, and send conclusions, blockers, or questions to the calling user with `swarm send user \"...\"`. When the run is complete, send a concise final answer to the user and call `swarm done \"summary\"`."
+        "Topic: {topic_id}\nParent: {parent_id}\n\nTask:\n{task}\n\nWork independently. {PARENT_REPLY_HINT} When complete, call `swarm done \"summary\"`. Start child topics only when useful; {HELP_DISCOVERY_HINT}"
     )
 }
 
@@ -1210,12 +1279,12 @@ fn swarm_agent_id() -> Option<String> {
     std::env::var("SWARM_AGENT_ID").ok()
 }
 
-fn effective_run_arg(run: &str) -> String {
-    if run == "current" {
-        std::env::var("SWARM_RUN_ID").unwrap_or_else(|_| "current".to_string())
-    } else {
-        run.to_string()
-    }
+fn parent_id_from_context(agent_id: Option<String>) -> String {
+    agent_id.unwrap_or_else(|| USER_TOPIC_ID.to_string())
+}
+
+fn runtime_parent_id() -> String {
+    parent_id_from_context(swarm_agent_id())
 }
 
 fn wants_json(explicit: bool) -> bool {
@@ -1230,7 +1299,6 @@ fn print_json<T: Serialize>(value: &T) -> std::result::Result<(), Box<dyn std::e
 
 async fn cmd_peers(
     include_all: bool,
-    run: Option<&str>,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
@@ -1241,9 +1309,6 @@ async fn cmd_peers(
     }
     if include_all {
         params.push("all=true".to_string());
-    }
-    if let Some(run) = run {
-        params.push(format!("run={run}"));
     }
     if !params.is_empty() {
         url.push('?');
@@ -1261,7 +1326,7 @@ async fn cmd_peers(
     }
 
     if agents.is_empty() {
-        println!("no agents");
+        println!("no topics");
         return Ok(());
     }
 
@@ -1281,20 +1346,18 @@ async fn cmd_peers(
             let status = agent["status"].as_str().unwrap_or("?");
             let id = agent["id"].as_str().unwrap_or("?");
             let harness = agent["harness"].as_str().unwrap_or("?");
-            let role = agent["role"].as_str().unwrap_or("?");
-            let run_id = agent["run_id"].as_str().unwrap_or("-");
-
+            let label = agent["label"].as_str().unwrap_or("?");
             if has_perspective {
                 let relation = agent["relation"].as_str().unwrap_or("?");
                 println!(
-                    "  {:<26} {:<10} {:<10} {:<16} {:<12} run={}",
-                    id, harness, status, role, relation, run_id
+                    "  {:<26} {:<10} {:<10} {:<16} {:<12}",
+                    id, harness, status, label, relation
                 );
             } else {
                 let parent = agent["parent_id"].as_str().unwrap_or("-");
                 println!(
-                    "  {:<26} {:<10} {:<10} {:<16} parent={:<20} run={}",
-                    id, harness, status, role, parent, run_id
+                    "  {:<26} {:<10} {:<10} {:<16} parent={:<20}",
+                    id, harness, status, label, parent
                 );
             }
         }
@@ -1365,6 +1428,7 @@ async fn cmd_send(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = swarm_socket();
     let from = swarm_agent_id().unwrap_or_else(|| "user".to_string());
+    let target = resolve_send_target(&socket, target, &from).await?;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{socket}/api/messages"))
@@ -1384,12 +1448,32 @@ async fn cmd_send(
     Ok(())
 }
 
+async fn resolve_send_target(
+    socket: &str,
+    target: &str,
+    from: &str,
+) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    if target != "parent" {
+        return Ok(target.to_string());
+    }
+    if from == "user" {
+        return Err("`parent` is only available inside a swarm topic".into());
+    }
+
+    let resp = reqwest::get(format!("{socket}/api/agents/{from}")).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    let agent: serde_json::Value = resp.json().await?;
+    Ok(agent["parent_id"].as_str().unwrap_or("user").to_string())
+}
+
 fn resolve_inbox_target(
     to: Option<&str>,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
     match to {
         Some("me") => swarm_agent_id()
-            .ok_or("SWARM_AGENT_ID is not set; use --to user or --to <agent-id>")
+            .ok_or("SWARM_AGENT_ID is not set; use --to user or --to <topic-id>")
             .map_err(Into::into),
         Some(target) => Ok(target.to_string()),
         None => Ok(swarm_agent_id().unwrap_or_else(|| "user".to_string())),
@@ -1400,7 +1484,6 @@ async fn cmd_inbox(
     from: Option<&str>,
     all: bool,
     to: Option<&str>,
-    run: Option<&str>,
     only_new: bool,
     since: Option<&str>,
     limit: usize,
@@ -1411,18 +1494,17 @@ async fn cmd_inbox(
     let from_agent = if all {
         None
     } else {
-        Some(from.ok_or("pass a source agent id, or use --all to read all inbox messages")?)
+        Some(from.ok_or("pass a source topic id, or use --all to read all inbox messages")?)
     };
     let target = resolve_inbox_target(to)?;
-    let resp =
-        fetch_inbox_entries(&target, from_agent, run, only_new, since, limit, search).await?;
+    let resp = fetch_inbox_entries(&target, from_agent, only_new, since, limit, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
     }
 
     if resp.is_empty() {
-        let source = from_agent.unwrap_or("any agent");
+        let source = from_agent.unwrap_or("any topic");
         println!("no inbox messages for {target} from {source}");
         return Ok(());
     }
@@ -1435,7 +1517,6 @@ async fn cmd_inbox(
 async fn fetch_inbox_entries(
     target: &str,
     from_agent: Option<&str>,
-    run: Option<&str>,
     only_new: bool,
     since: Option<&str>,
     limit: usize,
@@ -1449,9 +1530,6 @@ async fn fetch_inbox_entries(
         if let Some(from_agent) = from_agent {
             query.append_pair("from", from_agent);
         }
-        if let Some(run) = run {
-            query.append_pair("run", run);
-        }
         if only_new {
             query.append_pair("new", "true");
         }
@@ -1463,6 +1541,31 @@ async fn fetch_inbox_entries(
         }
     }
 
+    let resp = reqwest::get(url).await?;
+    if !resp.status().is_success() {
+        return Err(response_error(resp).await);
+    }
+    Ok(resp.json().await?)
+}
+
+async fn fetch_log_entries(
+    target: &str,
+    limit: usize,
+    filter: &str,
+    search: Option<&str>,
+) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let socket = swarm_socket();
+    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/log"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("n", &limit.to_string());
+        if filter != "all" {
+            query.append_pair("type", filter);
+        }
+        if let Some(search) = search {
+            query.append_pair("q", search);
+        }
+    }
     let resp = reqwest::get(url).await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
@@ -1490,7 +1593,6 @@ async fn cmd_watch(
     from: Option<&str>,
     all: bool,
     to: Option<&str>,
-    run: Option<&str>,
     limit: usize,
     interval_ms: u64,
     json: bool,
@@ -1498,66 +1600,38 @@ async fn cmd_watch(
     let from_agent = if all {
         None
     } else {
-        Some(from.ok_or("pass a source agent id, or use --all to watch all inbox messages")?)
+        Some(from.ok_or("pass a source topic id, or use --all to watch all inbox messages")?)
     };
     let target = resolve_inbox_target(to)?;
     let interval_ms = interval_ms.max(250);
+    let mut since = chrono::Utc::now().to_rfc3339();
+    let mut seen = HashSet::new();
 
     loop {
         let entries =
-            fetch_inbox_entries(&target, from_agent, run, true, None, limit, None).await?;
-        if !entries.is_empty() {
+            fetch_inbox_entries(&target, from_agent, false, Some(&since), limit, None).await?;
+        let mut new_entries = entries
+            .into_iter()
+            .filter(|entry| seen.insert(inbox_entry_key(entry)))
+            .collect::<Vec<_>>();
+
+        if !new_entries.is_empty() {
+            new_entries.reverse();
+            if let Some(last) = new_entries.last() {
+                if let Some(timestamp) = last["timestamp"].as_str() {
+                    since = timestamp.to_string();
+                }
+            }
             if wants_json(json) {
-                print_json(&entries)?;
+                print_json(&new_entries)?;
             } else {
-                print_inbox_entries(&entries, 0);
+                print_inbox_entries(&new_entries, 0);
                 println!("{CLI_ENTRY_SEPARATOR}");
             }
+            std::io::stdout().flush()?;
         }
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
     }
-}
-
-async fn cmd_spawn(
-    role: &str,
-    harness: &str,
-    prompt: &str,
-    comms: &str,
-    model: Option<&str>,
-    worktree: bool,
-    run: Option<&str>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
-    let parent_id = swarm_agent_id();
-    let run_id = run
-        .map(effective_run_arg)
-        .or_else(|| std::env::var("SWARM_RUN_ID").ok());
-    let user_launched = parent_id.is_none();
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{socket}/api/agents"))
-        .json(&serde_json::json!({
-            "role": role,
-            "harness": harness,
-            "system_prompt": prompt,
-            "parent_id": parent_id,
-            "comms": comms,
-            "model": model,
-            "worktree": worktree,
-            "run_id": run_id,
-            "user_launched": user_launched,
-        }))
-        .send()
-        .await?;
-
-    if resp.status().is_success() {
-        let agent: serde_json::Value = resp.json().await?;
-        let id = agent["id"].as_str().unwrap_or("?");
-        println!("{id}");
-    } else {
-        return Err(response_error(resp).await);
-    }
-    Ok(())
 }
 
 async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -1576,7 +1650,7 @@ async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::E
     let model = resp["model"].as_str().unwrap_or("");
     let model_display = if model.is_empty() { "(default)" } else { model };
     println!("id:      {}", resp["id"].as_str().unwrap_or("?"));
-    println!("role:    {}", resp["role"].as_str().unwrap_or("?"));
+    println!("label:    {}", resp["label"].as_str().unwrap_or("?"));
     println!("harness: {}", resp["harness"].as_str().unwrap_or("?"));
     println!("model:   {}", model_display);
     println!("status:  {}", resp["status"].as_str().unwrap_or("?"));
@@ -1644,23 +1718,7 @@ async fn cmd_log(
     truncate: usize,
     search: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
-    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/log"))?;
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("n", &limit.to_string());
-        if filter != "all" {
-            query.append_pair("type", filter);
-        }
-        if let Some(search) = search {
-            query.append_pair("q", search);
-        }
-    }
-    let resp = reqwest::get(url).await?;
-    if !resp.status().is_success() {
-        return Err(response_error(resp).await);
-    }
-    let resp: Vec<serde_json::Value> = resp.json().await?;
+    let resp = fetch_log_entries(target, limit, filter, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
@@ -1735,7 +1793,7 @@ async fn cmd_brief(
     if target.is_some() {
         print_agent_brief(&brief);
     } else {
-        print_run_brief(&brief);
+        print_swarm_brief(&brief);
     }
     Ok(())
 }
@@ -1744,7 +1802,7 @@ fn print_agent_brief(brief: &serde_json::Value) {
     println!(
         "{} ({}) [{}]",
         brief["id"].as_str().unwrap_or("?"),
-        brief["role"].as_str().unwrap_or("?"),
+        brief["label"].as_str().unwrap_or("?"),
         brief["status"].as_str().unwrap_or("?")
     );
     println!(
@@ -1781,10 +1839,10 @@ fn print_agent_brief(brief: &serde_json::Value) {
     }
 }
 
-fn print_run_brief(brief: &serde_json::Value) {
+fn print_swarm_brief(brief: &serde_json::Value) {
     let stats = &brief["stats"];
     println!(
-        "agents: total={} alive={} done={} messages={} errors={}",
+        "topics: total={} alive={} done={} messages={} errors={}",
         stats["total"].as_u64().unwrap_or(0),
         stats["alive"].as_u64().unwrap_or(0),
         stats["done"].as_u64().unwrap_or(0),
@@ -1794,7 +1852,7 @@ fn print_run_brief(brief: &serde_json::Value) {
 
     if let Some(agents) = brief["agents"].as_array() {
         if !agents.is_empty() {
-            println!("recent agents:");
+            println!("recent topics:");
             for agent in agents {
                 let summary = agent
                     .get("latest_handover")
@@ -1804,7 +1862,7 @@ fn print_run_brief(brief: &serde_json::Value) {
                 println!(
                     "  {:<26} {:<18} {:<8} prompt={:>5} {}",
                     agent["id"].as_str().unwrap_or("?"),
-                    agent["role"].as_str().unwrap_or("?"),
+                    agent["label"].as_str().unwrap_or("?"),
                     agent["status"].as_str().unwrap_or("?"),
                     agent["prompt_chars"].as_u64().unwrap_or(0),
                     summary
@@ -2058,6 +2116,52 @@ fn cmd_manpage() {
 mod tests {
     use super::*;
 
+    fn removed_command_name() -> String {
+        ["sp", "awn"].concat()
+    }
+
+    fn removed_team_flag() -> String {
+        ["--te", "am"].concat()
+    }
+
+    fn removed_label_predecessor_flag() -> String {
+        ["--ro", "le"].concat()
+    }
+
+    #[test]
+    fn top_level_help_points_to_run_only() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        let removed = removed_command_name();
+        let removed_team = removed_team_flag();
+
+        assert!(help.contains("swarm run \"task\""));
+        assert!(!help.contains(&removed));
+        assert!(!help.contains(&removed_team));
+    }
+
+    #[test]
+    fn run_help_describes_contextual_topic_start() {
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let mut help = Vec::new();
+        run.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        let removed = removed_command_name();
+        let removed_team = removed_team_flag();
+        let removed_label_predecessor = removed_label_predecessor_flag();
+
+        assert!(help.contains("Start one durable topic"));
+        assert!(help.contains("parent=user outside swarm"));
+        assert!(help.contains("--label"));
+        assert!(help.contains("--worktree"));
+        assert!(!help.contains(&removed));
+        assert!(!help.contains(&removed_team));
+        assert!(!help.contains(&removed_label_predecessor));
+    }
+
     #[test]
     fn truncate_for_display_uses_requested_limit() {
         assert_eq!(
@@ -2077,5 +2181,18 @@ mod tests {
     #[test]
     fn truncate_for_display_handles_char_boundaries() {
         assert_eq!(truncate_for_display("éclair", 1), "é... (6 chars total)");
+    }
+
+    #[test]
+    fn parent_id_defaults_to_user_outside_swarm() {
+        assert_eq!(parent_id_from_context(None), "user");
+    }
+
+    #[test]
+    fn parent_id_uses_current_topic_inside_swarm() {
+        assert_eq!(
+            parent_id_from_context(Some("coordinator-12345678".to_string())),
+            "coordinator-12345678"
+        );
     }
 }

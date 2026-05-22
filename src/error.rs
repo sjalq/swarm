@@ -20,11 +20,11 @@ impl fmt::Display for SwarmError {
             Self::Process(msg) => write!(f, "process error: {msg}"),
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
-            Self::AgentNotFound(id) => write!(f, "agent not found: {id}"),
+            Self::AgentNotFound(id) => write!(f, "topic not found: {id}"),
             Self::AgentInactive { id, status } => {
                 write!(
                     f,
-                    "agent {id} is not accepting messages; status is {status}"
+                    "topic {id} is not accepting messages; status is {status}"
                 )
             }
             Self::InvalidRequest(msg) => write!(f, "{msg}"),

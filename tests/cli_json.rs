@@ -1,4 +1,6 @@
+use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 struct SwarmRun {
@@ -6,6 +8,26 @@ struct SwarmRun {
 }
 
 impl Drop for SwarmRun {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct WatchRun {
+    child: Child,
+    rx: mpsc::Receiver<String>,
+}
+
+impl WatchRun {
+    fn wait_for_output(&self) -> String {
+        self.rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("watch did not print the expected message")
+    }
+}
+
+impl Drop for WatchRun {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -25,6 +47,37 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
     std::fs::create_dir_all(&data_dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
+            "serve",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--no-gitignore",
+        ])
+        .env_remove("SWARM_SOCKET")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start swarm serve");
+
+    let run = SwarmRun { child };
+    let client = reqwest::Client::new();
+    let mut server_ready = false;
+    for _ in 0..100 {
+        if let Ok(resp) = client.get(format!("{addr}/api/health")).send().await {
+            if resp.status().is_success() {
+                server_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(server_ready, "swarm server did not start");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args([
             "run",
             "--project-dir",
             dir.path().to_str().unwrap(),
@@ -34,18 +87,23 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
             &port.to_string(),
             "--harness",
             "echo",
-            "--role",
+            "--label",
             "cli-json",
+            "--detach",
             "--no-gitignore",
+            "cli json smoke",
         ])
-        .env_remove("SWARM_SOCKET")
+        .env("SWARM_SOCKET", &addr)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to start swarm run");
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run swarm topic");
+    assert!(
+        output.status.success(),
+        "failed to start topic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let run = SwarmRun { child };
-    let client = reqwest::Client::new();
     for _ in 0..100 {
         if let Ok(resp) = client.get(format!("{addr}/api/agents")).send().await {
             if resp.status().is_success() {
@@ -59,7 +117,7 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    panic!("swarm server did not start");
+    panic!("swarm topic did not start");
 }
 
 fn run_swarm_json(args: &[&str], addr: &str, agent_id: Option<&str>) -> serde_json::Value {
@@ -103,6 +161,142 @@ fn run_swarm_ok(args: &[&str], addr: &str, agent_id: Option<&str>) {
         "command {:?} failed: {}",
         args,
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn start_watch_until(args: &[&str], addr: &str, expected: &str) -> WatchRun {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(args)
+        .env("SWARM_SOCKET", addr)
+        .env_remove("SWARM_AGENT_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start swarm watch");
+
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let expected = expected.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut output = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(output);
+                    return;
+                }
+                Ok(_) => {
+                    output.push_str(&line);
+                    if output.contains(&expected) {
+                        let _ = tx.send(output);
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    WatchRun { child, rx }
+}
+
+#[tokio::test]
+async fn run_inline_watch_prints_echo_reply() {
+    let (_dir, _run, addr, _agent_id) = start_swarm().await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args([
+            "run",
+            "--harness",
+            "echo",
+            "--label",
+            "watch-smoke",
+            "inline watch smoke",
+        ])
+        .env("SWARM_SOCKET", &addr)
+        .env_remove("SWARM_AGENT_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run swarm topic");
+
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut output = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(output);
+                    return;
+                }
+                Ok(_) => {
+                    output.push_str(&line);
+                    if output.contains("(echo) inline watch smoke") {
+                        let _ = tx.send(output);
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let received = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8)))
+        .await
+        .expect("reader task should not panic");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let output = received.expect("inline run did not print the echo reply");
+
+    assert!(
+        output.contains("(echo) inline watch smoke"),
+        "stdout should include the echoed parent response; stdout was: {output}"
+    );
+}
+
+#[tokio::test]
+async fn watch_uses_session_local_cursor() {
+    let (_dir, _run, addr, agent_id) = start_swarm().await;
+
+    let watch = start_watch_until(
+        &["watch", "--all", "--json"],
+        &addr,
+        "session local watch smoke",
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{addr}/api/messages"))
+        .json(&serde_json::json!({
+            "from": agent_id,
+            "to": "user",
+            "content": "session local watch smoke",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let watch_output = watch.wait_for_output();
+    assert!(
+        watch_output.contains("session local watch smoke"),
+        "watch should print the message; stdout was: {watch_output}"
+    );
+    drop(watch);
+
+    let inbox = run_swarm_json(&["inbox", "--all", "--new", "--json"], &addr, None);
+    assert!(
+        inbox
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["content"].as_str() == Some("session local watch smoke")),
+        "watch should not advance the persistent inbox cursor; inbox was: {inbox}"
     );
 }
 
@@ -212,6 +406,6 @@ async fn brief_and_structured_done_json_flags_parse() {
         Some("review")
     );
 
-    let run = run_swarm_json(&["brief", "--json"], &addr, None);
-    assert!(run["agents"].as_array().is_some());
+    let overview = run_swarm_json(&["brief", "--json"], &addr, None);
+    assert!(overview["agents"].as_array().is_some());
 }

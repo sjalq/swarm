@@ -1,10 +1,12 @@
-use crate::db::{
-    AgentRow, Db, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow, OutputLogRow,
-    RunRow,
-};
+use crate::db::{Db, EventRow, LogFilter, MessageRow, OutputLogRow};
 use crate::error::{Result, SwarmError};
+use crate::guidance::{HELP_DISCOVERY_HINT, PARENT_REPLY_HINT};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
-use serde::{Deserialize, Serialize};
+use crate::types::{
+    AgentBrief, AgentBriefSummary, AgentRow, AgentView, BriefLogEntry, CommsMode, DbStats,
+    HandoverRow, LogEntry, SqlEnum, SwarmBrief, TopicStatus, WorktreeInfo, USER_TOPIC_ID,
+};
+pub use crate::types::{DoneReport, StartTopicOptions, SwarmEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -13,203 +15,22 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 const SWARM_PREAMBLE: &str = "\
-You are a swarm agent running inside a multi-agent coordination session.
-The `swarm` CLI is available in this shell for coordination with the user and other agents.
+You are a durable swarm topic running inside an inter-harness coordination session.
+Use the `swarm` CLI for replies and coordination.
 
-Commands:
-  swarm peers [--json]                 List visible agents (your parent, siblings, and all descendants) with relation labels.
-  swarm peers --all [--json]           Include done agents.
-  swarm peers --run current [--json]   List agents from the current run. Use --all-runs to include older runs.
-  swarm send <agent-id> \"message\"      Send a direct message to another agent.
-  swarm send user \"message\"            Send a direct message to the user.
-  swarm inbox <agent-id> [-n <count>]   Read direct messages sent to you by one agent (default: last 20).
-  swarm inbox --all [-n <count>]        Read all recent direct messages sent to you.
-  swarm inbox --new --all              Read only messages you have not seen yet in this run.
-  swarm watch                          Stream new direct responses sent to you for this run.
-  swarm spawn --role <name> --harness <cli> --prompt \"instructions...\"
-                                       Create a child agent. Include the task and how it should report back.
-  swarm spawn --role <name> --harness claude --model <model> --worktree --prompt \"...\"
-                                       Spawn with a model override and an isolated git worktree.
-  swarm cleanup <agent-id>             Remove a done agent's git worktree.
-  swarm cleanup <agent-id> --delete-branch  Also delete the agent's branch.
-  swarm models [--json]                Show harnesses; harness CLIs choose default models.
-  swarm brief [agent-id] [--json]      View a compact run or agent digest without raw transcript payloads.
-  swarm log <agent-id> [--json]        View an agent's recent activity (messages sent/received and output).
-  swarm log <agent-id> -n <count>      Show the last N entries (default: 20).
-  swarm log <agent-id> --search <text> Search recent log content before displaying entries.
-  swarm log <agent-id> --raw           Show exact full log content in text output.
-  swarm log <agent-id> --truncate <N>  Truncate text log content to N chars (default: 500; 0 disables).
-  swarm log <agent-id> --messages      Show only messages (sent and received).
-  swarm log user --messages            Inspect the broader user message log.
-  swarm log <agent-id> --output        Show only harness output.
-  swarm status [--json]                Show your own agent status (includes model info).
-  swarm done \"optional final message\"   Signal that you have finished your task. Sends a message to your parent and exits gracefully.
-  swarm done \"summary\" --outcome done --deliverable \"branch/file/report\" --checks \"...\" --risk \"...\" --next-action \"...\"
-                                       Attach a structured handover for brief views.
-  swarm kill <agent-id>                Stop an agent and mark it done.
+Runtime:
+- Your topic ID, label, parent, and project directory are shown below.
+- SWARM_AGENT_ID is your topic ID.
+- SWARM_SOCKET is the daemon HTTP URL.
+- SWARM_PROJECT_DIR is the project root.
 
-Runtime context:
-- Your agent ID, role, and project directory are shown below this preamble.
-- SWARM_AGENT_ID, SWARM_SOCKET, and SWARM_PROJECT_DIR are set for this process.
-- SWARM_RUN_ID is set when the agent belongs to a tracked run.
-- Run project work from the shown project directory. Use `swarm status` if you need to confirm your identity or runtime details.
+Workflow:
+- Reply via `swarm send parent \"message\"`.
+- Check messages with `swarm inbox --all` or `swarm watch --all`.
+- Pause and hand off with `swarm done \"summary\"`.
+- Run `swarm --help` or `swarm <command> --help` when command details matter.
 
-Communication guidelines:
-- Always reply via `swarm send` when the sender asks a question or directly requests a result.
-- If you are the top-level orchestrator, send conclusions, blockers, and questions to the user with `swarm send user \"message\"`. Do not rely on harness stdout as the direct response path.
-- If another agent asked for the work, send conclusions, blockers, and questions back to that calling agent with `swarm send <agent-id> \"message\"`.
-- Use `swarm inbox <agent-id>` to read recent direct messages sent to you by one agent. Use `swarm inbox --all` only when you need all recent direct messages sent to you.
-- When you spawn an agent, put both the task and the report-back path in `--prompt`, for example: `when done, send your conclusion to <your-agent-id> with swarm send <your-agent-id> \"...\"`.
-- Never reply to status broadcasts or FYI progress updates unless they ask for action.
-- Keep swarm messages under 300 words unless the requester explicitly asks for more.
-- Treat every `swarm send` as context-expensive for the recipient: send concise conclusions by default, and move long detail into files, commits, or logs unless the requester asked for the full detail inline.
-- All swarm commands are idempotent and safe to retry.
-- Use `swarm send user \"message\"` when you need to notify the user directly.
-- For long-running work, send brief progress updates to the requestor so they know you are active. Keep updates short - the recipient has a limited context window, and every message you send consumes part of it.
-- Do not send unnecessary messages. If you have nothing meaningful to report, stay silent. Silence is better than noise.
-- Use `swarm brief <agent-id>` first when checking delegated agents. Use `swarm log <agent-id> --search <text>` for targeted follow-up, and `swarm log <agent-id> --raw` only when exact transcript details matter.
-- `swarm peers` shows only your parent, siblings, and descendants. Agents outside your family tree are not visible to you.
-- When your assigned task is complete, call `swarm done \"summary of what you did\"` to signal completion and report back to your parent. Do not stay idle - finish and exit.
-- Prefer structured handovers when finishing: include outcome, deliverable, checks, residual risk, and next action. Keep the summary short and put detail in files or commits when possible.
-- If you spawn child agents, their relationship to you is preserved when you finish. You do not need to clean them up unless they are stuck or no longer useful.
-- Git worktrees (`--worktree` on spawn) give an agent its own branch and file checkout. Use your judgment:
-  - DO use worktrees when multiple agents will edit files in the same compiled project (Rust, Elm, etc.) - the compiler will fail if two agents edit concurrently.
-  - DO NOT use worktrees for read-only tasks: reviewing, critiquing, searching, analyzing. Those agents should see the real source.
-  - DO NOT use worktrees for a single editing agent when no other agent is editing the same codebase.
-  - When in doubt: if the agent's job is to read, no worktree. If it will write and others are also writing, worktree.
-- When you finish work in a worktree, `git add` and `git commit` your changes before calling `swarm done`. Uncommitted work in a worktree is invisible to other agents and the coordinator.
-- Worktrees are NOT automatically cleaned up. Use `swarm cleanup <agent-id>` only after you have reviewed or merged the agent's work.
-- If you are a coordinator and your child agents worked in worktrees, merge their branches into the base branch (usually main) before calling `swarm done`. Use `git merge <branch>` from the main checkout. Resolve conflicts if needed - that is part of your coordination role.";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SwarmEvent {
-    AgentSpawned {
-        agent: AgentRow,
-    },
-    AgentDone {
-        agent_id: String,
-        message: Option<String>,
-    },
-    AgentKilled {
-        agent_id: String,
-    },
-    AgentStatus {
-        agent_id: String,
-        status: String,
-    },
-    AgentOutput {
-        agent_id: String,
-        text: String,
-    },
-    AgentError {
-        agent_id: String,
-        error: String,
-    },
-    MessageRouted {
-        from: String,
-        to: String,
-    },
-    UserNotification {
-        from: String,
-        content: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentView {
-    #[serde(flatten)]
-    pub agent: AgentRow,
-    pub relation: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorktreeInfo {
-    pub branch: String,
-    pub head: String,
-    pub dirty: bool,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DoneReport {
-    pub summary: Option<String>,
-    pub outcome: Option<String>,
-    pub deliverable: Option<String>,
-    pub checks: Option<String>,
-    pub risk: Option<String>,
-    pub next_action: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SpawnOptions<'a> {
-    pub model: Option<&'a str>,
-    pub parent_id: Option<&'a str>,
-    pub comms: &'a str,
-    pub use_worktree: bool,
-    pub run_id: Option<&'a str>,
-    pub user_launched: bool,
-}
-
-impl DoneReport {
-    fn has_content(&self) -> bool {
-        self.summary
-            .as_ref()
-            .or(self.outcome.as_ref())
-            .or(self.deliverable.as_ref())
-            .or(self.checks.as_ref())
-            .or(self.risk.as_ref())
-            .or(self.next_action.as_ref())
-            .is_some()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BriefLogEntry {
-    pub timestamp: String,
-    pub kind: String,
-    pub peer: String,
-    pub content_chars: usize,
-    pub preview: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentBrief {
-    pub id: String,
-    pub role: String,
-    pub harness: String,
-    pub model: String,
-    pub status: String,
-    pub parent_id: Option<String>,
-    pub created_at: String,
-    pub ended_at: Option<String>,
-    pub worktree_branch: Option<String>,
-    pub prompt_chars: usize,
-    pub latest_handover: Option<HandoverRow>,
-    pub recent_log: Vec<BriefLogEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentBriefSummary {
-    pub id: String,
-    pub role: String,
-    pub harness: String,
-    pub status: String,
-    pub parent_id: Option<String>,
-    pub created_at: String,
-    pub ended_at: Option<String>,
-    pub worktree_branch: Option<String>,
-    pub prompt_chars: usize,
-    pub latest_handover: Option<HandoverRow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunBrief {
-    pub stats: DbStats,
-    pub agents: Vec<AgentBriefSummary>,
-    pub recent_handovers: Vec<HandoverRow>,
-}
+Keep swarm messages concise. Send progress only when useful.";
 
 enum WorkerCmd {
     NewMessage,
@@ -225,12 +46,12 @@ struct WorkerConfig {
     db: Arc<Db>,
     harness: Arc<dyn Harness>,
     agent_id: String,
-    agent_role: String,
+    topic_label: String,
+    parent_id: String,
     model: Option<String>,
     topic_dir: PathBuf,
     project_dir: PathBuf,
     swarm_addr: String,
-    run_id: Option<String>,
     event_tx: broadcast::Sender<SwarmEvent>,
     resume_conversation: bool,
 }
@@ -283,8 +104,8 @@ impl Orchestrator {
             .map_err(|_| SwarmError::Internal("worker registry mutex poisoned".to_string()))
     }
 
-    fn active_status(status: &str) -> bool {
-        status != "done"
+    fn active_status(status: TopicStatus) -> bool {
+        status.is_active()
     }
 
     fn brief_log_entry(entry: LogEntry) -> BriefLogEntry {
@@ -329,8 +150,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn validate_role(role: &str) -> Result<()> {
-        Self::validate_identifier("role", role)
+    fn validate_label(label: &str) -> Result<()> {
+        Self::validate_identifier("label", label)
     }
 
     fn validate_agent_id(agent_id: &str) -> Result<()> {
@@ -341,7 +162,7 @@ impl Orchestrator {
         let workers = self.workers()?;
         if let Some(worker) = workers.get(agent_id) {
             worker.cmd_tx.send(cmd).map_err(|_| {
-                SwarmError::Internal(format!("agent worker is stopped: {agent_id}"))
+                SwarmError::Internal(format!("topic worker is stopped: {agent_id}"))
             })?;
             Ok(true)
         } else {
@@ -382,9 +203,9 @@ impl Orchestrator {
             .map_err(|e| SwarmError::Internal(format!("{context} task failed: {e}")))?
     }
 
-    async fn update_status_if_active_async(db: Arc<Db>, agent_id: String, status: String) {
+    async fn update_status_if_active_async(db: Arc<Db>, agent_id: String, status: TopicStatus) {
         if let Err(e) = Self::blocking_db("update agent status", move || {
-            db.update_agent_status_if_active(&agent_id, &status)
+            db.update_agent_status_if_active(&agent_id, status)
         })
         .await
         {
@@ -392,9 +213,9 @@ impl Orchestrator {
         }
     }
 
-    async fn update_status_async(db: Arc<Db>, agent_id: String, status: String) {
+    async fn update_status_async(db: Arc<Db>, agent_id: String, status: TopicStatus) {
         if let Err(e) = Self::blocking_db("update agent status", move || {
-            db.update_agent_status(&agent_id, &status)
+            db.update_agent_status(&agent_id, status)
         })
         .await
         {
@@ -406,19 +227,6 @@ impl Orchestrator {
         if let Err(e) = Self::blocking_db(context, move || db.insert_output_log(&entry)).await {
             tracing::error!("{context}: {e}");
         }
-    }
-
-    fn mark_run_done_if_root(db: &Db, agent: &AgentRow) -> Result<()> {
-        let Some(run_id) = agent.run_id.as_deref() else {
-            return Ok(());
-        };
-        let Some(run) = db.get_run(run_id)? else {
-            return Ok(());
-        };
-        if run.root_agent_id.as_deref() == Some(agent.id.as_str()) {
-            db.update_run_status(run_id, "done")?;
-        }
-        Ok(())
     }
 
     fn start_worker_for_agent(&self, agent: &AgentRow, resume_conversation: bool) -> Result<bool> {
@@ -447,12 +255,12 @@ impl Orchestrator {
                 db: self.db.clone(),
                 harness,
                 agent_id: agent.id.clone(),
-                agent_role: agent.role.clone(),
+                topic_label: agent.label.clone(),
+                parent_id: agent.parent_or_user().to_string(),
                 model,
                 topic_dir,
                 project_dir: agent_project_dir,
                 swarm_addr: self.addr.clone(),
-                run_id: agent.run_id.clone(),
                 event_tx: self.event_tx.clone(),
                 resume_conversation,
             },
@@ -478,7 +286,7 @@ impl Orchestrator {
     }
 
     async fn reactivate_agent_async(&self, agent: &AgentRow) -> Result<()> {
-        if Self::active_status(&agent.status) {
+        if Self::active_status(agent.status) {
             return Ok(());
         }
 
@@ -486,12 +294,12 @@ impl Orchestrator {
         let db = self.db.clone();
         let agent_id = agent.id.clone();
         Self::blocking_db("reactivate agent", move || {
-            db.update_agent_status(&agent_id, "idle")
+            db.update_agent_status(&agent_id, TopicStatus::Idle)
         })
         .await?;
         self.emit_event_async(SwarmEvent::AgentStatus {
             agent_id: agent.id.clone(),
-            status: "idle".to_string(),
+            status: TopicStatus::Idle,
         })
         .await;
         Ok(())
@@ -503,61 +311,6 @@ impl Orchestrator {
 
     pub fn list_all_agents(&self) -> Result<Vec<AgentRow>> {
         self.db.list_all_agents_for_project(&self.project_key)
-    }
-
-    pub fn list_agents_for_run(
-        &self,
-        run_id: Option<&str>,
-        include_inactive: bool,
-    ) -> Result<Vec<AgentRow>> {
-        match run_id {
-            Some(run_id) => {
-                self.db
-                    .list_agents_for_project_run(&self.project_key, run_id, include_inactive)
-            }
-            None if include_inactive => self.list_all_agents(),
-            None => self.list_agents(),
-        }
-    }
-
-    pub fn create_run(&self, task: &str) -> Result<RunRow> {
-        let run = RunRow {
-            id: format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-            project_dir: self.project_key.clone(),
-            task: task.to_string(),
-            root_agent_id: None,
-            status: "active".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            ended_at: None,
-        };
-        self.db.insert_run(&run)?;
-        Ok(run)
-    }
-
-    pub fn update_run_root_agent(&self, run_id: &str, root_agent_id: &str) -> Result<()> {
-        let run = self
-            .db
-            .get_run(run_id)?
-            .filter(|run| run.project_dir == self.project_key)
-            .ok_or_else(|| SwarmError::InvalidRequest(format!("run not found: {run_id}")))?;
-        let _ = run;
-        self.db.update_run_root_agent(run_id, root_agent_id)
-    }
-
-    pub fn update_run_status(&self, run_id: &str, status: &str) -> Result<()> {
-        self.db
-            .get_run(run_id)?
-            .filter(|run| run.project_dir == self.project_key)
-            .ok_or_else(|| SwarmError::InvalidRequest(format!("run not found: {run_id}")))?;
-        self.db.update_run_status(run_id, status)
-    }
-
-    pub fn current_run(&self) -> Result<Option<RunRow>> {
-        self.db.latest_run_for_project(&self.project_key)
-    }
-
-    pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRow>> {
-        self.db.list_runs_for_project(&self.project_key, limit)
     }
 
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>> {
@@ -607,7 +360,7 @@ impl Orchestrator {
         limit: usize,
         query: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
-        self.search_inbox_scoped(target, from_agent, limit, query, None, false, None)
+        self.search_inbox_scoped(target, from_agent, limit, query, false, None)
     }
 
     pub fn search_inbox_scoped(
@@ -616,12 +369,11 @@ impl Orchestrator {
         from_agent: Option<&str>,
         limit: usize,
         query: Option<&str>,
-        run_id: Option<&str>,
         only_new: bool,
         since: Option<&str>,
     ) -> Result<Vec<LogEntry>> {
         let cursor = if only_new {
-            self.db.get_inbox_cursor(target, run_id)?
+            self.db.get_inbox_cursor(target)?
         } else {
             None
         };
@@ -633,13 +385,11 @@ impl Orchestrator {
                 from_agent,
                 limit,
                 query,
-                run_id,
                 since,
             )?;
             if only_new {
                 if let Some(last) = entries.last() {
-                    self.db
-                        .set_inbox_cursor(target, run_id, last.timestamp.as_str())?;
+                    self.db.set_inbox_cursor(target, last.timestamp.as_str())?;
                 }
             }
             return Ok(entries);
@@ -652,8 +402,7 @@ impl Orchestrator {
             .search_agent_inbox(target, from_agent, limit, query, since)?;
         if only_new {
             if let Some(last) = entries.last() {
-                self.db
-                    .set_inbox_cursor(target, run_id, last.timestamp.as_str())?;
+                self.db.set_inbox_cursor(target, last.timestamp.as_str())?;
             }
         }
         Ok(entries)
@@ -678,7 +427,7 @@ impl Orchestrator {
 
         Ok(AgentBrief {
             id: agent.id,
-            role: agent.role,
+            label: agent.label,
             harness: agent.harness,
             model: agent.model,
             status: agent.status,
@@ -692,7 +441,7 @@ impl Orchestrator {
         })
     }
 
-    pub fn run_brief(&self, limit: usize, query: Option<&str>) -> Result<RunBrief> {
+    pub fn swarm_brief(&self, limit: usize, query: Option<&str>) -> Result<SwarmBrief> {
         let mut agents = self.list_all_agents()?;
         agents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
@@ -704,7 +453,7 @@ impl Orchestrator {
                 let haystack = format!(
                     "{} {} {} {} {} {} {}",
                     agent.id,
-                    agent.role,
+                    agent.label,
                     agent.harness,
                     agent.status,
                     agent.parent_id.as_deref().unwrap_or(""),
@@ -725,7 +474,7 @@ impl Orchestrator {
 
             summaries.push(AgentBriefSummary {
                 id: agent.id,
-                role: agent.role,
+                label: agent.label,
                 harness: agent.harness,
                 status: agent.status,
                 parent_id: agent.parent_id,
@@ -740,7 +489,7 @@ impl Orchestrator {
             }
         }
 
-        Ok(RunBrief {
+        Ok(SwarmBrief {
             stats: self.stats()?,
             agents: summaries,
             recent_handovers: self
@@ -784,16 +533,7 @@ impl Orchestrator {
         perspective_id: &str,
         include_inactive: bool,
     ) -> Result<Vec<AgentView>> {
-        self.list_agents_with_perspective_all_for_run(perspective_id, include_inactive, None)
-    }
-
-    pub fn list_agents_with_perspective_all_for_run(
-        &self,
-        perspective_id: &str,
-        include_inactive: bool,
-        run_id: Option<&str>,
-    ) -> Result<Vec<AgentView>> {
-        let all = self.list_agents_for_run(run_id, true)?;
+        let all = self.list_all_agents()?;
         let self_parent: Option<String> = all
             .iter()
             .find(|a| a.id == perspective_id)
@@ -819,7 +559,7 @@ impl Orchestrator {
 
         let views = all
             .into_iter()
-            .filter(|a| include_inactive || Self::active_status(&a.status))
+            .filter(|a| include_inactive || Self::active_status(a.status))
             .filter_map(|a| {
                 let relation = if a.id == perspective_id {
                     "self"
@@ -843,16 +583,16 @@ impl Orchestrator {
         Ok(views)
     }
 
-    pub fn spawn_agent(
+    pub fn start_topic(
         &self,
-        role: &str,
+        label: &str,
         harness_name: &str,
         system_prompt: &str,
         parent_id: Option<&str>,
         comms: &str,
     ) -> Result<AgentRow> {
-        self.spawn_agent_with_model(
-            role,
+        self.start_topic_with_model(
+            label,
             harness_name,
             None,
             system_prompt,
@@ -863,9 +603,9 @@ impl Orchestrator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_agent_with_model(
+    pub fn start_topic_with_model(
         &self,
-        role: &str,
+        label: &str,
         harness_name: &str,
         model: Option<&str>,
         prompt: &str,
@@ -873,33 +613,33 @@ impl Orchestrator {
         comms: &str,
         use_worktree: bool,
     ) -> Result<AgentRow> {
-        let inherited_run_id = match parent_id {
-            Some(parent) => self.get_agent(parent)?.and_then(|agent| agent.run_id),
-            None => None,
+        let comms = CommsMode::from_sql(comms).map_err(SwarmError::InvalidInput)?;
+        let user_launched = match parent_id {
+            Some(USER_TOPIC_ID) | None => true,
+            Some(_) => false,
         };
-        self.spawn_agent_with_options(
-            role,
+        self.start_topic_with_options(
+            label,
             harness_name,
             prompt,
-            SpawnOptions {
+            StartTopicOptions {
                 model,
                 parent_id,
                 comms,
                 use_worktree,
-                run_id: inherited_run_id.as_deref(),
-                user_launched: parent_id.is_none(),
+                user_launched,
             },
         )
     }
 
-    pub fn spawn_agent_with_options(
+    pub fn start_topic_with_options(
         &self,
-        role: &str,
+        label: &str,
         harness_name: &str,
         prompt: &str,
-        options: SpawnOptions<'_>,
+        options: StartTopicOptions<'_>,
     ) -> Result<AgentRow> {
-        Self::validate_role(role)?;
+        Self::validate_label(label)?;
 
         let _harness = self
             .registry
@@ -908,7 +648,7 @@ impl Orchestrator {
 
         let uuid = uuid::Uuid::new_v4().to_string();
         let short_id = &uuid[..8];
-        let id = format!("{role}-{short_id}");
+        let id = format!("{label}-{short_id}");
         Self::validate_agent_id(&id)?;
         let topic_dir = self.data_dir.join("agents").join(&id);
         std::fs::create_dir_all(&topic_dir)?;
@@ -922,21 +662,21 @@ impl Orchestrator {
 
         let now = chrono::Utc::now().to_rfc3339();
         let model_str = options.model.unwrap_or("").to_string();
+        let parent_id = Some(options.parent_id.unwrap_or(USER_TOPIC_ID).to_string());
         let agent = AgentRow {
             id: id.clone(),
-            role: role.to_string(),
+            label: label.to_string(),
             harness: harness_name.to_string(),
             model: model_str.clone(),
-            status: "idle".to_string(),
-            parent_id: options.parent_id.map(String::from),
+            status: TopicStatus::Idle,
+            parent_id,
             system_prompt: prompt.to_string(),
             work_dir: topic_dir.to_string_lossy().to_string(),
-            comms: options.comms.to_string(),
+            comms: options.comms,
             created_at: now,
             ended_at: None,
             worktree_branch,
             project_dir: Some(self.project_dir.to_string_lossy().to_string()),
-            run_id: options.run_id.map(String::from),
             user_launched: options.user_launched,
         };
 
@@ -944,7 +684,7 @@ impl Orchestrator {
             if options.use_worktree {
                 if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
                     tracing::error!(
-                        "failed to clean up worktree after spawn failure: {cleanup_err}"
+                        "failed to clean up worktree after topic start failure: {cleanup_err}"
                     );
                 }
             }
@@ -965,13 +705,13 @@ impl Orchestrator {
             return Err(e);
         }
 
-        self.emit_event(SwarmEvent::AgentSpawned {
+        self.emit_event(SwarmEvent::TopicStarted {
             agent: agent.clone(),
         });
 
         // Auto-send prompt as first message if non-empty
         if !prompt.is_empty() {
-            let from = options.parent_id.unwrap_or("user").to_string();
+            let from = agent.parent_or_user().to_string();
             let msg = MessageRow {
                 id: uuid::Uuid::new_v4().to_string(),
                 from_agent: from.clone(),
@@ -1067,7 +807,7 @@ impl Orchestrator {
             }
 
             if self.registry.get(&agent.harness).is_none() {
-                self.db.update_agent_status(&agent.id, "error")?;
+                self.db.update_agent_status(&agent.id, TopicStatus::Error)?;
                 tracing::error!(
                     "cannot resume agent {}: unknown harness {}",
                     agent.id,
@@ -1147,14 +887,14 @@ impl Orchestrator {
 
     fn event_agent_id(event: &SwarmEvent) -> Option<String> {
         match event {
-            SwarmEvent::AgentSpawned { agent } => Some(agent.id.clone()),
+            SwarmEvent::TopicStarted { agent } => Some(agent.id.clone()),
             SwarmEvent::AgentDone { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentKilled { agent_id } => Some(agent_id.clone()),
             SwarmEvent::AgentStatus { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentOutput { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::AgentError { agent_id, .. } => Some(agent_id.clone()),
             SwarmEvent::MessageRouted { from, to } => {
-                if to == "user" {
+                if to == USER_TOPIC_ID {
                     Some(from.clone())
                 } else {
                     Some(to.clone())
@@ -1166,7 +906,7 @@ impl Orchestrator {
 
     fn event_type(event: &SwarmEvent) -> &'static str {
         match event {
-            SwarmEvent::AgentSpawned { .. } => "agent_spawned",
+            SwarmEvent::TopicStarted { .. } => "topic_started",
             SwarmEvent::AgentDone { .. } => "agent_done",
             SwarmEvent::AgentKilled { .. } => "agent_killed",
             SwarmEvent::AgentStatus { .. } => "agent_status",
@@ -1216,7 +956,7 @@ impl Orchestrator {
     }
 
     pub async fn send_message(&self, from: &str, to: &str, content: &str) -> Result<MessageRow> {
-        if to == "user" {
+        if to == USER_TOPIC_ID {
             let msg = MessageRow {
                 id: uuid::Uuid::new_v4().to_string(),
                 from_agent: from.to_string(),
@@ -1232,6 +972,11 @@ impl Orchestrator {
                 db.enqueue_message(&msg_for_insert)
             })
             .await?;
+            self.emit_event_async(SwarmEvent::MessageRouted {
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+            .await;
             self.emit_event_async(SwarmEvent::UserNotification {
                 from: from.to_string(),
                 content: content.to_string(),
@@ -1249,30 +994,30 @@ impl Orchestrator {
             .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
-        if agent.comms == "parent-only" {
+        if agent.comms == CommsMode::ParentOnly {
             match agent.parent_id.as_deref() {
-                Some(parent) if from == parent || from == "user" || from == "system" => {}
+                Some(parent) if from == parent || from == USER_TOPIC_ID || from == "system" => {}
                 Some(parent) => {
                     return Err(SwarmError::InvalidRequest(format!(
-                        "agent {to} only accepts messages from its parent ({parent})"
+                        "topic {to} only accepts messages from its parent ({parent})"
                     )));
                 }
-                None if from == "user" || from == "system" => {}
+                None if from == USER_TOPIC_ID || from == "system" => {}
                 None => {
                     return Err(SwarmError::InvalidRequest(format!(
-                        "agent {to} has parent-only comms but no parent"
+                        "topic {to} has parent-only comms but no parent"
                     )));
                 }
             }
         }
 
-        if !Self::active_status(&agent.status) {
+        if !Self::active_status(agent.status) {
             self.reactivate_agent_async(&agent).await?;
         }
 
         if !self.has_worker(to)? {
             return Err(SwarmError::Internal(format!(
-                "agent {to} has no running worker"
+                "topic {to} has no running worker"
             )));
         }
 
@@ -1293,7 +1038,7 @@ impl Orchestrator {
         .await?
         {
             return Err(SwarmError::Internal(format!(
-                "agent {to} is not accepting messages"
+                "topic {to} is not accepting messages"
             )));
         }
         self.notify_worker(to, WorkerCmd::NewMessage)?;
@@ -1327,7 +1072,7 @@ impl Orchestrator {
             .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
 
-        if !Self::active_status(&agent.status) {
+        if !Self::active_status(agent.status) {
             return Ok(());
         }
 
@@ -1348,39 +1093,14 @@ impl Orchestrator {
         }
 
         if let Some(msg_content) = report.summary.as_deref() {
-            if let Some(ref parent_id) = agent.parent_id {
-                let msg = MessageRow {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    from_agent: id.to_string(),
-                    to_agent: parent_id.clone(),
-                    content: msg_content.to_string(),
-                    delivered: false,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                };
-                let db = self.db.clone();
-                Self::blocking_db("enqueue done message", move || db.enqueue_message(&msg)).await?;
-                if let Err(e) = self.notify_worker(parent_id, WorkerCmd::NewMessage) {
-                    tracing::error!("failed to notify parent agent {parent_id}: {e}");
-                }
-                self.emit_event_async(SwarmEvent::MessageRouted {
-                    from: id.to_string(),
-                    to: parent_id.clone(),
-                })
-                .await;
-            }
+            let parent_id = agent.parent_or_user().to_string();
+            self.send_message(id, &parent_id, msg_content).await?;
         }
 
         let db = self.db.clone();
         let agent_id = id.to_string();
         Self::blocking_db("mark agent done", move || {
-            db.update_agent_status(&agent_id, "done")
-        })
-        .await?;
-
-        let db = self.db.clone();
-        let root_agent = agent.clone();
-        Self::blocking_db("mark run done", move || {
-            Self::mark_run_done_if_root(&db, &root_agent)
+            db.update_agent_status(&agent_id, TopicStatus::Paused)
         })
         .await?;
 
@@ -1406,21 +1126,14 @@ impl Orchestrator {
             .await?
             .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(id.to_string()))?;
-        if !Self::active_status(&agent.status) {
+        if !Self::active_status(agent.status) {
             return Ok(());
         }
 
         let db = self.db.clone();
         let agent_id = id.to_string();
         Self::blocking_db("mark agent killed", move || {
-            db.update_agent_status(&agent_id, "done")
-        })
-        .await?;
-
-        let db = self.db.clone();
-        let root_agent = agent.clone();
-        Self::blocking_db("mark run done", move || {
-            Self::mark_run_done_if_root(&db, &root_agent)
+            db.update_agent_status(&agent_id, TopicStatus::Paused)
         })
         .await?;
 
@@ -1447,14 +1160,7 @@ impl Orchestrator {
             let db = self.db.clone();
             let status_agent_id = agent_id.clone();
             Self::blocking_db("mark agent done", move || {
-                let agent = db.get_agent(&status_agent_id)?;
-                db.update_agent_status(&status_agent_id, "done")
-                    .and_then(|_| {
-                        if let Some(agent) = agent.as_ref() {
-                            Self::mark_run_done_if_root(&db, agent)?;
-                        }
-                        Ok(())
-                    })
+                db.update_agent_status(&status_agent_id, TopicStatus::Paused)
             })
             .await?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
@@ -1478,12 +1184,12 @@ impl Orchestrator {
             db,
             harness,
             agent_id,
-            agent_role,
+            topic_label,
+            parent_id,
             model,
             topic_dir,
             project_dir,
             swarm_addr,
-            run_id,
             event_tx,
             resume_conversation,
         } = config;
@@ -1534,15 +1240,11 @@ impl Orchestrator {
                 }
             }
 
-            Self::update_status_if_active_async(
-                db.clone(),
-                agent_id.clone(),
-                "working".to_string(),
-            )
-            .await;
+            Self::update_status_if_active_async(db.clone(), agent_id.clone(), TopicStatus::Working)
+                .await;
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
-                status: "working".to_string(),
+                status: TopicStatus::Working,
             });
 
             let is_first = first_message;
@@ -1554,8 +1256,10 @@ impl Orchestrator {
 
             let prompt = if first_message {
                 first_message = false;
+                let help_hint = HELP_DISCOVERY_HINT;
+                let parent_reply_hint = PARENT_REPLY_HINT;
                 format!(
-                    "{SWARM_PREAMBLE}\n\nYour agent ID: {agent_id}\nYour role: {agent_role}\nProject directory: {}\n\n{}",
+                    "{SWARM_PREAMBLE}\n\n{help_hint}\n{parent_reply_hint}\n\nYour topic ID: {agent_id}\nYour label: {topic_label}\nYour parent: {parent_id}\nProject directory: {}\n\n{}",
                     project_dir.display(), msg_block
                 )
             } else if was_interrupted {
@@ -1575,10 +1279,6 @@ impl Orchestrator {
                 "SWARM_PROJECT_DIR".to_string(),
                 project_dir.to_string_lossy().to_string(),
             );
-            if let Some(run_id) = run_id.as_ref() {
-                env.insert("SWARM_RUN_ID".to_string(), run_id.clone());
-            }
-
             let (tx, mut rx) = mpsc::channel(100);
             let h = harness.clone();
             let td = topic_dir.clone();
@@ -1689,7 +1389,7 @@ impl Orchestrator {
                                 Self::update_status_async(
                                     db.clone(),
                                     agent_id.clone(),
-                                    "done".to_string(),
+                                    TopicStatus::Paused,
                                 )
                                 .await;
                                 return;
@@ -1718,16 +1418,15 @@ impl Orchestrator {
                 continue;
             }
 
-            let next_status = if had_error { "error" } else { "idle" };
-            Self::update_status_if_active_async(
-                db.clone(),
-                agent_id.clone(),
-                next_status.to_string(),
-            )
-            .await;
+            let next_status = if had_error {
+                TopicStatus::Error
+            } else {
+                TopicStatus::Idle
+            };
+            Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status).await;
             let _ = event_tx.send(SwarmEvent::AgentStatus {
                 agent_id: agent_id.clone(),
-                status: next_status.to_string(),
+                status: next_status,
             });
 
             let pending_db = db.clone();
@@ -1743,6 +1442,6 @@ impl Orchestrator {
             }
         }
 
-        Self::update_status_async(db.clone(), agent_id.clone(), "done".to_string()).await;
+        Self::update_status_async(db.clone(), agent_id.clone(), TopicStatus::Paused).await;
     }
 }

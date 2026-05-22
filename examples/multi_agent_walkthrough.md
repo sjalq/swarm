@@ -1,50 +1,50 @@
-# Multi-Agent Walkthrough: Feature Implementation with Review
+# Multi-Topic Walkthrough: Feature Implementation with Review
 
-This example walks through a realistic workflow: a Claude coordinator spawns two
-Codex agents in worktrees to implement and review a feature, then merges the results.
+This example walks through a realistic workflow: a Claude coordinator starts two
+Codex topics to implement and review a feature, then merges the results.
 
 ## Scenario
 
-You want to add a `/health` endpoint to a web service. One agent writes the code,
-another reviews it. A Claude coordinator orchestrates the whole thing.
+You want to add a `/health` endpoint to a web service. One topic writes the code,
+another reviews it. A Claude coordinator topic orchestrates the whole thing.
 
-## Step 1: Start the orchestrator
+## Step 1: Start the coordinator topic
 
 ```bash
 swarm run \
   --project-dir ./my-project \
   --harness claude \
-  --role coordinator \
-  --prompt "Add a /health endpoint. Spawn one codex agent to implement it in a worktree, and another codex agent to review the implementation once it is done. Merge both branches when finished."
+  --label coordinator \
+  "Add a /health endpoint. Start one codex topic to implement it in a worktree, and another codex topic to review the implementation once it is done. Merge both branches when finished."
 ```
 
-This starts the swarm orchestrator on port 9800, creates the `.swarm/` directory,
-and launches a Claude agent as the coordinator.
+This starts the daemon on port 9800 if needed, creates the `.swarm/` directory,
+and starts a Claude coordinator topic.
 
 ## Step 2: What the coordinator does
 
 The coordinator receives the prompt and autonomously:
 
-### Spawns the implementation agent
+### Starts the implementation topic
 
 ```bash
-swarm spawn \
-  --role implementer \
+swarm run \
+  --label implementer \
   --harness codex \
   --worktree \
-  --prompt "Add a GET /health endpoint to src/server.rs that returns 200 OK with a JSON body {\"status\": \"healthy\"}. Write a test for it. Commit your changes when done."
+  "Add a GET /health endpoint to src/server.rs that returns 200 OK with a JSON body {\"status\": \"healthy\"}. Write a test for it. Commit your changes when done."
 ```
 
-The `--worktree` flag gives this agent its own git branch
-(`swarm/implementer-<id>`) so it can edit files without conflicting with other agents.
+The `--worktree` flag gives this topic its own git branch
+(`swarm/implementer-<id>`) so it can edit files without conflicting with other topics.
 
-### Spawns the review agent (no worktree, read-only)
+### Starts the review topic (no worktree, read-only)
 
 ```bash
-swarm spawn \
-  --role reviewer \
+swarm run \
+  --label reviewer \
   --harness codex \
-  --prompt "Wait for a message from the coordinator with a branch name. Then review the code changes on that branch. Check for correctness, error handling, and test coverage. Send your review back to the coordinator."
+  "Wait for a message from the coordinator with a branch name. Then review the code changes on that branch. Check for correctness, error handling, and test coverage. Send your review back to the coordinator."
 ```
 
 No `--worktree` here since the reviewer only reads code; it does not need an
@@ -52,7 +52,7 @@ isolated checkout.
 
 ## Step 3: Implementation
 
-The implementer agent works in its worktree:
+The implementer topic works in its worktree:
 
 1. Edits `src/server.rs` to add the `/health` route.
 2. Adds a test in `tests/health_test.rs`.
@@ -70,7 +70,7 @@ The coordinator sends the branch info to the reviewer:
 swarm send reviewer-def456 "Please review branch swarm/implementer-abc123. Check the /health endpoint implementation and tests."
 ```
 
-The reviewer:
+The reviewer topic:
 
 1. Runs `git log main..swarm/implementer-abc123` and `git diff main...swarm/implementer-abc123`.
 2. Reads the changed files.
@@ -99,11 +99,11 @@ swarm done "Feature complete: /health endpoint implemented, reviewed, and merged
 
 ## Monitoring the swarm
 
-While agents are working, you can check on them from any terminal that can reach
+While topics are working, you can check on them from any terminal that can reach
 the swarm socket:
 
 ```bash
-# List all agents and their status
+# List all topics and their status
 swarm peers
 
 # Check what the implementer is doing
@@ -121,11 +121,11 @@ swarm status
 
 ## Key takeaways
 
-- Use `--worktree` when agents will edit files, skip it for read-only tasks.
-- Agents communicate via `swarm send` and receive messages through their harness.
-- The coordinator is just another agent; it orchestrates by sending messages and
-  spawning children.
+- Use `--worktree` when topics will edit files, skip it for read-only tasks.
+- Topics communicate via `swarm send` and receive messages through their harness.
+- The coordinator is just another topic; it orchestrates by sending messages and
+  starting child topics with `swarm run`.
 - Always commit changes in a worktree before calling `swarm done`, otherwise the
-  work is invisible to other agents.
+  work is invisible to other topics.
 - Use `swarm cleanup <id>` after merging a worktree branch to remove the temporary
   checkout.

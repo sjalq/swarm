@@ -104,7 +104,7 @@ impl SortState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Agent {
     pub id: String,
-    pub role: String,
+    pub label: String,
     pub harness: String,
     pub model: String,
     pub status: String,
@@ -116,7 +116,6 @@ pub struct Agent {
     pub ended_at: Option<String>,
     pub worktree_branch: Option<String>,
     pub project_dir: Option<String>,
-    pub run_id: Option<String>,
     #[serde(default)]
     pub user_launched: bool,
 }
@@ -197,7 +196,7 @@ pub struct Stats {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SwarmEvent {
-    AgentSpawned {
+    TopicStarted {
         agent: Agent,
     },
     AgentDone {
@@ -334,7 +333,7 @@ pub fn apply_event(
     let now = chrono::Utc::now().to_rfc3339();
 
     match event {
-        SwarmEvent::AgentSpawned { agent } => {
+        SwarmEvent::TopicStarted { agent } => {
             if !agents.iter().any(|a| a.id == agent.id) {
                 agents.push(agent.clone());
             }

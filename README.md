@@ -1,6 +1,6 @@
 # swarm
 
-A multi-agent CLI orchestrator that coordinates LLM coding assistants working together on your codebase.
+A topic-stream CLI for coordinating LLM coding assistants across harnesses.
 
 <!-- Badges -->
 [![CI](https://github.com/sjalq/swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/sjalq/swarm/actions/workflows/ci.yml)
@@ -9,12 +9,12 @@ A multi-agent CLI orchestrator that coordinates LLM coding assistants working to
 
 ## Overview
 
-Swarm lets you run multiple AI coding agents in parallel on the same project. A coordinator agent can spawn children, assign them tasks, communicate via messages, and merge their work. Each agent runs in its own process backed by a real LLM CLI (Claude, Codex, Gemini, or Grok), and swarm handles the orchestration: process lifecycle, message routing, git worktree isolation, and persistent state.
+Swarm lets you run multiple durable topic streams on the same project. A topic has an ID, label, mailbox, log, parent, and optional child topics. A worker process backed by a real LLM CLI (Claude, Codex, Gemini, or Grok) advances that topic when messages arrive, and the topic can be resumed later.
 
 Use cases:
 
-- Split a large feature across multiple agents working in parallel worktrees.
-- Have one agent implement and another review, with the coordinator merging results.
+- Split a large feature across multiple topics working in parallel worktrees.
+- Have one topic implement and another review, with the coordinator merging results.
 - Run a heterogeneous swarm (Claude for planning, Codex for implementation, Gemini for testing).
 - Automate multi-step workflows that would be tedious to drive by hand.
 
@@ -24,14 +24,14 @@ Use cases:
 # Install
 curl -fsSL https://raw.githubusercontent.com/sjalq/swarm/main/install.sh | bash
 
-# Start a swarm with a Claude coordinator
-swarm run --harness claude --prompt "Refactor the auth module into smaller files."
+# Start a topic with Claude
+swarm run --harness claude "Refactor the auth module into smaller files."
 
-# In another terminal, check on agents
+# In another terminal, check on topics
 swarm peers
 
 # View a compact digest before opening raw logs
-swarm brief <agent-id>
+swarm brief <topic-id>
 ```
 
 ## Install
@@ -99,13 +99,13 @@ Swarm also includes an `echo` harness for testing that mirrors prompts back with
 # Default server port
 # port = 9800
 
-# Default harness for the root agent
+# Default harness for new topics
 # default_harness = "claude"
 
 # Default communication mode: "mesh" or "parent-only"
 # default_comms = "mesh"
 
-# Agent timeout in milliseconds (default: 6 hours)
+# Topic worker timeout in milliseconds (default: 6 hours)
 # agent_timeout_ms = 21600000
 
 # Harness binary overrides
@@ -127,8 +127,8 @@ Swarm also includes an `echo` harness for testing that mirrors prompts back with
 ```
 Variable            | Description
 --------------------|------------------------------------------------------------
-SWARM_SOCKET        | WebSocket URL for agent-to-orchestrator communication
-SWARM_AGENT_ID      | Current agent's unique identifier (set automatically)
+SWARM_SOCKET        | HTTP URL for topic-to-daemon communication
+SWARM_AGENT_ID      | Current topic identifier (set automatically)
 SWARM_PROJECT_DIR   | Project root directory (set automatically)
 SWARM_CLAUDE_BIN    | Override the Claude CLI binary path
 SWARM_CODEX_BIN     | Override the Codex CLI binary path
@@ -143,11 +143,11 @@ Swarm stores all runtime data under `.swarm/` in the project directory:
 
 ```
 .swarm/
-  swarm.db          SQLite database (agent state, messages, logs)
-  agents/           Per-agent working directories
-    <agent-id>/     Agent's home (env file, harness config)
-  worktrees/        Git worktrees for isolated agent branches
-    <agent-id>/     Separate checkout on branch swarm/<agent-id>
+  swarm.db          SQLite database (topic state, messages, logs)
+  agents/           Per-topic working directories (legacy path name)
+    <topic-id>/     Topic home (env file, harness config)
+  worktrees/        Git worktrees for isolated topic branches
+    <topic-id>/     Separate checkout on branch swarm/<topic-id>
 ```
 
 On first run, swarm automatically appends `.swarm/` to the project's `.gitignore` if it is not already present. To suppress this behavior, pass `--no-gitignore` to `swarm run`.
@@ -156,28 +156,30 @@ On first run, swarm automatically appends `.swarm/` to the project's `.gitignore
 
 ### `swarm run`
 
-Start the orchestrator and root agent, or start a tracked task run with a coordinator and optional teammates.
+Start a topic in the current context. Outside swarm the parent is `user`; inside swarm the parent is the current topic.
 
 ```bash
-swarm run [OPTIONS]
-swarm run "Investigate the failing checkout flow" --team claude,codex,grok
-swarm run "Summarize this repo" --team reviewer:claude,scanner:codex --detach
+swarm run "Investigate the failing checkout flow"
+swarm run --label reviewer --harness codex "Review the current branch"
+swarm run --label editor --harness codex --worktree "Implement the parser cleanup"
 ```
 
 Options:
 - `--project-dir <PATH>` : Project directory (default: `.`)
 - `--port <PORT>` : Server port (default: `9800`)
-- `--harness <NAME>` : Harness for the root agent (default: `echo`)
-- `--prompt <TEXT>` : Initial prompt for the root agent
-- `--role <NAME>` : Role name for the root agent (default: `coordinator`)
-- `--team <HARNESS>` / `--teammates <HARNESS>` : Teammates for a task run, comma-separated or repeated. Use `role:harness` to name a teammate.
-- `--detach` : Start a tracked run and return immediately instead of watching direct responses.
+- `--harness <NAME>` : Harness for the topic worker (default: `echo`)
+- `--prompt <TEXT>` : Extra prompt text, or the task text when no positional task is provided
+- `--label <NAME>` : Readable label for the topic (default: `coordinator`)
+- `--comms <MODE>` : Communication mode: `mesh` or `parent-only` (default: `mesh`)
+- `--model <MODEL>` : Model override supported by the selected harness CLI.
+- `--worktree` : Give the topic its own git worktree (isolated branch)
+- `--detach` : Return immediately instead of watching direct messages to the parent.
 
-When a task argument or `--team` is present, `swarm run` creates a run record in SQLite, starts the daemon if needed, spawns a coordinator, spawns any teammates, and gives them prompts that include the report-back protocol.
+`swarm run` starts the daemon if needed, starts one topic, and sends the task to it.
 
 ### `swarm serve`
 
-Start only the daemon/API server without spawning an agent.
+Start only the daemon/API server without starting a topic.
 
 ```bash
 swarm serve [OPTIONS]
@@ -185,71 +187,54 @@ swarm serve [OPTIONS]
 
 ### `swarm peers`
 
-List all agents in the swarm visible to you (parent, siblings, descendants).
+List topic streams visible to you (parent, siblings, descendants).
 
 ```bash
-swarm peers [--all] [--run current]
-swarm peers --all-runs --all
+swarm peers [--all]
 ```
 
-- `--all` : Include done agents.
-- `--run <RUN_ID|current>` : Show one run. Inside an agent, `current` resolves to `SWARM_RUN_ID`; outside an agent, it resolves to the latest run.
-- `--all-runs` : Include agents from every run in the current project.
+- `--all` : Include paused/done topics.
 
 ### `swarm send`
 
-Send a message to another agent.
+Send a message to another topic stream, the current parent, or the user.
 
 ```bash
-swarm send <AGENT_ID> "<MESSAGE>"
+swarm send <TOPIC_ID> "<MESSAGE>"
+swarm send parent "<MESSAGE>"
 swarm send user "<MESSAGE>"
 ```
 
+Inside a topic, `parent` means the user or topic stream that started the current topic.
+
 ### `swarm inbox`
 
-Read direct messages sent to the user/calling agent from one source agent. Outside an agent, the default recipient is `user`; inside an agent, the default recipient is `SWARM_AGENT_ID`.
+Read direct messages sent to the user/current topic from one source topic. Outside swarm, the default recipient is `user`; inside a topic, the default recipient is `SWARM_AGENT_ID`.
 
 ```bash
-swarm inbox <FROM_AGENT_ID> [-n <COUNT>]
-swarm inbox <FROM_AGENT_ID> --to user
-swarm inbox --all [-n <COUNT>] [--run current]
+swarm inbox <FROM_TOPIC_ID> [-n <COUNT>]
+swarm inbox <FROM_TOPIC_ID> --to user
+swarm inbox --all [-n <COUNT>]
 swarm inbox --new --all
 ```
 
 Inbox output shows full direct message bodies by default. Use `--truncate <COUNT>` if you want a shorter terminal view.
 
-- `--new` : Read only messages newer than the saved SQLite cursor for this recipient/run.
+- `--new` : Read only messages newer than the saved SQLite cursor for this recipient.
 - `--since <TIMESTAMP>` : Read messages after an RFC3339 timestamp.
-- `--run <RUN_ID|current>` : Scope user inbox reads to a run. Use `--all-runs` to inspect everything.
 
 ### `swarm watch`
 
-Poll and print new direct responses sent to the user/current agent.
+Poll and print new direct responses sent to the user/current topic.
 
 ```bash
-swarm watch --all --run current
-swarm watch <FROM_AGENT_ID> --to user --run <RUN_ID>
+swarm watch --all
+swarm watch <FROM_TOPIC_ID> --to user
 ```
-
-### `swarm spawn`
-
-Create a new child agent.
-
-```bash
-swarm spawn --role <NAME> --harness <HARNESS> [OPTIONS]
-```
-
-Options:
-- `--role <NAME>` : Agent role name (required)
-- `--harness <NAME>` : Harness to use (default: `echo`)
-- `--prompt <TEXT>` : Task prompt for the agent. Include how it should report back, such as `swarm send <your-agent-id> "...summary..."`.
-- `--comms <MODE>` : Communication mode: `mesh` or `parent-only` (default: `mesh`)
-- `--model <MODEL>` : Model override supported by the selected harness CLI.
-- `--worktree` : Give the agent its own git worktree (isolated branch)
 
 ### `swarm status`
 
-Show your own agent's status, including model and harness info.
+Show the current topic's status, including model and harness info.
 
 ```bash
 swarm status
@@ -265,16 +250,16 @@ swarm models
 
 ### `swarm log`
 
-View recent activity for an agent, or inspect the broader user message log.
+View recent activity for a topic, or inspect the broader user message log.
 
 ```bash
-swarm log <AGENT_ID> [-n <COUNT>] [--messages] [--output] [--search <TEXT>] [--raw]
+swarm log <TOPIC_ID> [-n <COUNT>] [--messages] [--output] [--search <TEXT>] [--raw]
 swarm log user --messages
 ```
 
 Options:
 - `-n <COUNT>` / `--tail <COUNT>` : Number of entries to show (default: `20`)
-- `--messages` : Show only messages (sent and received). Use `swarm inbox <FROM_AGENT_ID>` when you only want messages sent to you from one agent.
+- `--messages` : Show only messages (sent and received). Use `swarm inbox <FROM_TOPIC_ID>` when you only want messages sent to you from one topic.
 - `--output` : Show only harness output
 - `--search <TEXT>` : Search log content case-insensitively before applying the limit
 - `--raw` : Disable text truncation and show exact full log entries
@@ -285,19 +270,19 @@ Options:
 Show a compact digest that is safe to use as working context before reaching for raw logs.
 
 ```bash
-swarm brief                 # run-level summary
-swarm brief <AGENT_ID>      # one agent summary and compact recent log
-swarm brief <AGENT_ID> --search "timeout"
+swarm brief                 # project/topic overview
+swarm brief <TOPIC_ID>      # one topic summary and compact recent log
+swarm brief <TOPIC_ID> --search "timeout"
 ```
 
 Brief output includes status, prompt size, latest structured handover, and short log previews. Use `swarm log --raw` when you need the exact transcript.
 
 ### `swarm cleanup`
 
-Remove a finished agent's worktree.
+Remove a finished topic's worktree.
 
 ```bash
-swarm cleanup <AGENT_ID> [--delete-branch]
+swarm cleanup <TOPIC_ID> [--delete-branch]
 ```
 
 - `--delete-branch` : Also delete the git branch.
@@ -316,14 +301,14 @@ swarm done "Implemented auth" \
   --next-action "review and merge"
 ```
 
-The optional structured fields are stored separately from the raw transcript and appear in `swarm brief`, keeping handoffs concise for coordinators and follow-on agents.
+The optional structured fields are stored separately from the raw transcript and appear in `swarm brief`, keeping handoffs concise for coordinators and follow-on topics.
 
 ### `swarm kill`
 
-Stop an agent and mark it done.
+Stop a topic and mark it paused/done.
 
 ```bash
-swarm kill <AGENT_ID>
+swarm kill <TOPIC_ID>
 ```
 
 ### `swarm doctor`
@@ -360,19 +345,19 @@ swarm manpage > swarm.1
 
 ## Worktrees
 
-When you pass `--worktree` to `swarm spawn`, the agent gets its own git branch and file checkout under `.swarm/worktrees/<agent-id>/`. This prevents file conflicts when multiple agents edit the same project concurrently.
+When you pass `--worktree` to `swarm run`, the topic gets its own git branch and file checkout under `.swarm/worktrees/<topic-id>/`. This prevents file conflicts when multiple topics edit the same project concurrently.
 
 **When to use worktrees:**
 
-- Multiple agents editing files in the same compiled project (Rust, TypeScript, etc.) where concurrent edits would break the build.
+- Multiple topics editing files in the same compiled project (Rust, TypeScript, etc.) where concurrent edits would break the build.
 - Parallel feature branches that will be merged by the coordinator.
 
 **When not to use worktrees:**
 
-- Read-only tasks: reviewing, searching, analyzing code. These agents should see the real source tree.
-- A single editing agent when no other agent is modifying the same files.
+- Read-only tasks: reviewing, searching, analyzing code. These topics should see the real source tree.
+- A single editing topic when no other topic is modifying the same files.
 
-**Important:** Agents must `git add` and `git commit` their changes before calling `swarm done`. Uncommitted work in a worktree is invisible to other agents and the coordinator. After merging a worktree branch, clean it up with `swarm cleanup <id>`.
+**Important:** Topics must `git add` and `git commit` their changes before calling `swarm done`. Uncommitted work in a worktree is invisible to other topics and the coordinator. After merging a worktree branch, clean it up with `swarm cleanup <id>`.
 
 ## Troubleshooting
 
@@ -386,33 +371,33 @@ swarm run --port 9801 --harness claude --prompt "..."
 
 ### Missing harness CLI
 
-If swarm reports "failed to spawn claude", the harness binary is not on your PATH. Install it (see the Harnesses table above) or set the override env var:
+If swarm reports "failed to start claude", the harness binary is not on your PATH. Install it (see the Harnesses table above) or set the override env var:
 
 ```bash
 export SWARM_CLAUDE_BIN=/path/to/claude
 ```
 
-### Stuck agent
+### Stuck Topic
 
-Check the agent's log for errors:
+Check the topic's log for errors:
 
 ```bash
-swarm log <agent-id> --output
+swarm log <topic-id> --output
 ```
 
-If an agent is unresponsive, kill it:
+If a topic is unresponsive, kill it:
 
 ```bash
-swarm kill <agent-id>
+swarm kill <topic-id>
 ```
 
 ### Done worktree cleanup
 
-If worktrees are left behind after agents finish, clean them up:
+If worktrees are left behind after topics finish, clean them up:
 
 ```bash
-swarm peers --all                          # find the agent ID
-swarm cleanup <agent-id> --delete-branch   # remove worktree + branch
+swarm peers --all                          # find the topic ID
+swarm cleanup <topic-id> --delete-branch   # remove worktree + branch
 ```
 
 ### Debug logging
@@ -447,8 +432,8 @@ cargo clippy -- -D warnings
 src/
   main.rs          CLI entry point, subcommand dispatch
   lib.rs           Public module re-exports
-  orchestrator.rs  Agent lifecycle, message routing, WebSocket server
-  server.rs        HTTP/WebSocket server setup
+  orchestrator.rs  Topic lifecycle and message routing
+  server.rs        HTTP API and dashboard server setup
   harness.rs       Harness trait + CLI harness implementations
   db.rs            SQLite persistence layer
   error.rs         Error types

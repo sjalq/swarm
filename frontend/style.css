@@ -340,7 +340,7 @@ html, body {
     min-width: 0;
 }
 
-.agent-role {
+.agent-label {
     font-family: var(--font-mono);
     font-size: 13px;
     font-weight: 600;
