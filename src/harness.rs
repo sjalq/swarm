@@ -58,7 +58,9 @@ impl Harness for EchoHarness {
             };
             let client = reqwest::Client::new();
             for (sender, content) in messages {
-                let response = format!("(echo) {}", echo_payload(&content));
+                let Some(response) = echo_response(&content) else {
+                    continue;
+                };
                 let resp = client
                     .post(format!("{socket}/api/messages"))
                     .json(&serde_json::json!({
@@ -112,6 +114,15 @@ fn parse_echo_messages(prompt: &str) -> Vec<(String, String)> {
     }
 
     messages
+}
+
+fn echo_response(message: &str) -> Option<String> {
+    let payload = echo_payload(message);
+    if payload.starts_with("(echo)") {
+        None
+    } else {
+        Some(format!("(echo) {payload}"))
+    }
 }
 
 fn echo_payload(message: &str) -> &str {
@@ -203,7 +214,7 @@ impl CliKind {
     ) -> Vec<String> {
         match self {
             Self::Claude => {
-                let mut args = vec!["-p".into(), prompt.into()];
+                let mut args = vec!["-p".into()];
                 if continue_conversation {
                     args.push("-c".into());
                 }
@@ -216,10 +227,12 @@ impl CliKind {
                     "--verbose".into(),
                     "--dangerously-skip-permissions".into(),
                 ]);
+                args.push("--".into());
+                args.push(prompt.into());
                 args
             }
             Self::Gemini => {
-                let mut args = vec!["-p".into(), prompt.into()];
+                let mut args = vec![format!("--prompt={prompt}")];
                 if continue_conversation {
                     args.extend_from_slice(&["--resume".into(), "latest".into()]);
                 }
@@ -265,7 +278,7 @@ impl CliKind {
                 args
             }
             Self::Grok => {
-                let mut args = vec!["-p".into(), prompt.into()];
+                let mut args = vec![format!("--single={prompt}")];
                 if continue_conversation {
                     args.push("-c".into());
                 }
@@ -601,6 +614,12 @@ mod tests {
     }
 
     #[test]
+    fn echo_ignores_echo_responses_to_avoid_bounce_loops() {
+        assert_eq!(echo_response("hello").as_deref(), Some("(echo) hello"));
+        assert_eq!(echo_response("(echo) hello"), None);
+    }
+
+    #[test]
     fn echo_preflight_always_passes() {
         assert!(preflight_check("echo").is_ok());
     }
@@ -622,6 +641,57 @@ mod tests {
     fn cli_kind_all_kinds() {
         let kinds = CliKind::all_kinds();
         assert_eq!(kinds.len(), 4);
+    }
+
+    #[test]
+    fn claude_prompt_starting_with_dash_is_positional() {
+        let args = CliKind::Claude.build_args(
+            "--- INCOMING MESSAGES ---\nhello",
+            None,
+            true,
+            Path::new("/tmp/swarm-test"),
+            &HashMap::new(),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--", "--- INCOMING MESSAGES ---\nhello"]),
+            "Claude prompt should be protected by --; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn gemini_prompt_starting_with_dash_is_attached_to_prompt_flag() {
+        let args = CliKind::Gemini.build_args(
+            "--- INCOMING MESSAGES ---\nhello",
+            None,
+            true,
+            Path::new("/tmp/swarm-test"),
+            &HashMap::new(),
+        );
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--prompt=--- INCOMING MESSAGES ---\nhello"),
+            "Gemini prompt should be attached to --prompt=; args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn grok_prompt_starting_with_dash_is_attached_to_single_flag() {
+        let args = CliKind::Grok.build_args(
+            "--- INCOMING MESSAGES ---\nhello",
+            None,
+            true,
+            Path::new("/tmp/swarm-test"),
+            &HashMap::new(),
+        );
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--single=--- INCOMING MESSAGES ---\nhello"),
+            "Grok prompt should be attached to --single=; args: {args:?}"
+        );
     }
 
     #[test]

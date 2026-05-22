@@ -311,6 +311,49 @@ async fn echo_agent_processes_message() {
 }
 
 #[tokio::test]
+async fn echo_parent_child_messages_do_not_bounce_forever() {
+    let (_dir, orch, _addr) = setup_http_server().await;
+
+    let parent = orch
+        .start_topic("parent", "echo", "", None, "mesh")
+        .unwrap();
+    let child = orch
+        .start_topic("child", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.send_message(&parent.id, &child.id, "one child task")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let parent_log = orch
+        .get_agent_log(&parent.id, 50, LogFilter::Messages)
+        .unwrap();
+    let child_replies = parent_log
+        .iter()
+        .filter(|entry| {
+            entry.kind == "recv"
+                && entry.peer == child.id
+                && entry.content.contains("one child task")
+        })
+        .count();
+    assert_eq!(child_replies, 1, "parent should get one child reply");
+
+    let child_log = orch
+        .get_agent_log(&child.id, 50, LogFilter::Messages)
+        .unwrap();
+    let child_sent = child_log
+        .iter()
+        .filter(|entry| entry.kind == "sent" && entry.peer == parent.id)
+        .count();
+    assert_eq!(
+        child_sent, 1,
+        "child should not echo the parent's echo response back again"
+    );
+}
+
+#[tokio::test]
 async fn agent_status_transitions() {
     let (_dir, orch, _addr) = setup_http_server().await;
 
@@ -387,19 +430,85 @@ async fn parent_only_comms_enforced() {
     let result = orch.send_message(&parent.id, &child.id, "do this").await;
     assert!(result.is_ok());
 
-    // Create a sibling that tries to message the child
+    // Same-parent siblings can coordinate with parent-only topics.
     let sibling = orch
         .start_topic("sibling", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
     let result = orch.send_message(&sibling.id, &child.id, "hey").await;
     assert!(
-        result.is_err(),
-        "sibling should not be able to message parent-only child"
+        result.is_ok(),
+        "sibling should be able to message parent-only child"
     );
 
     // User can always message (special sender)
     let result = orch.send_message("user", &child.id, "override").await;
     assert!(result.is_ok());
+
+    let outsider_parent = orch
+        .start_topic("outsider-parent", "echo", "", None, "mesh")
+        .unwrap();
+    let outsider = orch
+        .start_topic("outsider", "echo", "", Some(&outsider_parent.id), "mesh")
+        .unwrap();
+    let result = orch
+        .send_message(&outsider.id, &child.id, "not family")
+        .await;
+    assert!(
+        result.is_err(),
+        "unrelated topics should not be able to message parent-only child"
+    );
+}
+
+#[tokio::test]
+async fn parent_only_topics_accept_messages_from_direct_children_and_siblings() {
+    let (_dir, orch) = setup();
+
+    let grandparent = orch.start_topic("root", "echo", "", None, "mesh").unwrap();
+    let parent = orch
+        .start_topic(
+            "limited-parent",
+            "echo",
+            "",
+            Some(&grandparent.id),
+            "parent-only",
+        )
+        .unwrap();
+    let child = orch
+        .start_topic("child", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let sibling = orch
+        .start_topic("sibling", "echo", "", Some(&grandparent.id), "mesh")
+        .unwrap();
+    let unrelated_root = orch
+        .start_topic("other-root", "echo", "", None, "mesh")
+        .unwrap();
+    let unrelated = orch
+        .start_topic("unrelated", "echo", "", Some(&unrelated_root.id), "mesh")
+        .unwrap();
+
+    let result = orch
+        .send_message(&child.id, &parent.id, "child report")
+        .await;
+    assert!(
+        result.is_ok(),
+        "direct children must be able to report to parent-only parents"
+    );
+
+    let result = orch
+        .send_message(&sibling.id, &parent.id, "sibling report")
+        .await;
+    assert!(
+        result.is_ok(),
+        "same-parent siblings must be able to message parent-only topics"
+    );
+
+    let result = orch
+        .send_message(&unrelated.id, &parent.id, "unrelated report")
+        .await;
+    assert!(
+        result.is_err(),
+        "parent-only topics should still reject unrelated peers"
+    );
 }
 
 #[tokio::test]
@@ -821,21 +930,18 @@ async fn agent_preamble_is_concise_and_topic_focused() {
         .start_topic("probe", "resume-probe", "inspect preamble", None, "mesh")
         .unwrap();
 
-    let output = wait_for_agent_output(
-        &mut rx,
-        &agent.id,
-        "Use the `swarm` CLI for replies and coordination",
-    )
-    .await;
+    let output = wait_for_agent_output(&mut rx, &agent.id, "Critical delivery rule").await;
     assert!(output.contains(
         "You are a durable swarm topic running inside an inter-harness coordination session"
     ));
-    assert!(output.contains("Runtime:"));
-    assert!(output.contains("Your topic ID, label, parent, and project directory are shown below"));
-    assert!(output.contains("SWARM_AGENT_ID is your topic ID"));
+    assert!(output.contains("Use the `swarm` CLI for all coordination"));
+    assert!(output.contains("Terminal stdout is only process output"));
     assert!(output.contains("`swarm send parent"));
-    assert!(output.contains("swarm <command> --help"));
-    assert!(output.contains("Your parent: user"));
+    assert!(output.contains("swarm watch-inbox"));
+    assert!(output.contains("no separate delegation command exists"));
+    assert!(output.contains("--- SWARM CONTEXT ---"));
+    assert!(output.contains("Parent: user"));
+    assert!(output.contains("--- TASK / INCOMING MESSAGES ---"));
     assert!(output.contains("Keep swarm messages concise"));
 }
 
@@ -2087,6 +2193,11 @@ async fn cleanup_removes_worktree() {
         orch.worktree_dir(&agent.id).unwrap().is_none(),
         "worktree should be gone after cleanup"
     );
+    let agent = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(
+        agent.worktree_branch, None,
+        "cleanup should clear stale worktree metadata"
+    );
 }
 
 #[tokio::test]
@@ -2123,6 +2234,11 @@ async fn cleanup_with_branch_delete() {
     let branch_name = format!("swarm/{}", agent.id);
 
     orch.cleanup_agent(&agent.id, true).unwrap();
+    let agent = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(
+        agent.worktree_branch, None,
+        "cleanup should clear stale worktree metadata"
+    );
 
     // Verify branch is gone too
     let output = std::process::Command::new("git")

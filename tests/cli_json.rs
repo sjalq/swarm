@@ -34,22 +34,45 @@ impl Drop for WatchRun {
     }
 }
 
+struct AutoStartedSwarm {
+    pid: u32,
+}
+
+impl Drop for AutoStartedSwarm {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg(self.pid.to_string()).status();
+    }
+}
+
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
 
-async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let addr = format!("http://127.0.0.1:{port}");
-    let data_dir = dir.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
+async fn wait_for_health(addr: &str) -> serde_json::Value {
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if let Ok(resp) = client.get(format!("{addr}/api/health")).send().await {
+            if resp.status().is_success() {
+                return resp.json().await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("swarm server did not start");
+}
+
+async fn start_serve_process(
+    project_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+) -> SwarmRun {
     let child = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
             "serve",
             "--project-dir",
-            dir.path().to_str().unwrap(),
+            project_dir.to_str().unwrap(),
             "--data-dir",
             data_dir.to_str().unwrap(),
             "--port",
@@ -63,18 +86,17 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
         .expect("failed to start swarm serve");
 
     let run = SwarmRun { child };
-    let client = reqwest::Client::new();
-    let mut server_ready = false;
-    for _ in 0..100 {
-        if let Ok(resp) = client.get(format!("{addr}/api/health")).send().await {
-            if resp.status().is_success() {
-                server_ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(server_ready, "swarm server did not start");
+    wait_for_health(&format!("http://127.0.0.1:{port}")).await;
+    run
+}
+
+async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let addr = format!("http://127.0.0.1:{port}");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let run = start_serve_process(dir.path(), &data_dir, port).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
@@ -104,6 +126,7 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let client = reqwest::Client::new();
     for _ in 0..100 {
         if let Ok(resp) = client.get(format!("{addr}/api/agents")).send().await {
             if resp.status().is_success() {
@@ -172,7 +195,7 @@ fn start_watch_until(args: &[&str], addr: &str, expected: &str) -> WatchRun {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start swarm watch");
+        .expect("failed to start swarm watch-inbox");
 
     let stdout = child.stdout.take().expect("stdout should be piped");
     let expected = expected.to_string();
@@ -202,9 +225,112 @@ fn start_watch_until(args: &[&str], addr: &str, expected: &str) -> WatchRun {
 }
 
 #[tokio::test]
-async fn run_inline_watch_prints_echo_reply() {
+async fn daemon_backed_commands_auto_start_local_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let addr = format!("http://127.0.0.1:{port}");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(dir.path().join(".swarm")).unwrap();
+    std::fs::write(
+        dir.path().join(".swarm/config.toml"),
+        format!("data_dir = '{}'\n", data_dir.display()),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["peers", "--json"])
+        .current_dir(dir.path())
+        .env("SWARM_SOCKET", &addr)
+        .env_remove("SWARM_AGENT_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run swarm peers");
+
+    let health = wait_for_health(&addr).await;
+    let _server = AutoStartedSwarm {
+        pid: health["pid"].as_u64().unwrap() as u32,
+    };
+
+    assert!(
+        output.status.success(),
+        "swarm peers failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+    assert_eq!(
+        health["project_dir"].as_str(),
+        Some(dir.path().canonicalize().unwrap().to_str().unwrap())
+    );
+    assert_eq!(
+        health["data_dir"].as_str(),
+        Some(data_dir.to_str().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn run_reuses_existing_port_without_project_match_error() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server_data_dir = server_dir.path().join("data");
+    std::fs::create_dir_all(&server_data_dir).unwrap();
+    let port = free_port();
+    let addr = format!("http://127.0.0.1:{port}");
+    let _server = start_serve_process(server_dir.path(), &server_data_dir, port).await;
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_data_dir = other_dir.path().join("data");
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args([
+            "run",
+            "--project-dir",
+            other_dir.path().to_str().unwrap(),
+            "--data-dir",
+            other_data_dir.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--harness",
+            "echo",
+            "--label",
+            "cross-project",
+            "--no-gitignore",
+            "use the server already on this port",
+        ])
+        .env_remove("SWARM_SOCKET")
+        .env_remove("SWARM_AGENT_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run swarm topic");
+
+    assert!(
+        output.status.success(),
+        "swarm run should reuse the existing daemon: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("topic: cross-project-"),
+        "stdout was: {stdout}"
+    );
+
+    let agents: Vec<serde_json::Value> = reqwest::get(format!("{addr}/api/agents"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent["label"].as_str() == Some("cross-project")),
+        "topic should be created on the existing daemon; agents were: {agents:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_prints_watch_inbox_hint_and_returns() {
     let (_dir, _run, addr, _agent_id) = start_swarm().await;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_swarm"))
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
             "run",
             "--harness",
@@ -217,53 +343,31 @@ async fn run_inline_watch_prints_echo_reply() {
         .env_remove("SWARM_AGENT_ID")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .expect("failed to run swarm topic");
 
-    let stdout = child.stdout.take().expect("stdout should be piped");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut output = String::new();
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(output);
-                    return;
-                }
-                Ok(_) => {
-                    output.push_str(&line);
-                    if output.contains("(echo) inline watch smoke") {
-                        let _ = tx.send(output);
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    let received = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8)))
-        .await
-        .expect("reader task should not panic");
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let output = received.expect("inline run did not print the echo reply");
-
     assert!(
-        output.contains("(echo) inline watch smoke"),
-        "stdout should include the echoed parent response; stdout was: {output}"
+        output.status.success(),
+        "swarm run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("topic: watch-smoke-"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("watch: swarm watch-inbox user --from watch-smoke-"),
+        "stdout should include watch-inbox hint; stdout was: {stdout}"
     );
 }
 
 #[tokio::test]
-async fn watch_uses_session_local_cursor() {
+async fn watch_inbox_uses_session_local_cursor_and_all_sources_by_default() {
     let (_dir, _run, addr, agent_id) = start_swarm().await;
 
     let watch = start_watch_until(
-        &["watch", "--all", "--json"],
+        &["watch-inbox", "--json"],
         &addr,
         "session local watch smoke",
     );

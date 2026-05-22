@@ -5,8 +5,30 @@ REPO="sjalq/swarm"
 BIN_NAME="swarm"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
-info() { printf '  \033[1;34m>\033[0m %s\n' "$*"; }
-err()  { printf '  \033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() {
+    local fmt="$1"
+    shift || true
+    printf '  \033[1;34m>\033[0m '
+    if [ "$#" -gt 0 ]; then
+        printf "$fmt" "$@"
+    else
+        printf '%s' "$fmt"
+    fi
+    printf '\n'
+}
+
+err() {
+    local fmt="$1"
+    shift || true
+    printf '  \033[1;31merror:\033[0m ' >&2
+    if [ "$#" -gt 0 ]; then
+        printf "$fmt" "$@" >&2
+    else
+        printf '%s' "$fmt" >&2
+    fi
+    printf '\n' >&2
+    exit 1
+}
 
 detect_os() {
     case "$(uname -s)" in
@@ -20,7 +42,7 @@ detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64)       echo "x86_64" ;;
         aarch64|arm64)      echo "aarch64" ;;
-        *)                  err "Unsupported architecture: $(uname -m)" ;;
+        *)                  uname -m ;;
     esac
 }
 
@@ -32,8 +54,12 @@ resolve_target() {
         linux-aarch64)  echo "aarch64-unknown-linux-gnu" ;;
         darwin-x86_64)  echo "x86_64-apple-darwin" ;;
         darwin-aarch64) echo "aarch64-apple-darwin" ;;
-        *)              err "No prebuilt binary for ${os}/${arch}" ;;
+        *)              return 1 ;;
     esac
+}
+
+is_musl_linux() {
+    command -v ldd >/dev/null 2>&1 && ldd /bin/ls 2>&1 | grep -qi musl
 }
 
 resolve_version() {
@@ -45,13 +71,13 @@ resolve_version() {
     info "Fetching latest release version..."
     local api_url="https://api.github.com/repos/${REPO}/releases/latest"
     local response
-    response="$(curl -fsSL "$api_url" 2>/dev/null)" || err "Failed to fetch latest release from GitHub API"
+    response="$(curl -fsSL "$api_url" 2>/dev/null)" || return 1
 
     local version
-    version="$(printf '%s' "$response" | grep '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+    version="$(printf '%s' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 
     if [ -z "$version" ]; then
-        err "Could not determine latest version from GitHub API"
+        return 1
     fi
     echo "$version"
 }
@@ -64,12 +90,92 @@ checksum_cmd() {
     esac
 }
 
+print_path_hint() {
+    local os="$1"
+    local bin_dir="${2:-$BIN_DIR}"
+    local shell_name="${SHELL##*/}"
+    local rc_file
+    local path_line
+
+    case "$shell_name" in
+        zsh)
+            rc_file="$HOME/.zshrc"
+            path_line="export PATH=\"${bin_dir}:\$PATH\""
+            ;;
+        bash)
+            if [ "$os" = "darwin" ]; then
+                rc_file="$HOME/.bash_profile"
+            else
+                rc_file="$HOME/.bashrc"
+            fi
+            path_line="export PATH=\"${bin_dir}:\$PATH\""
+            ;;
+        fish)
+            rc_file="$HOME/.config/fish/config.fish"
+            path_line="fish_add_path \"${bin_dir}\""
+            ;;
+        *)
+            rc_file="your shell startup file"
+            path_line="export PATH=\"${bin_dir}:\$PATH\""
+            ;;
+    esac
+
+    printf '\n'
+    info "WARNING: %s is not in your PATH." "$bin_dir"
+    info "Add this line to %s:" "$rc_file"
+    printf '\n  %s\n\n' "$path_line"
+    info "Then restart your shell, or run the line above in this terminal."
+    printf '\n'
+}
+
+fallback_to_source_install() {
+    local os="$1"
+    local reason="$2"
+
+    info "%s" "$reason"
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "No prebuilt release found and cargo is not installed.\nEither retry after a GitHub release is published, or install Rust/Cargo from https://rustup.rs and run:\n  cargo install --git https://github.com/sjalq/swarm --bin swarm"
+    fi
+
+    info "No prebuilt release found. Falling back to cargo source install (this takes a few minutes)..."
+    cargo install --git https://github.com/sjalq/swarm --bin swarm || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/sjalq/swarm --bin swarm"
+
+    local cargo_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+    local installed_bin="${cargo_bin_dir}/${BIN_NAME}"
+    local installed_version
+
+    if installed_version="$("$installed_bin" --version 2>&1)"; then
+        info "Verified: %s" "$installed_version"
+    elif command -v "$BIN_NAME" >/dev/null 2>&1 && installed_version="$("$BIN_NAME" --version 2>&1)"; then
+        info "Verified: %s" "$installed_version"
+    else
+        err "Source install finished, but the installed swarm binary could not be verified.\nCheck Cargo output and ensure %s is on your PATH." "$cargo_bin_dir"
+    fi
+
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$cargo_bin_dir"; then
+        print_path_hint "$os" "$cargo_bin_dir"
+    fi
+
+    info "Done! Run '${BIN_NAME} --help' to get started."
+    exit 0
+}
+
 main() {
     local os arch target version
     os="$(detect_os)"
     arch="$(detect_arch)"
-    target="$(resolve_target "$os" "$arch")"
-    version="$(resolve_version)"
+
+    if [ "$os" = "linux" ] && is_musl_linux; then
+        fallback_to_source_install "$os" "musl Linux detected, but prebuilt musl binaries are not available yet."
+    fi
+
+    if ! target="$(resolve_target "$os" "$arch")"; then
+        fallback_to_source_install "$os" "No prebuilt binary is available for ${os}/${arch}."
+    fi
+
+    if ! version="$(resolve_version)"; then
+        fallback_to_source_install "$os" "Could not find a published GitHub release."
+    fi
 
     local version_num="${version#v}"
     local archive="${BIN_NAME}-${version_num}-${target}.tar.gz"
@@ -84,16 +190,16 @@ main() {
     trap 'rm -rf "$tmp_dir"' EXIT
 
     info "Downloading ${archive}..."
-    curl -fsSL -o "${tmp_dir}/${archive}" "$archive_url" || err "Download failed: ${archive_url}"
+    curl -fsSL -o "${tmp_dir}/${archive}" "$archive_url" || fallback_to_source_install "$os" "Could not download prebuilt archive: ${archive_url}"
 
     info "Downloading checksums..."
-    curl -fsSL -o "${tmp_dir}/SHA256SUMS" "$checksums_url" || err "Download failed: ${checksums_url}"
+    curl -fsSL -o "${tmp_dir}/SHA256SUMS" "$checksums_url" || fallback_to_source_install "$os" "Could not download release checksums: ${checksums_url}"
 
     info "Verifying checksum..."
     local expected_checksum
-    expected_checksum="$(grep "${archive}" "${tmp_dir}/SHA256SUMS" | awk '{print $1}')"
+    expected_checksum="$(awk -v archive="$archive" '$2 == archive { print $1; exit }' "${tmp_dir}/SHA256SUMS")"
     if [ -z "$expected_checksum" ]; then
-        err "Archive ${archive} not found in SHA256SUMS"
+        fallback_to_source_install "$os" "Release checksums do not include ${archive}."
     fi
 
     local sha_cmd
@@ -102,7 +208,7 @@ main() {
     actual_checksum="$(cd "$tmp_dir" && $sha_cmd "$archive" | awk '{print $1}')"
 
     if [ "$expected_checksum" != "$actual_checksum" ]; then
-        err "Checksum mismatch!\n  expected: ${expected_checksum}\n  actual:   ${actual_checksum}"
+        err "Checksum mismatch!\n  expected: %s\n  actual:   %s" "$expected_checksum" "$actual_checksum"
     fi
     info "Checksum OK"
 
@@ -113,12 +219,16 @@ main() {
 
     info "Installed ${BIN_NAME} to ${BIN_DIR}/${BIN_NAME}"
 
+    info "Verifying installed binary..."
+    local installed_version
+    if installed_version="$("${BIN_DIR}/${BIN_NAME}" --version 2>&1)"; then
+        info "Verified: %s" "$installed_version"
+    else
+        err "Installed binary did not run successfully:\n  %s --version\n%s" "${BIN_DIR}/${BIN_NAME}" "$installed_version"
+    fi
+
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-        printf '\n'
-        info "WARNING: %s is not in your PATH." "$BIN_DIR"
-        info "Add it with:"
-        info "  export PATH=\"%s:\$PATH\"" "$BIN_DIR"
-        printf '\n'
+        print_path_hint "$os" "$BIN_DIR"
     fi
 
     info "Done! Run '${BIN_NAME} --help' to get started."

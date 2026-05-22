@@ -1,6 +1,5 @@
 use crate::db::{Db, EventRow, LogFilter, MessageRow, OutputLogRow};
 use crate::error::{Result, SwarmError};
-use crate::guidance::{HELP_DISCOVERY_HINT, PARENT_REPLY_HINT};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use crate::types::{
     AgentBrief, AgentBriefSummary, AgentRow, AgentView, BriefLogEntry, CommsMode, DbStats,
@@ -16,21 +15,17 @@ use tokio::task::JoinHandle;
 
 const SWARM_PREAMBLE: &str = "\
 You are a durable swarm topic running inside an inter-harness coordination session.
-Use the `swarm` CLI for replies and coordination.
+Use the `swarm` CLI for all coordination.
 
-Runtime:
-- Your topic ID, label, parent, and project directory are shown below.
-- SWARM_AGENT_ID is your topic ID.
-- SWARM_SOCKET is the daemon HTTP URL.
-- SWARM_PROJECT_DIR is the project root.
+Critical delivery rule:
+- Send useful work to your parent with `swarm send parent \"message\"`.
+- Terminal stdout is only process output; it is not a reliable reply to your parent or the user.
+- Use `swarm done \"summary\"` after you have sent the useful result, to pause the topic and hand off status.
+- Do not poll for messages in a wait loop. Incoming messages automatically interrupt and resume this topic with the new messages included.
+- Use `swarm inbox --all` only for an occasional snapshot/debug check; use `swarm watch-inbox` from outside the running topic to monitor traffic.
+- Start child topics with `swarm run --label <label> --harness <harness> \"task\"`; no separate delegation command exists.
 
-Workflow:
-- Reply via `swarm send parent \"message\"`.
-- Check messages with `swarm inbox --all` or `swarm watch --all`.
-- Pause and hand off with `swarm done \"summary\"`.
-- Run `swarm --help` or `swarm <command> --help` when command details matter.
-
-Keep swarm messages concise. Send progress only when useful.";
+Keep swarm messages concise. Send progress only when useful. Run `swarm --help` when command syntax matters.";
 
 enum WorkerCmd {
     NewMessage,
@@ -834,13 +829,18 @@ impl Orchestrator {
         Self::validate_agent_id(agent_id)?;
 
         let worktree_dir = self.data_dir.join("worktrees").join(agent_id);
-        if !worktree_dir.exists() {
-            return Ok(());
-        }
-        if let Some(agent) = self.db.get_agent(agent_id)? {
+        let agent = self.db.get_agent(agent_id)?;
+        if let Some(agent) = agent.as_ref() {
             if agent.project_dir.as_deref() != Some(self.project_key.as_str()) {
                 return Err(SwarmError::AgentNotFound(agent_id.to_string()));
             }
+        }
+
+        if !worktree_dir.exists() {
+            if agent.is_some() {
+                self.db.clear_agent_worktree_branch(agent_id)?;
+            }
+            return Ok(());
         }
 
         let output = std::process::Command::new("git")
@@ -863,9 +863,9 @@ impl Orchestrator {
         }
 
         if delete_branch {
-            let branch_name = self
-                .get_agent(agent_id)?
-                .and_then(|agent| agent.worktree_branch)
+            let branch_name = agent
+                .as_ref()
+                .and_then(|agent| agent.worktree_branch.clone())
                 .unwrap_or_else(|| Self::worktree_branch_name(agent_id));
             let output = std::process::Command::new("git")
                 .args(["branch", "-D", &branch_name])
@@ -881,6 +881,8 @@ impl Orchestrator {
                 )));
             }
         }
+
+        self.db.clear_agent_worktree_branch(agent_id)?;
 
         Ok(())
     }
@@ -994,20 +996,17 @@ impl Orchestrator {
             .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()))
             .ok_or_else(|| SwarmError::AgentNotFound(to.to_string()))?;
 
-        if agent.comms == CommsMode::ParentOnly {
-            match agent.parent_id.as_deref() {
-                Some(parent) if from == parent || from == USER_TOPIC_ID || from == "system" => {}
-                Some(parent) => {
-                    return Err(SwarmError::InvalidRequest(format!(
-                        "topic {to} only accepts messages from its parent ({parent})"
-                    )));
-                }
-                None if from == USER_TOPIC_ID || from == "system" => {}
-                None => {
-                    return Err(SwarmError::InvalidRequest(format!(
-                        "topic {to} has parent-only comms but no parent"
-                    )));
-                }
+        if agent.comms == CommsMode::ParentOnly
+            && !self.is_immediate_family_sender(from, &agent).await?
+        {
+            if let Some(parent) = agent.parent_id.as_deref() {
+                return Err(SwarmError::InvalidRequest(format!(
+                    "topic {to} only accepts messages from user/system, its parent ({parent}), its children, or its siblings"
+                )));
+            } else {
+                return Err(SwarmError::InvalidRequest(format!(
+                    "topic {to} has parent-only comms and only accepts messages from user/system or its children"
+                )));
             }
         }
 
@@ -1050,6 +1049,39 @@ impl Orchestrator {
         .await;
 
         Ok(msg)
+    }
+
+    async fn is_immediate_family_sender(
+        &self,
+        sender_id: &str,
+        recipient: &AgentRow,
+    ) -> Result<bool> {
+        if sender_id == USER_TOPIC_ID || sender_id == "system" {
+            return Ok(true);
+        }
+
+        if recipient.parent_id.as_deref() == Some(sender_id) {
+            return Ok(true);
+        }
+
+        let db = self.db.clone();
+        let sender_id = sender_id.to_string();
+        let project_key = self.project_key.clone();
+        let sender = Self::blocking_db("get message sender", move || db.get_agent(&sender_id))
+            .await?
+            .filter(|agent| agent.project_dir.as_deref() == Some(project_key.as_str()));
+        let Some(sender_parent) = sender.and_then(|agent| agent.parent_id) else {
+            return Ok(false);
+        };
+
+        if sender_parent == recipient.id {
+            return Ok(true);
+        }
+
+        Ok(recipient
+            .parent_id
+            .as_deref()
+            .is_some_and(|recipient_parent| sender_parent == recipient_parent))
     }
 
     pub async fn done_agent(&self, id: &str, message: Option<&str>) -> Result<()> {
@@ -1256,19 +1288,17 @@ impl Orchestrator {
 
             let prompt = if first_message {
                 first_message = false;
-                let help_hint = HELP_DISCOVERY_HINT;
-                let parent_reply_hint = PARENT_REPLY_HINT;
                 format!(
-                    "{SWARM_PREAMBLE}\n\n{help_hint}\n{parent_reply_hint}\n\nYour topic ID: {agent_id}\nYour label: {topic_label}\nYour parent: {parent_id}\nProject directory: {}\n\n{}",
+                    "{SWARM_PREAMBLE}\n\n--- SWARM CONTEXT ---\nTopic ID: {agent_id}\nLabel: {topic_label}\nParent: {parent_id}\nProject directory: {}\n\n--- TASK / INCOMING MESSAGES ---\n{}",
                     project_dir.display(), msg_block
                 )
             } else if was_interrupted {
                 format!(
-                    "[system: your previous response was interrupted by incoming messages]\n\n{}",
+                    "[system: your previous response was interrupted by incoming messages]\n\n--- INCOMING MESSAGES ---\n{}",
                     msg_block
                 )
             } else {
-                msg_block
+                format!("--- INCOMING MESSAGES ---\n{msg_block}")
             };
             was_interrupted = false;
 

@@ -132,6 +132,7 @@ struct HealthResponse {
     protocol: &'static str,
     uptime: u64,
     version: &'static str,
+    pid: u32,
     data_dir: String,
     project_dir: String,
 }
@@ -261,6 +262,7 @@ async fn health(State(orch): State<AppState>) -> impl IntoResponse {
         protocol: SWARM_PROTOCOL_VERSION,
         uptime: orch.uptime_seconds(),
         version: env!("CARGO_PKG_VERSION"),
+        pid: std::process::id(),
         data_dir: orch.data_dir().to_string_lossy().to_string(),
         project_dir: orch.project_dir().to_string_lossy().to_string(),
     })

@@ -21,16 +21,39 @@ Use cases:
 ## Quickstart
 
 ```bash
-# Install
+# Install on Linux or macOS
 curl -fsSL https://raw.githubusercontent.com/sjalq/swarm/main/install.sh | bash
+```
 
-# Start a topic with Claude
+The installer uses a published GitHub release when available; if none exists yet, use the source install method below.
+
+1. Run a no-API smoke test:
+
+```bash
+swarm run --harness echo 'hello'
+```
+
+2. Check your real harness setup:
+
+```bash
+swarm doctor
+```
+
+3. Start a topic with a real harness after installing that harness and signing in:
+
+```bash
 swarm run --harness claude "Refactor the auth module into smaller files."
+```
 
-# In another terminal, check on topics
-swarm peers
+In another terminal, stream direct replies from the printed topic:
 
-# View a compact digest before opening raw logs
+```bash
+swarm watch-inbox user --from <topic-id>
+```
+
+View a compact digest before opening raw logs:
+
+```bash
 swarm brief <topic-id>
 ```
 
@@ -42,29 +65,33 @@ swarm brief <topic-id>
 curl -fsSL https://raw.githubusercontent.com/sjalq/swarm/main/install.sh | bash
 ```
 
+Requires a published GitHub release for the prebuilt path. If none exists yet, use the source install method below; the installer also falls back to that method when `cargo` is available.
+
 Set `SWARM_VERSION=v0.1.0` to pin a specific version. Set `BIN_DIR=~/.local/bin` to change the install location.
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/sjalq/swarm.git
+cargo install --git https://github.com/sjalq/swarm --bin swarm
 ```
 
-### From crates.io
+### From Homebrew (coming soon)
+
+The Homebrew tap is not published yet. This will become the preferred macOS install path after release checksums are wired into the formula.
 
 ```bash
-cargo install swarm-cli
-```
-
-The crate is named `swarm-cli`; the installed binary is `swarm`.
-
-### From Homebrew
-
-```bash
+# Coming soon:
 brew install sjalq/swarm/swarm
 ```
 
-Available once the tap is published.
+### Shell completions
+
+```bash
+mkdir -p ~/.zfunc
+swarm completions zsh >> ~/.zfunc/_swarm
+```
+
+See `swarm completions --help` for other shells.
 
 ## Harnesses
 
@@ -73,10 +100,10 @@ Swarm delegates actual AI work to external CLI tools called harnesses. Each harn
 ```
 Harness  | Install                              | API Key Env Var              | Docs
 ---------|--------------------------------------|------------------------------|-----------------------------------------------
-claude   | npm install -g @anthropic-ai/claude  | ANTHROPIC_API_KEY            | https://docs.anthropic.com/en/docs/claude-code
+claude   | npm install -g @anthropic-ai/claude-code | ANTHROPIC_API_KEY         | https://docs.anthropic.com/en/docs/claude-code
 codex    | npm install -g @openai/codex         | OPENAI_API_KEY               | https://github.com/openai/codex
-gemini   | npm install -g @anthropic-ai/claude  | GEMINI_API_KEY               | https://github.com/google-gemini/gemini-cli
-grok     | npm install -g grok-cli              | XAI_API_KEY                  | https://docs.x.ai/docs/grok-cli
+gemini   | npm install -g @google/gemini-cli    | GEMINI_API_KEY               | https://github.com/google-gemini/gemini-cli
+grok     | npm install -g @xai-official/grok    | XAI_API_KEY                  | https://docs.x.ai/
 ```
 
 Swarm also includes an `echo` harness for testing that mirrors prompts back without calling any API.
@@ -96,8 +123,8 @@ Swarm also includes an `echo` harness for testing that mirrors prompts back with
 ```toml
 # ~/.config/swarm/config.toml
 
-# Default server port
-# port = 9800
+# Default local server port
+# default_port = 9800
 
 # Default harness for new topics
 # default_harness = "claude"
@@ -105,21 +132,15 @@ Swarm also includes an `echo` harness for testing that mirrors prompts back with
 # Default communication mode: "mesh" or "parent-only"
 # default_comms = "mesh"
 
-# Topic worker timeout in milliseconds (default: 6 hours)
-# agent_timeout_ms = 21600000
+# Runtime storage directory. Defaults to the latest active data dir, then
+# the platform data directory (for example ~/Library/Application Support/swarm on macOS).
+# data_dir = "/path/to/swarm-data"
 
 # Harness binary overrides
-# [harness.claude]
-# binary = "/usr/local/bin/claude"
-
-# [harness.codex]
-# binary = "/opt/codex/bin/codex"
-
-# [harness.gemini]
-# binary = "gemini"
-
-# [harness.grok]
-# binary = "grok"
+# claude_bin = "/usr/local/bin/claude"
+# codex_bin = "/opt/codex/bin/codex"
+# gemini_bin = "gemini"
+# grok_bin = "grok"
 ```
 
 ### Environment variables
@@ -127,7 +148,7 @@ Swarm also includes an `echo` harness for testing that mirrors prompts back with
 ```
 Variable            | Description
 --------------------|------------------------------------------------------------
-SWARM_SOCKET        | HTTP URL for topic-to-daemon communication
+SWARM_SOCKET        | HTTP URL for topic-to-daemon communication; local HTTP sockets auto-start when quiet
 SWARM_AGENT_ID      | Current topic identifier (set automatically)
 SWARM_PROJECT_DIR   | Project root directory (set automatically)
 SWARM_CLAUDE_BIN    | Override the Claude CLI binary path
@@ -137,20 +158,24 @@ SWARM_GROK_BIN      | Override the Grok CLI binary path
 RUST_LOG            | Control log verbosity (e.g. RUST_LOG=swarm=debug)
 ```
 
-## Data layout
+## Daemon and data layout
 
-Swarm stores all runtime data under `.swarm/` in the project directory:
+Daemon-backed commands use `SWARM_SOCKET` when it is set. Otherwise they use the configured local port, defaulting to `http://127.0.0.1:9800`. If that local socket is not running, commands such as `run`, `send`, `inbox`, `watch-inbox`, `peers`, `brief`, `log`, `cleanup`, and `kill` start the daemon automatically.
+
+If a daemon is already running on the selected socket, swarm uses it. Running a command from another folder does not make swarm reject the daemon just because its project root differs; the socket is the source of truth unless you explicitly start a separate daemon on another port/socket.
+
+Runtime state lives in the configured data directory:
 
 ```
-.swarm/
+<data-dir>/
   swarm.db          SQLite database (topic state, messages, logs)
-  agents/           Per-topic working directories (legacy path name)
-    <topic-id>/     Topic home (env file, harness config)
+  agents/           Per-topic working directories
+    <topic-id>/     Topic home
   worktrees/        Git worktrees for isolated topic branches
     <topic-id>/     Separate checkout on branch swarm/<topic-id>
 ```
 
-On first run, swarm automatically appends `.swarm/` to the project's `.gitignore` if it is not already present. To suppress this behavior, pass `--no-gitignore` to `swarm run`.
+The data directory comes from `--data-dir`, then project/global `data_dir`, then the latest active data-dir breadcrumb, then the platform data directory. Project-local `.swarm/config.toml` is still used for project config.
 
 ## Command reference
 
@@ -166,16 +191,16 @@ swarm run --label editor --harness codex --worktree "Implement the parser cleanu
 
 Options:
 - `--project-dir <PATH>` : Project directory (default: `.`)
-- `--port <PORT>` : Server port (default: `9800`)
+- `--port <PORT>` : Local server port when `SWARM_SOCKET` is not set (default: `9800`)
 - `--harness <NAME>` : Harness for the topic worker (default: `echo`)
 - `--prompt <TEXT>` : Extra prompt text, or the task text when no positional task is provided
 - `--label <NAME>` : Readable label for the topic (default: `coordinator`)
 - `--comms <MODE>` : Communication mode: `mesh` or `parent-only` (default: `mesh`)
 - `--model <MODEL>` : Model override supported by the selected harness CLI.
 - `--worktree` : Give the topic its own git worktree (isolated branch)
-- `--detach` : Return immediately instead of watching direct messages to the parent.
+- `--detach` : Deprecated compatibility flag; `swarm run` now returns immediately.
 
-`swarm run` starts the daemon if needed, starts one topic, and sends the task to it.
+`swarm run` uses `SWARM_SOCKET` when set, otherwise the configured/default local socket. If that local socket is not running, it starts the daemon, starts one topic, sends the task to it, then prints the topic ID and a `swarm watch-inbox ...` command for replies.
 
 ### `swarm serve`
 
@@ -184,6 +209,8 @@ Start only the daemon/API server without starting a topic.
 ```bash
 swarm serve [OPTIONS]
 ```
+
+Most workflows do not need `swarm serve`; daemon-backed commands auto-start a local server when their socket is quiet. Use `serve` when you want to pin the daemon process yourself, choose a specific project/data directory up front, or run the dashboard/API before issuing topic commands.
 
 ### `swarm peers`
 
@@ -211,6 +238,8 @@ Inside a topic, `parent` means the user or topic stream that started the current
 
 Read direct messages sent to the user/current topic from one source topic. Outside swarm, the default recipient is `user`; inside a topic, the default recipient is `SWARM_AGENT_ID`.
 
+Running topics do not need to poll their inbox to wait for children or peers. New direct messages automatically wake the topic and resume the harness with those messages included. Use `inbox` inside a topic for occasional snapshots or debugging, not as a long-running wait loop.
+
 ```bash
 swarm inbox <FROM_TOPIC_ID> [-n <COUNT>]
 swarm inbox <FROM_TOPIC_ID> --to user
@@ -223,13 +252,14 @@ Inbox output shows full direct message bodies by default. Use `--truncate <COUNT
 - `--new` : Read only messages newer than the saved SQLite cursor for this recipient.
 - `--since <TIMESTAMP>` : Read messages after an RFC3339 timestamp.
 
-### `swarm watch`
+### `swarm watch-inbox`
 
-Poll and print new direct responses sent to the user/current topic.
+Poll and print new direct messages sent to an inbox. Without a topic ID, it watches the current topic inbox inside swarm, or the user inbox outside swarm. By default it shows messages from all senders.
 
 ```bash
-swarm watch --all
-swarm watch <FROM_TOPIC_ID> --to user
+swarm watch-inbox
+swarm watch-inbox user --from <FROM_TOPIC_ID>
+swarm watch-inbox <TOPIC_ID>
 ```
 
 ### `swarm status`
@@ -345,7 +375,7 @@ swarm manpage > swarm.1
 
 ## Worktrees
 
-When you pass `--worktree` to `swarm run`, the topic gets its own git branch and file checkout under `.swarm/worktrees/<topic-id>/`. This prevents file conflicts when multiple topics edit the same project concurrently.
+When you pass `--worktree` to `swarm run`, the topic gets its own git branch and file checkout under `<data-dir>/worktrees/<topic-id>/`. This prevents file conflicts when multiple topics edit the same project concurrently.
 
 **When to use worktrees:**
 
@@ -363,11 +393,13 @@ When you pass `--worktree` to `swarm run`, the topic gets its own git branch and
 
 ### Port conflict
 
-If port 9800 is already in use:
+If port 9800 is already in use by something that is not a swarm daemon:
 
 ```bash
 swarm run --port 9801 --harness claude --prompt "..."
 ```
+
+If it is already a swarm daemon, swarm will reuse it.
 
 ### Missing harness CLI
 

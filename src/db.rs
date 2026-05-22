@@ -532,6 +532,15 @@ impl Db {
         Ok(updated > 0)
     }
 
+    pub fn clear_agent_worktree_branch(&self, id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE agents SET worktree_branch = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_agent(&self, id: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;

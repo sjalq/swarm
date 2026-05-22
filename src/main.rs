@@ -14,36 +14,45 @@ use swarm::orchestrator::{Orchestrator, SwarmEvent};
 use swarm::types::{SWARM_PROTOCOL_VERSION, USER_TOPIC_ID};
 
 const CLI_ENTRY_SEPARATOR: &str = "------------";
+const DEFAULT_SWARM_PORT: u16 = 9800;
 
 #[derive(Parser)]
 #[command(
     name = "swarm",
     about = "Coordinate durable LLM topic streams across harness CLIs",
+    subcommand_help_heading = "Commands (LLM-first)",
     long_about = "Swarm coordinates durable topic streams backed by Claude, Codex, Gemini, Grok, or echo workers.\n\
         A topic stream has an ID, label, parent, mailbox, status, log, and optional child topics.\n\n\
         Mental model:\n  \
-        - `swarm run \"task\"` starts one topic, sends the task as its first direct message, then watches direct replies by default.\n  \
+        - `swarm run \"task\"` starts one topic, sends the task as its first direct message, then prints how to watch replies.\n  \
+        - Commands that need the API use SWARM_SOCKET when set, else http://127.0.0.1:9800; local sockets auto-start when quiet.\n  \
         - Outside swarm, a new topic's parent is `user`; inside swarm, its parent is the current topic.\n  \
         - Topics reply with `swarm send parent \"message\"`; harness stdout is process output, not the message path.\n  \
-        - Pressing Ctrl-C in the default `run` watcher stops only your local watch; the topic and daemon keep running.\n  \
+        - `swarm watch-inbox` streams direct mailbox messages without changing global read state.\n  \
         - Topics can be paused with `swarm done` and resumed by sending them another message.\n\n\
         Common LLM loop:\n  \
         1. `swarm run --label worker --harness codex \"task\"`\n  \
-        2. Keep the default `run` watch open, or use `--detach` and later `swarm watch --all`\n  \
+        2. Use the printed `swarm watch-inbox ...` command to monitor replies\n  \
         3. `swarm brief` before opening full logs\n  \
         4. `swarm log <topic-id> --messages` when exact message history is needed\n\n\
-        Useful commands:\n  \
-        swarm run \"task\"              Start a topic in this context\n  \
-        swarm send parent \"message\"   Reply to whoever started this topic\n  \
-        swarm inbox --all             Read direct messages sent to you/current topic\n  \
-        swarm watch --all             Stream new direct messages without changing global read state\n  \
-        swarm peers --all             List visible topics, including paused/done topics\n  \
-        swarm brief [topic-id]        Read compact project/topic status\n  \
+        LLM-first command order:\n  \
+        Reply / receive:\n    \
+        swarm send parent \"message\"   Reply to whoever started this topic\n    \
+        swarm inbox --new --all       Read new direct messages\n    \
+        swarm watch-inbox             Stream new direct messages\n    \
+        swarm done \"summary\"          Pause current topic after handing off\n  \
+        Orient / inspect:\n    \
+        swarm status                  Show your current topic identity\n    \
+        swarm peers --all             List visible topics, including paused/done topics\n    \
+        swarm brief [topic-id]        Read compact project/topic status\n    \
         swarm log <topic-id>          Read historical topic activity\n  \
-        swarm done \"summary\"          Pause current topic and optionally report completion\n\n\
-        Use `swarm serve` only when you want the daemon/API without starting a topic.\n\n\
+        Delegate / operate:\n    \
+        swarm run \"task\"              Start a child or root topic\n    \
+        swarm cleanup <topic-id>      Remove a topic worktree\n    \
+        swarm kill <topic-id>         Stop a topic worker\n\n\
+        Use `swarm serve` only when you want to pin the daemon/API process yourself.\n\n\
         Environment variables:\n  \
-        SWARM_SOCKET      Daemon HTTP URL, default http://127.0.0.1:9800\n  \
+        SWARM_SOCKET      Daemon HTTP URL; local http sockets auto-start when quiet\n  \
         SWARM_AGENT_ID    Current topic ID, set inside harness processes\n  \
         SWARM_PROJECT_DIR Project root, set inside harness processes\n  \
         SWARM_CLAUDE_BIN  Override the claude binary path\n  \
@@ -60,35 +69,39 @@ struct Cli {
 enum Commands {
     /// Start a topic in the current context
     #[command(
+        display_order = 70,
         about = "Start a topic in the current context",
         long_about = "Start one durable topic and send TASK as its first direct message.\n\n\
             What happens:\n  \
-            - Starts the background daemon if needed.\n  \
+            - Uses SWARM_SOCKET when set, or the default/configured local socket otherwise.\n  \
+            - Starts the background daemon if that local socket is quiet.\n  \
             - Creates one topic with an ID like <label>-<short-id>.\n  \
             - Sets parent=user outside swarm, or parent=current topic inside swarm.\n  \
             - Sends TASK plus any --prompt text to the topic.\n  \
-            - Prints topic ID, parent ID, and dashboard URL.\n  \
-            - By default, stays in watch mode and prints direct replies from the new topic to its parent.\n\n\
-            Default watch mode:\n  \
-            - `swarm run \"task\"` does not return after creating the topic; it keeps polling for direct replies.\n  \
-            - Press Ctrl-C to stop only the local watcher. The topic and daemon keep running.\n  \
-            - Use --detach to return immediately. Later monitor with `swarm watch --to <parent> <topic-id>`, `swarm inbox`, `swarm brief`, or `swarm log`.\n\n\
+            - Prints topic ID, parent ID, dashboard URL, and a watch-inbox command for replies.\n  \
+            - Returns immediately; the topic and daemon continue running in the background.\n\n\
+            Delegating:\n  \
+            - Use this same `swarm run` command inside a topic to start a child topic.\n  \
+            - No separate delegation command exists.\n\n\
+            Watching replies:\n  \
+            - Use the printed `swarm watch-inbox <parent> --from <topic-id>` command to stream direct replies.\n  \
+            - `swarm watch-inbox` without a topic watches the current topic inbox inside swarm, or the user inbox outside swarm.\n\n\
             Key options and accepted values:\n  \
             --label <LABEL>       Human-readable prefix for the topic ID. Default: coordinator.\n  \
             --harness <HARNESS>   One of: claude, codex, gemini, grok, echo. Default: config default_harness, else echo.\n  \
             --model <MODEL>       Free-form model string passed through to harnesses that support model selection.\n  \
             --comms <MODE>        One of: mesh, parent-only. Default: config default_comms, else mesh.\n  \
             --worktree            Give the topic an isolated git worktree and branch.\n  \
-            --detach              Return after creating the topic; use watch/inbox/brief/log later.\n  \
+            --detach              Deprecated compatibility flag; run now returns immediately.\n  \
             --prompt <TEXT>       Extra task text appended after positional TASK, or used as TASK if no positional TASK is given.\n  \
             --project-dir <PATH>  Project root for daemon and topic work. Default: current directory.\n  \
             --data-dir <PATH>     SQLite/log/worktree storage. Default: platform data directory.\n  \
-            --port <PORT>         Daemon port. Default: config port, else 9800.\n\n\
+            --port <PORT>         Local daemon port when SWARM_SOCKET is not set. Default: config port, else 9800.\n\n\
             Examples:\n  \
             swarm run \"say hi\"\n  \
             swarm run --label reviewer --harness codex \"Review the current branch\"\n  \
             swarm run --label editor --harness claude --worktree \"Implement the parser cleanup\"\n  \
-            swarm run --detach --label monitor \"Watch for messages and summarize blockers\""
+            swarm watch-inbox user --from reviewer-1234abcd"
     )]
     Run {
         /// Project directory where topics work
@@ -111,7 +124,7 @@ enum Commands {
         #[arg(long, default_value = "coordinator")]
         label: String,
 
-        /// Skip automatic .gitignore update
+        /// Skip automatic .gitignore update for project-local runtime data
         #[arg(long)]
         no_gitignore: bool,
 
@@ -135,7 +148,7 @@ enum Commands {
         #[arg(long)]
         worktree: bool,
 
-        /// Return immediately instead of staying in default watch mode
+        /// Deprecated compatibility flag; run now always returns immediately
         #[arg(long)]
         detach: bool,
 
@@ -146,16 +159,17 @@ enum Commands {
 
     /// Start only the background daemon/API server
     #[command(
+        display_order = 120,
         about = "Start only the background daemon/API server",
         long_about = "Start the daemon, HTTP API, dashboard, and worker resume loop without creating a topic.\n\n\
             Use this when you want the UI/API available before starting topics, or when another process will call the API directly.\n\n\
-            Most users and LLM callers should prefer `swarm run \"task\"`, because it starts the daemon automatically when needed.\n\n\
+            Most users and LLM callers should use `swarm run`, `swarm send`, `swarm inbox`, `swarm watch-inbox`, `swarm peers`, `swarm brief`, or `swarm log` directly; those commands start a local daemon automatically when needed.\n\n\
             Options:\n  \
             --project-dir <PATH>  Project root served by this daemon. Default: current directory.\n  \
             --port <PORT>         Daemon port. Default: config port, else 9800.\n  \
             --data-dir <PATH>     SQLite/log/worktree storage. Default: platform data directory.\n  \
             --dashboard <PATH>    Override dashboard dist directory for development.\n  \
-            --no-gitignore        Do not add .swarm/ to the project .gitignore."
+            --no-gitignore        Do not add project-local runtime .swarm/ to .gitignore."
     )]
     Serve {
         /// Project directory served by this daemon
@@ -166,7 +180,7 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Skip automatic .gitignore update
+        /// Skip automatic .gitignore update for project-local runtime data
         #[arg(long)]
         no_gitignore: bool,
 
@@ -181,6 +195,7 @@ enum Commands {
 
     /// List topic streams
     #[command(
+        display_order = 60,
         about = "List topic streams",
         long_about = "List topics visible from the current context.\n\n\
             Outside swarm, this lists project topics. Inside a topic, it lists the visible family tree: parent, siblings, and children. By default paused/done topics are hidden.\n\n\
@@ -204,6 +219,7 @@ enum Commands {
 
     /// Send a direct message to a topic, parent, or user
     #[command(
+        display_order = 10,
         about = "Send a direct message to a topic, parent, or user",
         long_about = "Send one direct message through the swarm mailbox.\n\n\
             Sender behavior:\n  \
@@ -213,7 +229,7 @@ enum Commands {
             <topic-id>  Send to a specific topic.\n  \
             parent      Inside a topic, resolves to whoever started the current topic.\n  \
             user        Send to the root user mailbox.\n\n\
-            This command only confirms that the message was queued. Use `watch`, `inbox`, `brief`, or `log` to observe replies.\n\n\
+            This command only confirms that the message was queued. Use `watch-inbox`, `inbox`, `brief`, or `log` to observe replies.\n\n\
             Examples:\n  \
             swarm send parent \"I found the issue\"\n  \
             swarm send reviewer-1234abcd \"Please review this branch\"\n  \
@@ -228,6 +244,7 @@ enum Commands {
 
     /// Read direct messages sent to the user/current topic
     #[command(
+        display_order = 20,
         about = "Read direct messages sent to the user/current topic",
         long_about = "Read a snapshot of mailbox messages for a recipient.\n\n\
             Default recipient:\n  \
@@ -299,40 +316,33 @@ enum Commands {
         truncate: Option<usize>,
     },
 
-    /// Watch new direct messages sent to the user/current topic without marking them read globally
+    /// Stream new direct messages sent to an inbox
     #[command(
-        about = "Watch new direct messages sent to the user/current topic",
-        long_about = "Poll for new mailbox messages and print them as they arrive.\n\n\
-            `watch` is session-local: it remembers what this invocation has already printed, but it does not advance the saved inbox cursor used by `inbox --new`.\n\n\
-            Default recipient:\n  \
-            - Outside swarm: user.\n  \
-            - Inside a topic: current topic (SWARM_AGENT_ID).\n\n\
-            Source selection:\n  \
-            - Pass a FROM topic ID to watch one source.\n  \
-            - Use --all to watch messages from any source.\n\n\
+        name = "watch-inbox",
+        display_order = 30,
+        about = "Stream new direct messages sent to an inbox",
+        long_about = "Poll one mailbox and print new direct messages as they arrive.\n\n\
+            Recipient selection:\n  \
+            - `swarm watch-inbox <topic-id>` watches that topic's inbox.\n  \
+            - `swarm watch-inbox user` watches the user inbox.\n  \
+            - `swarm watch-inbox` watches the current topic inside swarm, else the user inbox.\n\n\
+            Source filtering:\n  \
+            - By default, messages from all senders are shown.\n  \
+            - Pass `--from <topic-id>` to watch one sender.\n\n\
+            `watch-inbox` is session-local: it remembers what this invocation has already printed, but it does not advance the saved inbox cursor used by `inbox --new`.\n\n\
             Stop with Ctrl-C.\n\n\
-            Accepted values:\n  \
-            --to <TO>           `user`, `me` inside a topic, or a topic ID.\n  \
-            --last <N>          Positive integer count fetched per poll. Default: 20. Alias: --tail.\n  \
-            --interval-ms <MS>  Poll interval in milliseconds. Default: 2000. Minimum effective value: 250.\n\n\
             Examples:\n  \
-            swarm watch --all\n  \
-            swarm watch reviewer-1234abcd --to user\n  \
-            swarm watch --all --interval-ms 500\n  \
-            swarm watch --all --json"
+            swarm watch-inbox\n  \
+            swarm watch-inbox user --from reviewer-1234abcd\n  \
+            swarm watch-inbox worker-1234abcd --json"
     )]
-    Watch {
-        /// Recipient: user, me, or topic ID. Default: current topic inside swarm, else user.
-        #[arg(long)]
-        to: Option<String>,
+    WatchInbox {
+        /// Inbox recipient: user, me, or a topic ID. Defaults to current topic inside swarm, else user.
+        target: Option<String>,
 
-        /// Source topic ID to watch; omit with --all
-        #[arg(conflicts_with = "all")]
+        /// Only show messages from this topic/user
+        #[arg(long = "from")]
         from: Option<String>,
-
-        /// Watch all source topics
-        #[arg(long)]
-        all: bool,
 
         /// Number of messages to fetch per poll
         #[arg(
@@ -354,6 +364,7 @@ enum Commands {
 
     /// Show harness model behavior (harness CLIs choose their own defaults)
     #[command(
+        display_order = 130,
         about = "Show harness model behavior",
         long_about = "List available harness kinds and their default model behavior.\n\n\
             Swarm usually lets each harness CLI choose its own default model. Use `swarm run --model <MODEL>` when you need an explicit model and the selected harness supports it.\n\n\
@@ -371,6 +382,7 @@ enum Commands {
 
     /// Show current topic status
     #[command(
+        display_order = 50,
         about = "Show current topic status",
         long_about = "Show identity and runtime state for the current topic.\n\n\
             This command requires SWARM_AGENT_ID, so it is mainly useful inside a running harness/topic process. It does not show children; use `swarm peers` for visible parent, sibling, and child topics.\n\n\
@@ -387,6 +399,7 @@ enum Commands {
 
     /// View recent topic activity, or the broader user message log
     #[command(
+        display_order = 90,
         about = "View recent topic activity, or the broader user message log",
         long_about = "Read historical activity for one topic, or the broader user message log with `swarm log user`.\n\n\
             Use `brief` first for compact context. Use `log` when you need recent transcript details.\n\n\
@@ -444,6 +457,7 @@ enum Commands {
 
     /// Show a compact digest for the project or one topic
     #[command(
+        display_order = 80,
         about = "Show a compact digest for the project or one topic",
         long_about = "Show deterministic, low-noise status without dumping full transcripts.\n\n\
             Project brief (`swarm brief`) includes topic counts, recent topics, prompt sizes, statuses, and recent structured handovers.\n\n\
@@ -478,6 +492,7 @@ enum Commands {
 
     /// Clean up a topic worktree and optionally its branch
     #[command(
+        display_order = 100,
         about = "Clean up a topic worktree and optionally its branch",
         long_about = "Remove the git worktree created for a topic started with --worktree.\n\n\
             This does not delete the topic record, mailbox, or logs. Use it after reviewing or merging worktree changes.\n\n\
@@ -498,6 +513,7 @@ enum Commands {
 
     /// Pause this topic and optionally report to parent
     #[command(
+        display_order = 40,
         about = "Pause this topic and optionally report to parent",
         long_about = "Mark the current topic paused/done, optionally send a final message to the parent, and store structured handover fields for future briefs.\n\n\
             This command requires SWARM_AGENT_ID, so it is for use inside a running topic. A paused topic can be resumed later by sending it another message.\n\n\
@@ -537,6 +553,7 @@ enum Commands {
 
     /// Stop a topic worker and mark the topic paused/done
     #[command(
+        display_order = 110,
         about = "Stop a topic worker and mark the topic paused/done",
         long_about = "Stop a running topic worker from outside or inside swarm.\n\n\
             This marks the topic paused/done. It does not delete logs, messages, or worktrees. If a topic has a worktree, use `swarm cleanup <topic-id>` separately after reviewing any work.\n\n\
@@ -550,6 +567,7 @@ enum Commands {
 
     /// Check harness availability, versions, and API keys
     #[command(
+        display_order = 140,
         about = "Check harness availability, versions, and API keys",
         long_about = "Check whether configured harness CLIs are available and whether expected API key environment variables are present.\n\n\
             This is a local diagnostic. It does not start a topic.\n\n\
@@ -560,6 +578,7 @@ enum Commands {
 
     /// Print shell completion script to stdout
     #[command(
+        display_order = 150,
         about = "Print shell completion script to stdout",
         long_about = "Generate shell autocomplete code for swarm commands and flags.\n\n\
             This prints the script to stdout. Redirect it into the completion location for your shell.\n\n\
@@ -575,6 +594,7 @@ enum Commands {
 
     /// Print roff manpage to stdout
     #[command(
+        display_order = 160,
         about = "Print roff manpage to stdout",
         long_about = "Generate a roff manpage for swarm and print it to stdout.\n\n\
             Example:\n  \
@@ -611,8 +631,15 @@ async fn main() {
             detach,
             task,
         } => {
-            let config = SwarmConfig::load(Some(&project_dir));
-            let port = port.unwrap_or_else(|| config.default_port.unwrap_or(9800));
+            let daemon =
+                match build_daemon_launch(project_dir, data_dir, port, no_gitignore, dashboard) {
+                    Ok(daemon) => daemon,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            let config = SwarmConfig::load(Some(&daemon.project_dir));
             let harness = harness.unwrap_or_else(|| {
                 config
                     .default_harness
@@ -626,8 +653,6 @@ async fn main() {
                     .unwrap_or_else(|| "mesh".into())
             });
 
-            let resolved_data_dir = SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
-
             if let Err(msg) = swarm::harness::preflight_check(&harness) {
                 eprintln!("{msg}");
                 std::process::exit(1);
@@ -635,19 +660,7 @@ async fn main() {
 
             let task_text = task.join(" ").trim().to_string();
             let result = run_task_swarm(
-                project_dir,
-                resolved_data_dir,
-                port,
-                harness,
-                label,
-                prompt,
-                comms,
-                model,
-                worktree,
-                task_text,
-                detach,
-                no_gitignore,
-                dashboard,
+                daemon, harness, label, prompt, comms, model, worktree, task_text, detach,
             )
             .await;
 
@@ -664,7 +677,7 @@ async fn main() {
             dashboard,
         } => {
             let config = SwarmConfig::load(Some(&project_dir));
-            let port = port.unwrap_or_else(|| config.default_port.unwrap_or(9800));
+            let port = port.unwrap_or_else(|| config.default_port.unwrap_or(DEFAULT_SWARM_PORT));
             let resolved_data_dir = SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
 
             if let Err(e) = run_orchestrator(
@@ -722,16 +735,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Watch {
-            to,
+        Commands::WatchInbox {
+            target,
             from,
-            all,
             last,
             interval_ms,
             json,
         } => {
             if let Err(e) =
-                cmd_watch(from.as_deref(), all, to.as_deref(), last, interval_ms, json).await
+                cmd_watch_inbox(target.as_deref(), from.as_deref(), last, interval_ms, json).await
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -853,31 +865,13 @@ async fn run_orchestrator(
 
     let project_dir = std::fs::canonicalize(&project_dir)?;
     std::fs::create_dir_all(&data_dir)?;
-    let agents_dir = project_dir.join(".swarm").join("agents");
-    std::fs::create_dir_all(&agents_dir)?;
+    std::fs::create_dir_all(data_dir.join("agents"))?;
 
     SwarmConfig::write_breadcrumb(&data_dir);
     tracing::info!("data directory: {}", data_dir.display());
 
-    if !no_gitignore {
-        let gitignore = project_dir.join(".gitignore");
-        let needs_entry = if gitignore.exists() {
-            let content = std::fs::read_to_string(&gitignore)?;
-            !content
-                .lines()
-                .any(|l| l.trim() == ".swarm" || l.trim() == ".swarm/")
-        } else {
-            true
-        };
-        if needs_entry {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&gitignore)?;
-            writeln!(f, "\n.swarm/")?;
-            tracing::info!("added .swarm/ to .gitignore");
-        }
+    if !no_gitignore && data_dir_uses_project_swarm(&project_dir, &data_dir) {
+        ensure_project_swarm_gitignored(&project_dir)?;
     }
 
     // Port conflict detection
@@ -980,10 +974,39 @@ async fn run_orchestrator(
     Ok(())
 }
 
+fn data_dir_uses_project_swarm(project_dir: &std::path::Path, data_dir: &std::path::Path) -> bool {
+    let project_swarm = project_dir.join(".swarm");
+    let project_swarm = std::fs::canonicalize(&project_swarm).unwrap_or(project_swarm);
+    let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    data_dir == project_swarm || data_dir.starts_with(project_swarm)
+}
+
+fn ensure_project_swarm_gitignored(
+    project_dir: &std::path::Path,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let gitignore = project_dir.join(".gitignore");
+    let needs_entry = if gitignore.exists() {
+        let content = std::fs::read_to_string(&gitignore)?;
+        !content
+            .lines()
+            .any(|line| matches!(line.trim(), ".swarm" | ".swarm/"))
+    } else {
+        true
+    };
+    if needs_entry {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore)?;
+        writeln!(f, "\n.swarm/")?;
+        tracing::info!("added .swarm/ to .gitignore");
+    }
+    Ok(())
+}
+
 async fn run_task_swarm(
-    project_dir: PathBuf,
-    data_dir: PathBuf,
-    port: u16,
+    daemon: DaemonLaunch,
     harness: String,
     label: String,
     prompt: String,
@@ -991,9 +1014,7 @@ async fn run_task_swarm(
     model: Option<String>,
     worktree: bool,
     task: String,
-    detach: bool,
-    no_gitignore: bool,
-    dashboard: Option<PathBuf>,
+    _detach: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let task = if task.trim().is_empty() {
         prompt.trim().to_string()
@@ -1008,13 +1029,7 @@ async fn run_task_swarm(
 
     let parent_id = runtime_parent_id();
     let user_launched = parent_id == USER_TOPIC_ID;
-    let socket = match std::env::var("SWARM_SOCKET") {
-        Ok(socket) if !socket.trim().is_empty() => {
-            ensure_socket_protocol(&socket).await?;
-            socket
-        }
-        _ => ensure_daemon(project_dir, data_dir, port, no_gitignore, dashboard).await?,
-    };
+    let socket = ensure_daemon(daemon).await?;
     let topic = create_topic_http(
         &socket,
         CreateTopicHttpRequest {
@@ -1040,47 +1055,10 @@ async fn run_task_swarm(
     println!("topic: {topic_id}");
     println!("parent: {parent_id}");
     println!("dashboard: {socket}");
+    println!("watch: swarm watch-inbox {parent_id} --from {topic_id}");
     println!("{CLI_ENTRY_SEPARATOR}");
     std::env::set_var("SWARM_SOCKET", &socket);
-
-    if detach {
-        println!("detached. watch responses with: swarm watch --to {parent_id} {topic_id}");
-        return Ok(());
-    }
-
-    println!(
-        "watching direct responses from {}; press Ctrl-C to stop",
-        topic_id
-    );
-    watch_started_topic_responses(&parent_id, &topic_id, 20, 2_000).await
-}
-
-async fn watch_started_topic_responses(
-    target: &str,
-    from_agent: &str,
-    limit: usize,
-    interval_ms: u64,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let interval_ms = interval_ms.max(250);
-    let mut seen = HashSet::new();
-
-    loop {
-        let entries =
-            fetch_inbox_entries(target, Some(from_agent), false, None, limit, None).await?;
-        let mut new_entries = entries
-            .into_iter()
-            .filter(|entry| seen.insert(inbox_entry_key(entry)))
-            .collect::<Vec<_>>();
-
-        if !new_entries.is_empty() {
-            new_entries.reverse();
-            print_inbox_entries(&new_entries, 0);
-            println!("{CLI_ENTRY_SEPARATOR}");
-            std::io::stdout().flush()?;
-        }
-
-        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-    }
+    Ok(())
 }
 
 fn inbox_entry_key(entry: &serde_json::Value) -> String {
@@ -1092,36 +1070,116 @@ fn inbox_entry_key(entry: &serde_json::Value) -> String {
     )
 }
 
-async fn ensure_daemon(
+#[derive(Clone)]
+struct DaemonLaunch {
     project_dir: PathBuf,
     data_dir: PathBuf,
     port: u16,
     no_gitignore: bool,
     dashboard: Option<PathBuf>,
-) -> std::result::Result<String, Box<dyn std::error::Error>> {
-    let socket = format!("http://127.0.0.1:{port}");
-    match daemon_health(&socket).await {
-        Some(health) if daemon_matches(&health, &project_dir, &data_dir) => return Ok(socket),
-        Some(health) => {
-            return Err(format!(
-                "daemon already running at {socket} for project {} with data dir {}. Stop it or pass --port <other>.",
-                health["project_dir"].as_str().unwrap_or("?"),
-                health["data_dir"].as_str().unwrap_or("?")
-            )
-            .into());
+}
+
+struct DaemonTarget {
+    socket: String,
+    launch_port: Option<u16>,
+}
+
+fn build_daemon_launch(
+    project_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    port: Option<u16>,
+    no_gitignore: bool,
+    dashboard: Option<PathBuf>,
+) -> std::result::Result<DaemonLaunch, Box<dyn std::error::Error>> {
+    let project_dir = std::fs::canonicalize(project_dir)?;
+    let config = SwarmConfig::load(Some(&project_dir));
+    let port = port.unwrap_or_else(|| config.default_port.unwrap_or(DEFAULT_SWARM_PORT));
+    let data_dir = SwarmConfig::resolve_data_dir(data_dir.as_deref(), &config);
+
+    Ok(DaemonLaunch {
+        project_dir,
+        data_dir,
+        port,
+        no_gitignore,
+        dashboard,
+    })
+}
+
+fn default_daemon_launch(
+    no_gitignore: bool,
+) -> std::result::Result<DaemonLaunch, Box<dyn std::error::Error>> {
+    build_daemon_launch(std::env::current_dir()?, None, None, no_gitignore, None)
+}
+
+fn daemon_target(
+    default_port: u16,
+) -> std::result::Result<DaemonTarget, Box<dyn std::error::Error>> {
+    if let Ok(socket) = std::env::var("SWARM_SOCKET") {
+        let socket = socket.trim();
+        if !socket.is_empty() {
+            let launch_port = local_http_port(socket)?;
+            return Ok(DaemonTarget {
+                socket: socket.trim_end_matches('/').to_string(),
+                launch_port,
+            });
         }
-        None => {}
     }
+
+    Ok(DaemonTarget {
+        socket: format!("http://127.0.0.1:{default_port}"),
+        launch_port: Some(default_port),
+    })
+}
+
+fn local_http_port(socket: &str) -> std::result::Result<Option<u16>, Box<dyn std::error::Error>> {
+    let url = reqwest::Url::parse(socket)?;
+    if url.scheme() != "http" {
+        return Ok(None);
+    }
+    let Some(host) = url.host_str() else {
+        return Ok(None);
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Ok(None);
+    }
+
+    Ok(url.port_or_known_default())
+}
+
+async fn api_socket() -> std::result::Result<String, Box<dyn std::error::Error>> {
+    ensure_daemon(default_daemon_launch(true)?).await
+}
+
+async fn ensure_daemon(
+    launch: DaemonLaunch,
+) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    let target = daemon_target(launch.port)?;
+    if let Some(health) = daemon_health(&target.socket).await {
+        ensure_health_protocol(&target.socket, &health)?;
+        return Ok(target.socket);
+    }
+
+    let Some(port) = target.launch_port else {
+        return Err(format!(
+            "no swarm daemon responded at {}; SWARM_SOCKET is not a local http socket swarm can start automatically",
+            target.socket
+        )
+        .into());
+    };
+    if port == 0 {
+        return Err("port 0 cannot be auto-started because swarm needs a stable socket".into());
+    }
+    ensure_launch_port_available(port)?;
 
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve")
         .arg("--project-dir")
-        .arg(&project_dir)
+        .arg(&launch.project_dir)
         .arg("--port")
         .arg(port.to_string())
         .arg("--data-dir")
-        .arg(&data_dir)
+        .arg(&launch.data_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1130,35 +1188,50 @@ async fn ensure_daemon(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    if no_gitignore {
+    if launch.no_gitignore {
         cmd.arg("--no-gitignore");
     }
-    if let Some(dashboard) = dashboard {
+    if let Some(dashboard) = launch.dashboard {
         cmd.arg("--dashboard").arg(dashboard);
     }
     cmd.spawn()?;
 
     for _ in 0..80 {
-        if daemon_health(&socket).await.is_some() {
-            return Ok(socket);
+        if let Some(health) = daemon_health(&target.socket).await {
+            ensure_health_protocol(&target.socket, &health)?;
+            return Ok(target.socket);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    Err(format!("daemon did not become healthy at {socket}").into())
+    Err(format!("daemon did not become healthy at {}", target.socket).into())
 }
 
-async fn ensure_socket_protocol(
+fn ensure_launch_port_available(port: u16) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(format!("port {port} is in use, but no swarm daemon responded there").into())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn ensure_health_protocol(
     socket: &str,
+    health: &serde_json::Value,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    match daemon_health(socket).await {
-        Some(health) if health["protocol"].as_str() == Some(SWARM_PROTOCOL_VERSION) => Ok(()),
-        Some(health) => Err(format!(
+    if health["protocol"].as_str() == Some(SWARM_PROTOCOL_VERSION) {
+        Ok(())
+    } else {
+        Err(format!(
             "daemon at {socket} uses protocol {} but this CLI expects {SWARM_PROTOCOL_VERSION}. Restart the daemon.",
             health["protocol"].as_str().unwrap_or("unknown")
         )
-        .into()),
-        None => Err(format!("no swarm daemon responded at {socket}").into()),
+        .into())
     }
 }
 
@@ -1179,32 +1252,6 @@ async fn daemon_health(socket: &str) -> Option<serde_json::Value> {
         return None;
     }
     resp.json().await.ok()
-}
-
-fn daemon_matches(
-    health: &serde_json::Value,
-    project_dir: &std::path::Path,
-    data_dir: &std::path::Path,
-) -> bool {
-    if health["protocol"].as_str() != Some(SWARM_PROTOCOL_VERSION) {
-        return false;
-    }
-    let Some(daemon_project) = health["project_dir"].as_str() else {
-        return false;
-    };
-    let Some(daemon_data) = health["data_dir"].as_str() else {
-        return false;
-    };
-
-    paths_equivalent(daemon_project, project_dir) && paths_equivalent(daemon_data, data_dir)
-}
-
-fn paths_equivalent(left: impl AsRef<std::path::Path>, right: impl AsRef<std::path::Path>) -> bool {
-    let left = left.as_ref();
-    let right = right.as_ref();
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    left == right
 }
 
 struct CreateTopicHttpRequest<'a> {
@@ -1267,12 +1314,8 @@ async fn send_message_http(
 
 fn topic_prompt(task: &str, topic_id: &str, parent_id: &str) -> String {
     format!(
-        "Topic: {topic_id}\nParent: {parent_id}\n\nTask:\n{task}\n\nWork independently. {PARENT_REPLY_HINT} When complete, call `swarm done \"summary\"`. Start child topics only when useful; {HELP_DISCOVERY_HINT}"
+        "Topic: {topic_id}\nParent: {parent_id}\n\nTask:\n{task}\n\nWork independently. {PARENT_REPLY_HINT} When complete, call `swarm done \"summary\"`. Start child topics with `swarm run` only when useful; no separate delegation command exists; {HELP_DISCOVERY_HINT}"
     )
-}
-
-fn swarm_socket() -> String {
-    std::env::var("SWARM_SOCKET").unwrap_or_else(|_| "http://127.0.0.1:9800".to_string())
 }
 
 fn swarm_agent_id() -> Option<String> {
@@ -1301,7 +1344,7 @@ async fn cmd_peers(
     include_all: bool,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
+    let socket = api_socket().await?;
     let mut url = format!("{socket}/api/agents");
     let mut params = Vec::new();
     if let Some(agent_id) = swarm_agent_id() {
@@ -1426,8 +1469,11 @@ async fn cmd_send(
     target: &str,
     message: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
     let from = swarm_agent_id().unwrap_or_else(|| "user".to_string());
+    if target == "parent" && from == "user" {
+        return Err("`parent` is only available inside a swarm topic".into());
+    }
+    let socket = api_socket().await?;
     let target = resolve_send_target(&socket, target, &from).await?;
     let client = reqwest::Client::new();
     let resp = client
@@ -1497,7 +1543,9 @@ async fn cmd_inbox(
         Some(from.ok_or("pass a source topic id, or use --all to read all inbox messages")?)
     };
     let target = resolve_inbox_target(to)?;
-    let resp = fetch_inbox_entries(&target, from_agent, only_new, since, limit, search).await?;
+    let socket = api_socket().await?;
+    let resp =
+        fetch_inbox_entries(&socket, &target, from_agent, only_new, since, limit, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
@@ -1515,6 +1563,7 @@ async fn cmd_inbox(
 }
 
 async fn fetch_inbox_entries(
+    socket: &str,
     target: &str,
     from_agent: Option<&str>,
     only_new: bool,
@@ -1522,7 +1571,6 @@ async fn fetch_inbox_entries(
     limit: usize,
     search: Option<&str>,
 ) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
     let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/inbox"))?;
     {
         let mut query = url.query_pairs_mut();
@@ -1549,12 +1597,12 @@ async fn fetch_inbox_entries(
 }
 
 async fn fetch_log_entries(
+    socket: &str,
     target: &str,
     limit: usize,
     filter: &str,
     search: Option<&str>,
 ) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
     let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/log"))?;
     {
         let mut query = url.query_pairs_mut();
@@ -1589,27 +1637,34 @@ fn print_inbox_entries(resp: &[serde_json::Value], truncate: usize) {
     }
 }
 
-async fn cmd_watch(
-    from: Option<&str>,
-    all: bool,
-    to: Option<&str>,
+async fn cmd_watch_inbox(
+    target: Option<&str>,
+    from_agent: Option<&str>,
     limit: usize,
     interval_ms: u64,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let from_agent = if all {
-        None
-    } else {
-        Some(from.ok_or("pass a source topic id, or use --all to watch all inbox messages")?)
-    };
-    let target = resolve_inbox_target(to)?;
+    let target = resolve_inbox_target(target)?;
+    let socket = api_socket().await?;
+    watch_inbox_loop(&socket, &target, from_agent, limit, interval_ms, json).await
+}
+
+async fn watch_inbox_loop(
+    socket: &str,
+    target: &str,
+    from_agent: Option<&str>,
+    limit: usize,
+    interval_ms: u64,
+    json: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let interval_ms = interval_ms.max(250);
     let mut since = chrono::Utc::now().to_rfc3339();
     let mut seen = HashSet::new();
 
     loop {
         let entries =
-            fetch_inbox_entries(&target, from_agent, false, Some(&since), limit, None).await?;
+            fetch_inbox_entries(socket, target, from_agent, false, Some(&since), limit, None)
+                .await?;
         let mut new_entries = entries
             .into_iter()
             .filter(|entry| seen.insert(inbox_entry_key(entry)))
@@ -1635,8 +1690,8 @@ async fn cmd_watch(
 }
 
 async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
+    let socket = api_socket().await?;
     let resp = reqwest::get(format!("{socket}/api/agents/{agent_id}")).await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
@@ -1718,7 +1773,8 @@ async fn cmd_log(
     truncate: usize,
     search: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let resp = fetch_log_entries(target, limit, filter, search).await?;
+    let socket = api_socket().await?;
+    let resp = fetch_log_entries(&socket, target, limit, filter, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
@@ -1765,7 +1821,7 @@ async fn cmd_brief(
     search: Option<&str>,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
+    let socket = api_socket().await?;
     let endpoint = if let Some(target) = target {
         format!("{socket}/api/agents/{target}/brief")
     } else {
@@ -1908,7 +1964,7 @@ async fn cmd_cleanup(
     target: &str,
     delete_branch: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
+    let socket = api_socket().await?;
     let client = reqwest::Client::new();
     let mut url = format!("{socket}/api/agents/{target}/cleanup");
     if delete_branch {
@@ -1932,8 +1988,8 @@ async fn cmd_done(
     risk: Option<&str>,
     next_action: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
+    let socket = api_socket().await?;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{socket}/api/agents/{agent_id}/done"))
@@ -1957,7 +2013,7 @@ async fn cmd_done(
 }
 
 async fn cmd_kill(target: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = swarm_socket();
+    let socket = api_socket().await?;
     let client = reqwest::Client::new();
     let resp = client
         .delete(format!("{socket}/api/agents/{target}"))
@@ -2128,6 +2184,16 @@ mod tests {
         ["--ro", "le"].concat()
     }
 
+    fn assert_ordered(haystack: &str, needles: &[&str]) {
+        let mut last = 0;
+        for needle in needles {
+            let offset = haystack[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in help output"));
+            last += offset + needle.len();
+        }
+    }
+
     #[test]
     fn top_level_help_points_to_run_only() {
         let mut cmd = Cli::command();
@@ -2138,6 +2204,21 @@ mod tests {
         let removed_team = removed_team_flag();
 
         assert!(help.contains("swarm run \"task\""));
+        assert!(help.contains("Commands (LLM-first):"));
+        assert_ordered(
+            &help,
+            &[
+                "send         Send a direct message",
+                "inbox        Read direct messages",
+                "watch-inbox  Stream new direct messages",
+                "done         Pause this topic",
+                "status       Show current topic status",
+                "peers        List topic streams",
+                "run          Start a topic",
+                "brief        Show a compact digest",
+                "log          View recent topic activity",
+            ],
+        );
         assert!(!help.contains(&removed));
         assert!(!help.contains(&removed_team));
     }
@@ -2155,6 +2236,7 @@ mod tests {
 
         assert!(help.contains("Start one durable topic"));
         assert!(help.contains("parent=user outside swarm"));
+        assert!(help.contains("No separate delegation command exists"));
         assert!(help.contains("--label"));
         assert!(help.contains("--worktree"));
         assert!(!help.contains(&removed));
