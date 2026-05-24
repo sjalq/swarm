@@ -113,7 +113,7 @@ enum Commands {
         port: Option<u16>,
 
         /// Harness for the topic worker
-        #[arg(long, value_parser = ["claude", "gemini", "codex", "grok", "echo"])]
+        #[arg(long, value_parser = ["claude", "cursor-agent", "gemini", "codex", "grok", "echo"])]
         harness: Option<String>,
 
         /// Extra task text appended to TASK; if TASK is omitted, this is the task
