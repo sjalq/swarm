@@ -141,6 +141,7 @@ fn echo_payload(message: &str) -> &str {
 #[derive(Debug, Clone)]
 pub enum CliKind {
     Claude,
+    CursorAgent,
     Gemini,
     Codex,
     Grok,
@@ -150,6 +151,7 @@ impl CliKind {
     pub fn default_binary(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::CursorAgent => "cursor-agent",
             Self::Gemini => "gemini",
             Self::Codex => "codex",
             Self::Grok => "grok",
@@ -159,6 +161,7 @@ impl CliKind {
     pub fn env_var_name(&self) -> &'static str {
         match self {
             Self::Claude => "SWARM_CLAUDE_BIN",
+            Self::CursorAgent => "SWARM_CURSOR_AGENT_BIN",
             Self::Gemini => "SWARM_GEMINI_BIN",
             Self::Codex => "SWARM_CODEX_BIN",
             Self::Grok => "SWARM_GROK_BIN",
@@ -172,6 +175,7 @@ impl CliKind {
     pub fn api_key_env_names(&self) -> &[&'static str] {
         match self {
             Self::Claude => &["ANTHROPIC_API_KEY"],
+            Self::CursorAgent => &["CURSOR_API_KEY"],
             Self::Codex => &["OPENAI_API_KEY", "CODEX_API_KEY"],
             Self::Gemini => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             Self::Grok => &["XAI_API_KEY"],
@@ -187,12 +191,13 @@ impl CliKind {
     }
 
     pub fn all_kinds() -> &'static [CliKind] {
-        &[Self::Claude, Self::Gemini, Self::Codex, Self::Grok]
+        &[Self::Claude, Self::CursorAgent, Self::Gemini, Self::Codex, Self::Grok]
     }
 
     pub fn from_harness_name(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::Claude),
+            "cursor-agent" => Some(Self::CursorAgent),
             "gemini" => Some(Self::Gemini),
             "codex" => Some(Self::Codex),
             "grok" => Some(Self::Grok),
@@ -228,6 +233,25 @@ impl CliKind {
                     "--dangerously-skip-permissions".into(),
                 ]);
                 args.push("--".into());
+                args.push(prompt.into());
+                args
+            }
+            Self::CursorAgent => {
+                let mut args = vec!["-p".into()];
+                if continue_conversation {
+                    args.push("--continue".into());
+                }
+                if let Some(m) = model {
+                    args.extend_from_slice(&["--model".into(), m.into()]);
+                }
+                args.extend_from_slice(&[
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--force".into(),
+                    "--trust".into(),
+                    "--sandbox".into(),
+                    "disabled".into(),
+                ]);
                 args.push(prompt.into());
                 args
             }
@@ -560,6 +584,7 @@ impl HarnessRegistry {
         };
         reg.register(EchoHarness);
         reg.register(CliHarness::new(CliKind::Claude));
+        reg.register(CliHarness::new(CliKind::CursorAgent));
         reg.register(CliHarness::new(CliKind::Gemini));
         reg.register(CliHarness::new(CliKind::Codex));
         reg.register(CliHarness::new(CliKind::Grok));
@@ -591,6 +616,7 @@ mod tests {
         let reg = HarnessRegistry::new();
         assert!(reg.get("echo").is_some());
         assert!(reg.get("claude").is_some());
+        assert!(reg.get("cursor-agent").is_some());
         assert!(reg.get("gemini").is_some());
         assert!(reg.get("codex").is_some());
         assert!(reg.get("grok").is_some());
@@ -632,6 +658,7 @@ mod tests {
     #[test]
     fn cli_kind_env_vars() {
         assert_eq!(CliKind::Claude.env_var_name(), "SWARM_CLAUDE_BIN");
+        assert_eq!(CliKind::CursorAgent.env_var_name(), "SWARM_CURSOR_AGENT_BIN");
         assert_eq!(CliKind::Codex.env_var_name(), "SWARM_CODEX_BIN");
         assert_eq!(CliKind::Gemini.env_var_name(), "SWARM_GEMINI_BIN");
         assert_eq!(CliKind::Grok.env_var_name(), "SWARM_GROK_BIN");
@@ -640,7 +667,7 @@ mod tests {
     #[test]
     fn cli_kind_all_kinds() {
         let kinds = CliKind::all_kinds();
-        assert_eq!(kinds.len(), 4);
+        assert_eq!(kinds.len(), 5);
     }
 
     #[test]
@@ -734,6 +761,7 @@ mod tests {
     #[test]
     fn api_key_env_names() {
         assert_eq!(CliKind::Claude.api_key_env_names(), &["ANTHROPIC_API_KEY"]);
+        assert_eq!(CliKind::CursorAgent.api_key_env_names(), &["CURSOR_API_KEY"]);
         assert!(CliKind::Codex
             .api_key_env_names()
             .contains(&"OPENAI_API_KEY"));

@@ -88,7 +88,7 @@ enum Commands {
             - `swarm watch-inbox` without a topic watches the current topic inbox inside swarm, or the user inbox outside swarm.\n\n\
             Key options and accepted values:\n  \
             --label <LABEL>       Human-readable prefix for the topic ID. Default: coordinator.\n  \
-            --harness <HARNESS>   One of: claude, codex, gemini, grok, echo. Default: config default_harness, else echo.\n  \
+            --harness <HARNESS>   One of: claude, cursor-agent, codex, gemini, grok, echo. Default: config default_harness, else echo.\n  \
             --model <MODEL>       Free-form model string passed through to harnesses that support model selection.\n  \
             --comms <MODE>        One of: mesh, parent-only. Default: config default_comms, else mesh.\n  \
             --worktree            Give the topic an isolated git worktree and branch.\n  \

@@ -524,6 +524,7 @@ async fn list_events(
 async fn list_models() -> impl IntoResponse {
     let harnesses = [
         CliKind::Claude,
+        CliKind::CursorAgent,
         CliKind::Gemini,
         CliKind::Codex,
         CliKind::Grok,

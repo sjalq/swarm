@@ -48,5 +48,5 @@ fn models_json_flag_parses() {
 
     let models: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("models --json should be parseable JSON");
-    assert_eq!(models.as_array().unwrap().len(), 4);
+    assert_eq!(models.as_array().unwrap().len(), 5);
 }

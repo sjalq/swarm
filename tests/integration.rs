@@ -1555,7 +1555,7 @@ async fn http_api_models_endpoint() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let models: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert_eq!(models.len(), 4);
+    assert_eq!(models.len(), 5);
 
     let claude = models.iter().find(|m| m["harness"] == "claude").unwrap();
     assert_eq!(claude["default_model"], "CLI default");
