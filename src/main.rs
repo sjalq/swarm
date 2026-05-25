@@ -242,6 +242,23 @@ enum Commands {
         message: String,
     },
 
+    /// Broadcast a message to parent, siblings, and children
+    #[command(
+        display_order = 11,
+        name = "send-family",
+        about = "Broadcast a message to parent, siblings, and children",
+        long_about = "Send one message to every immediate family member: parent, siblings, and direct children.\n\n\
+            The sender (current topic) is excluded. The user mailbox is never included.\n\n\
+            This command requires SWARM_AGENT_ID, so it is for use inside a running topic.\n\n\
+            Examples:\n  \
+            swarm send-family \"Status update: phase 1 complete\"\n  \
+            swarm send-family \"Heads up: switching to plan B\""
+    )]
+    SendFamily {
+        /// Message content
+        message: String,
+    },
+
     /// Read direct messages sent to the user/current topic
     #[command(
         display_order = 20,
@@ -701,6 +718,12 @@ async fn main() {
         }
         Commands::Send { target, message } => {
             if let Err(e) = cmd_send(&target, &message).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::SendFamily { message } => {
+            if let Err(e) = cmd_send_family(&message).await {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -1488,6 +1511,39 @@ async fn cmd_send(
 
     if resp.status().is_success() {
         println!("sent to {target}");
+    } else {
+        return Err(response_error(resp).await);
+    }
+    Ok(())
+}
+
+async fn cmd_send_family(
+    message: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let from = swarm_agent_id()
+        .ok_or("send-family requires SWARM_AGENT_ID (only available inside a swarm topic)")?;
+    let socket = api_socket().await?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{socket}/api/messages/family"))
+        .json(&serde_json::json!({
+            "from": from,
+            "content": message,
+        }))
+        .send()
+        .await?;
+
+    if resp.status().is_success() {
+        let msgs: Vec<serde_json::Value> = resp.json().await?;
+        let targets: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m["to_agent"].as_str())
+            .collect();
+        if targets.is_empty() {
+            println!("no family members to send to");
+        } else {
+            println!("sent to {} family member(s): {}", targets.len(), targets.join(", "));
+        }
     } else {
         return Err(response_error(resp).await);
     }

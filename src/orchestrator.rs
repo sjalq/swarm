@@ -19,6 +19,7 @@ Use the `swarm` CLI for all coordination.
 
 Critical delivery rule:
 - Send useful work to your parent with `swarm send parent \"message\"`.
+- Broadcast to parent, siblings, and children at once with `swarm send-family \"message\"` (excludes yourself).
 - Terminal stdout is only process output; it is not a reliable reply to your parent or the user.
 - Use `swarm done \"summary\"` after you have sent the useful result, to pause the topic and hand off status.
 - Do not poll for messages in a wait loop. Incoming messages automatically interrupt and resume this topic with the new messages included.
@@ -49,6 +50,7 @@ struct WorkerConfig {
     swarm_addr: String,
     event_tx: broadcast::Sender<SwarmEvent>,
     resume_conversation: bool,
+    min_run_grace: std::time::Duration,
 }
 
 pub struct Orchestrator {
@@ -245,6 +247,7 @@ impl Orchestrator {
         };
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let min_run_grace = harness.min_run_grace();
         let handle = tokio::spawn(Self::agent_worker_loop(
             WorkerConfig {
                 db: self.db.clone(),
@@ -258,6 +261,7 @@ impl Orchestrator {
                 swarm_addr: self.addr.clone(),
                 event_tx: self.event_tx.clone(),
                 resume_conversation,
+                min_run_grace,
             },
             cmd_rx,
         ));
@@ -1051,6 +1055,58 @@ impl Orchestrator {
         Ok(msg)
     }
 
+    pub async fn broadcast_family(&self, from: &str, content: &str) -> Result<Vec<MessageRow>> {
+        let db = self.db.clone();
+        let from_id = from.to_string();
+        let project_key = self.project_key.clone();
+        let all_agents = Self::blocking_db("list agents for family broadcast", move || {
+            db.list_all_agents_for_project(&project_key)
+        })
+        .await?;
+
+        let sender = all_agents
+            .iter()
+            .find(|a| a.id == from_id)
+            .ok_or_else(|| SwarmError::AgentNotFound(from_id.clone()))?;
+
+        let sender_parent = sender.parent_id.as_deref();
+
+        let targets: Vec<String> = all_agents
+            .iter()
+            .filter(|a| {
+                if a.id == from_id || a.id == USER_TOPIC_ID || !Self::active_status(a.status) {
+                    return false;
+                }
+                // parent
+                if sender_parent == Some(a.id.as_str()) {
+                    return true;
+                }
+                // child
+                if a.parent_id.as_deref() == Some(from_id.as_str()) {
+                    return true;
+                }
+                // sibling (same parent, both non-None)
+                if let (Some(sp), Some(ap)) = (sender_parent, a.parent_id.as_deref()) {
+                    if sp == ap {
+                        return true;
+                    }
+                }
+                false
+            })
+            .map(|a| a.id.clone())
+            .collect();
+
+        let mut sent = Vec::with_capacity(targets.len());
+        for target in targets {
+            match self.send_message(from, &target, content).await {
+                Ok(msg) => sent.push(msg),
+                Err(SwarmError::AgentNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(sent)
+    }
+
     async fn is_immediate_family_sender(
         &self,
         sender_id: &str,
@@ -1224,6 +1280,7 @@ impl Orchestrator {
             swarm_addr,
             event_tx,
             resume_conversation,
+            min_run_grace,
         } = config;
         let mut first_message = !resume_conversation;
         let mut has_pending = false;
@@ -1398,9 +1455,7 @@ impl Orchestrator {
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(WorkerCmd::NewMessage) => {
-                                // Async DB boundaries can yield between quick sends; give those
-                                // follow-up notifications a moment to batch instead of aborting.
-                                if run_started.elapsed() < std::time::Duration::from_millis(25) {
+                                if run_started.elapsed() < min_run_grace {
                                     has_pending = true;
                                     continue;
                                 }

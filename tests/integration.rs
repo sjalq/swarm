@@ -2262,3 +2262,174 @@ async fn cleanup_noop_without_worktree() {
     // Should not error even though there's no worktree
     orch.cleanup_agent(&agent.id, false).unwrap();
 }
+
+#[tokio::test]
+async fn broadcast_family_sends_to_parent_siblings_and_children() {
+    let (_dir, orch) = setup();
+
+    let grandparent = orch
+        .start_topic("grandparent", "echo", "", None, "mesh")
+        .unwrap();
+    let parent = orch
+        .start_topic("parent", "echo", "", Some(&grandparent.id), "mesh")
+        .unwrap();
+    let sender = orch
+        .start_topic("sender", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let sibling = orch
+        .start_topic("sibling", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let child_a = orch
+        .start_topic("child-a", "echo", "", Some(&sender.id), "mesh")
+        .unwrap();
+    let child_b = orch
+        .start_topic("child-b", "echo", "", Some(&sender.id), "mesh")
+        .unwrap();
+    let _unrelated = orch
+        .start_topic("unrelated", "echo", "", None, "mesh")
+        .unwrap();
+
+    let msgs = orch
+        .broadcast_family(&sender.id, "family update")
+        .await
+        .unwrap();
+
+    let targets: Vec<&str> = msgs.iter().map(|m| m.to_agent.as_str()).collect();
+    assert!(
+        targets.contains(&parent.id.as_str()),
+        "should send to parent"
+    );
+    assert!(
+        targets.contains(&sibling.id.as_str()),
+        "should send to sibling"
+    );
+    assert!(
+        targets.contains(&child_a.id.as_str()),
+        "should send to child a"
+    );
+    assert!(
+        targets.contains(&child_b.id.as_str()),
+        "should send to child b"
+    );
+    assert_eq!(targets.len(), 4, "should send to exactly parent + sibling + 2 children");
+
+    assert!(
+        !targets.contains(&sender.id.as_str()),
+        "should not send to self"
+    );
+    assert!(
+        !targets.contains(&grandparent.id.as_str()),
+        "should not send to grandparent"
+    );
+    assert!(
+        !targets.contains(&"user"),
+        "should not send to user"
+    );
+
+    for msg in &msgs {
+        assert_eq!(msg.from_agent, sender.id);
+        assert_eq!(msg.content, "family update");
+    }
+}
+
+#[tokio::test]
+async fn broadcast_family_excludes_done_agents() {
+    let (_dir, orch) = setup();
+
+    let parent = orch
+        .start_topic("parent", "echo", "", None, "mesh")
+        .unwrap();
+    let sender = orch
+        .start_topic("sender", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let sibling = orch
+        .start_topic("sibling", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+
+    orch.done_agent(&sibling.id, None).await.unwrap();
+
+    let msgs = orch
+        .broadcast_family(&sender.id, "update")
+        .await
+        .unwrap();
+
+    let targets: Vec<&str> = msgs.iter().map(|m| m.to_agent.as_str()).collect();
+    assert!(
+        targets.contains(&parent.id.as_str()),
+        "should send to active parent"
+    );
+    assert!(
+        !targets.contains(&sibling.id.as_str()),
+        "should not send to done sibling"
+    );
+}
+
+#[tokio::test]
+async fn broadcast_family_returns_empty_for_isolated_agent() {
+    let (_dir, orch) = setup();
+
+    let agent = orch
+        .start_topic("loner", "echo", "", None, "mesh")
+        .unwrap();
+
+    let msgs = orch
+        .broadcast_family(&agent.id, "hello?")
+        .await
+        .unwrap();
+    assert!(msgs.is_empty(), "isolated agent has no family to broadcast to");
+}
+
+#[tokio::test]
+async fn broadcast_family_http_endpoint() {
+    let (_dir, orch, addr) = setup_http_server().await;
+    let client = reqwest::Client::new();
+
+    let parent = orch
+        .start_topic("parent", "echo", "", None, "mesh")
+        .unwrap();
+    let sender = orch
+        .start_topic("sender", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let child = orch
+        .start_topic("child", "echo", "", Some(&sender.id), "mesh")
+        .unwrap();
+
+    let resp = client
+        .post(format!("{addr}/api/messages/family"))
+        .json(&serde_json::json!({
+            "from": sender.id,
+            "content": "family broadcast via http"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let msgs: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(msgs.len(), 2);
+
+    let targets: Vec<&str> = msgs
+        .iter()
+        .filter_map(|m| m["to_agent"].as_str())
+        .collect();
+    assert!(targets.contains(&parent.id.as_str()));
+    assert!(targets.contains(&child.id.as_str()));
+}
+
+#[tokio::test]
+async fn broadcast_family_preamble_mentions_send_family() {
+    let mut registry = HarnessRegistry::new();
+    registry.register(ResumeProbeHarness);
+    let (_dir, orch) = setup_with_registry(registry);
+    let mut rx = orch.subscribe();
+
+    let agent = orch
+        .start_topic("probe", "resume-probe", "check preamble", None, "mesh")
+        .unwrap();
+
+    let output = wait_for_agent_output(&mut rx, &agent.id, "send-family").await;
+    assert!(
+        output.contains("swarm send-family"),
+        "preamble should mention send-family command"
+    );
+}

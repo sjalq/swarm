@@ -60,6 +60,12 @@ pub struct SendRequest {
 }
 
 #[derive(Deserialize)]
+pub struct FamilyBroadcastRequest {
+    pub from: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
 pub struct ListQuery {
     pub perspective: Option<String>,
     #[serde(default)]
@@ -217,6 +223,7 @@ pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) ->
         .route("/api/agents/{id}/log", get(get_agent_log))
         .route("/api/agents/{id}/worktree", get(get_agent_worktree))
         .route("/api/messages", post(send_message))
+        .route("/api/messages/family", post(broadcast_family))
         .route("/api/events", get(list_events))
         .route("/api/models", get(list_models))
         .route("/ws", get(ws_handler))
@@ -372,6 +379,16 @@ async fn send_message(
 ) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
+        Err(e) => swarm_error_response(e),
+    }
+}
+
+async fn broadcast_family(
+    State(orch): State<AppState>,
+    Json(req): Json<FamilyBroadcastRequest>,
+) -> impl IntoResponse {
+    match orch.broadcast_family(&req.from, &req.content).await {
+        Ok(msgs) => Json(msgs).into_response(),
         Err(e) => swarm_error_response(e),
     }
 }
