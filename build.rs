@@ -85,6 +85,12 @@ fn main() {
         }
         _ => {
             clear_dist();
+            if std::env::var("SWARM_ALLOW_NO_DASHBOARD").as_deref() == Ok("1") {
+                println!(
+                    "cargo:warning=trunk not found; dashboard omitted because SWARM_ALLOW_NO_DASHBOARD=1"
+                );
+                return;
+            }
             panic!("trunk not found; install with: cargo install trunk --locked");
         }
     }
