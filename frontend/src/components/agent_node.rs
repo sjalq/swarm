@@ -8,26 +8,43 @@ use std::sync::{
 };
 use wasm_bindgen_futures::spawn_local;
 
-#[component]
-pub fn AgentNode(
-    node: AgentTreeNode,
+pub type NodeSignalMap = RwSignal<HashMap<String, RwSignal<AgentTreeNode>>>;
+
+pub fn render_agent_node(
+    agent_id: String,
+    node_signals: NodeSignalMap,
     expanded_agents: RwSignal<HashSet<String>>,
     log_tabs: RwSignal<HashSet<String>>,
     log_scroll_positions: RwSignal<HashMap<String, i32>>,
     log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
 ) -> AnyView {
-    let agent = node.agent.clone();
-    let children = node.children;
-    let last_activity = node.last_activity;
-    let has_children = !children.is_empty();
+    let Some(node) = node_signals.with_untracked(|signals| signals.get(&agent_id).copied()) else {
+        return view! { <></> }.into_any();
+    };
 
-    let status_class = agent.status_class().to_string();
-    let harness_class = agent.harness_class().to_string();
-    let model_display = agent.display_model().to_string();
-    let harness_display = agent.harness.clone();
-    let label = agent.label.clone();
-    let id = agent.id.clone();
-    let created_at = agent.created_at.clone();
+    view! {
+        <AgentNode
+            node=node
+            node_signals=node_signals
+            expanded_agents=expanded_agents
+            log_tabs=log_tabs
+            log_scroll_positions=log_scroll_positions
+            log_cache=log_cache
+        />
+    }
+    .into_any()
+}
+
+#[component]
+pub fn AgentNode(
+    node: RwSignal<AgentTreeNode>,
+    node_signals: NodeSignalMap,
+    expanded_agents: RwSignal<HashSet<String>>,
+    log_tabs: RwSignal<HashSet<String>>,
+    log_scroll_positions: RwSignal<HashMap<String, i32>>,
+    log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
+) -> AnyView {
+    let id = node.with_untracked(|node| node.agent.id.clone());
     let expanded_id = id.clone();
     let expanded = Memo::new(move |_| expanded_agents.with(|agents| agents.contains(&expanded_id)));
     let log_tab_id = id.clone();
@@ -49,6 +66,27 @@ pub fn AgentNode(
             activity_tick.update(|tick| *tick = tick.saturating_add(1));
         }
     });
+
+    let status_indicator_class =
+        move || node.with(|node| format!("agent-status-indicator {}", node.agent.status_class()));
+
+    let label_display = move || {
+        node.with(|node| {
+            let child_prefix = if node.children.is_empty() { "" } else { "^ " };
+            format!("{}{}", child_prefix, node.agent.label)
+        })
+    };
+
+    let harness_badge_class =
+        move || node.with(|node| format!("badge badge-harness {}", node.agent.harness_class()));
+    let harness_display = move || node.with(|node| node.agent.harness.clone());
+    let model_display = move || node.with(|node| node.agent.display_model().to_string());
+    let created_display = move || node.with(|node| format_timestamp(&node.agent.created_at));
+    let last_activity_display = move || node.with(|node| format_timestamp(&node.last_activity));
+    let activity_display = move || {
+        activity_tick.get();
+        node.with(|node| format_relative_time(&node.last_activity))
+    };
 
     let card_class = move || {
         if expanded.get() {
@@ -77,22 +115,6 @@ pub fn AgentNode(
         }
     };
 
-    let created_display = format_timestamp(&created_at);
-    let last_activity_display = format_timestamp(&last_activity);
-    let activity_display = move || {
-        activity_tick.get();
-        format_relative_time(&last_activity)
-    };
-
-    let child_prefix = if has_children { "^ " } else { "" };
-    let label_display = format!("{}{}", child_prefix, label);
-
-    let detail_agent_id = RwSignal::new(agent.id.clone());
-    let detail_prompt = RwSignal::new(agent.system_prompt.clone());
-    let detail_status = RwSignal::new(agent.status.clone());
-    let detail_comms = RwSignal::new(agent.comms.clone());
-    let detail_workdir = RwSignal::new(agent.work_dir.clone());
-    let detail_branch = RwSignal::new(agent.worktree_branch.clone());
     let tab_agent_id = id.clone();
 
     let detail_view = move || {
@@ -130,9 +152,10 @@ pub fn AgentNode(
             }
         };
 
+        let content_agent_id = tab_agent_id.clone();
         let content = move || {
             if show_chat.get() {
-                let aid = detail_agent_id.get();
+                let aid = content_agent_id.clone();
                 view! {
                     <ChatPanel
                         agent_id=aid
@@ -142,14 +165,21 @@ pub fn AgentNode(
                 }
                 .into_any()
             } else {
-                let prompt = detail_prompt.get();
+                let (status, comms, workdir, branch, prompt) = node.with(|node| {
+                    (
+                        node.agent.status.clone(),
+                        node.agent.comms.clone(),
+                        node.agent.work_dir.clone(),
+                        node.agent.worktree_branch.clone(),
+                        node.agent.system_prompt.clone(),
+                    )
+                });
                 let prompt_preview = if prompt.chars().count() > 500 {
                     let truncated: String = prompt.chars().take(500).collect();
                     format!("{}...", truncated)
                 } else {
                     prompt
                 };
-                let branch = detail_branch.get();
                 let branch_view = branch.map(|b| {
                     view! {
                         <span class="detail-key">"branch"</span>
@@ -160,11 +190,11 @@ pub fn AgentNode(
                 view! {
                     <div class="agent-detail-grid">
                         <span class="detail-key">"status"</span>
-                        <span class="detail-value">{detail_status.get()}</span>
+                        <span class="detail-value">{status}</span>
                         <span class="detail-key">"comms"</span>
-                        <span class="detail-value">{detail_comms.get()}</span>
+                        <span class="detail-value">{comms}</span>
                         <span class="detail-key">"work dir"</span>
-                        <span class="detail-value">{detail_workdir.get()}</span>
+                        <span class="detail-value">{workdir}</span>
                         {branch_view}
                         <span class="detail-key">"prompt"</span>
                         <span class="detail-value prompt">{prompt_preview}</span>
@@ -186,27 +216,20 @@ pub fn AgentNode(
         .into_any()
     };
 
-    let children_view = if has_children {
-        let child_views: Vec<AnyView> = children
-            .into_iter()
-            .map(|child| {
-                AgentNode(AgentNodeProps {
-                    node: child,
-                    expanded_agents,
-                    log_tabs,
-                    log_scroll_positions,
-                    log_cache,
-                })
-            })
-            .collect();
-
-        Some(view! {
-            <div class="agent-children">
-                {child_views}
-            </div>
+    let child_ids = move || {
+        node.with(|node| {
+            node.children
+                .iter()
+                .map(|child| child.agent.id.clone())
+                .collect::<Vec<_>>()
         })
-    } else {
-        None
+    };
+    let children_style = move || {
+        if node.with(|node| node.children.is_empty()) {
+            "display:none"
+        } else {
+            ""
+        }
     };
 
     let node_agent_id = id.clone();
@@ -214,13 +237,13 @@ pub fn AgentNode(
     view! {
         <div class="agent-node" data-agent-id=node_agent_id>
             <div class=card_class on:click=on_click>
-                <div class={format!("agent-status-indicator {}", status_class)}></div>
+                <div class=status_indicator_class></div>
                 <div class="agent-identity">
                     <span class="agent-label">{label_display}</span>
                     <span class="agent-id">{id}</span>
                 </div>
                 <div class="agent-badges">
-                    <span class={format!("badge badge-harness {}", harness_class)}>
+                    <span class=harness_badge_class>
                         {harness_display}
                     </span>
                     <span class="badge badge-model">{model_display}</span>
@@ -241,7 +264,22 @@ pub fn AgentNode(
                 </div>
             </div>
             {detail_view}
-            {children_view}
+            <div class="agent-children" style=children_style>
+                <For
+                    each=child_ids
+                    key=|agent_id| agent_id.clone()
+                    let(child_id)
+                >
+                    {render_agent_node(
+                        child_id,
+                        node_signals,
+                        expanded_agents,
+                        log_tabs,
+                        log_scroll_positions,
+                        log_cache,
+                    )}
+                </For>
+            </div>
         </div>
     }
     .into_any()

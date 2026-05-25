@@ -17,7 +17,6 @@ pub fn App() -> impl IntoView {
     let show_done = RwSignal::new(true);
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
-    let topic_scroll_top = RwSignal::new(0i32);
 
     spawn_local({
         let stats = stats;
@@ -61,11 +60,6 @@ pub fn App() -> impl IntoView {
         }
     });
 
-    let on_topic_scroll = move |ev: web_sys::Event| {
-        let target = event_target::<web_sys::HtmlElement>(&ev);
-        topic_scroll_top.set(target.scroll_top());
-    };
-
     view! {
         <div class="app">
             <Header stats=stats ws_state=ws_state />
@@ -73,7 +67,6 @@ pub fn App() -> impl IntoView {
             <div
                 class="main-content"
                 data-topic-scroll-root="true"
-                on:scroll=on_topic_scroll
             >
                 <TopicTree
                     agents=agents
@@ -82,7 +75,6 @@ pub fn App() -> impl IntoView {
                     show_done=show_done
                     loading=loading
                     error=error
-                    topic_scroll_top=topic_scroll_top
                 />
             </div>
         </div>

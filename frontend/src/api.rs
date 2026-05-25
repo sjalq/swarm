@@ -157,11 +157,7 @@ async fn ws_connect_loop(
             match msg {
                 Ok(WsMessage::Text(text)) => {
                     if let Ok(event) = serde_json::from_str::<SwarmEvent>(&text) {
-                        agents.update(|a| {
-                            activity_map.update(|am| {
-                                crate::state::apply_event(a, am, &event);
-                            });
-                        });
+                        apply_ws_event(agents, activity_map, event);
                     }
                 }
                 Ok(WsMessage::Bytes(_)) => {}
@@ -176,4 +172,40 @@ async fn ws_connect_loop(
         let delay = ws_state.get_untracked().reconnect_delay_ms();
         gloo_timers::future::TimeoutFuture::new(delay).await;
     }
+}
+
+fn apply_ws_event(
+    agents: RwSignal<Vec<Agent>>,
+    activity_map: RwSignal<HashMap<String, String>>,
+    event: SwarmEvent,
+) {
+    match event {
+        SwarmEvent::AgentOutput { agent_id, .. } | SwarmEvent::AgentError { agent_id, .. } => {
+            mark_activity(activity_map, agent_id);
+        }
+        SwarmEvent::MessageRouted { from, to } => {
+            let now = chrono::Utc::now().to_rfc3339();
+            activity_map.update(|am| {
+                am.insert(from, now.clone());
+                am.insert(to, now);
+            });
+        }
+        SwarmEvent::UserNotification { from, .. } => {
+            mark_activity(activity_map, from);
+        }
+        event => {
+            agents.update(|a| {
+                activity_map.update(|am| {
+                    crate::state::apply_event(a, am, &event);
+                });
+            });
+        }
+    }
+}
+
+fn mark_activity(activity_map: RwSignal<HashMap<String, String>>, agent_id: String) {
+    let now = chrono::Utc::now().to_rfc3339();
+    activity_map.update(|am| {
+        am.insert(agent_id, now);
+    });
 }

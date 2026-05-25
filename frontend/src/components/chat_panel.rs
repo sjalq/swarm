@@ -34,6 +34,12 @@ pub fn ChatPanel(
         cancel_flag.store(true, Ordering::Relaxed);
     });
 
+    restore_saved_log_scroll(
+        agent_id.clone(),
+        scroll_positions,
+        scroll_restore_token.clone(),
+    );
+
     let id = agent_id.clone();
     let initial_scroll_restore_token = scroll_restore_token.clone();
     spawn_local(async move {
@@ -85,7 +91,6 @@ pub fn ChatPanel(
             return view! { <div class="chat-error">{err}</div> }.into_any();
         }
 
-        let log = entries.get();
         let send_agent_id = form_agent_id.clone();
         let send_scroll_restore_token = scroll_restore_token.clone();
         let on_send = move |ev: web_sys::SubmitEvent| {
@@ -141,22 +146,22 @@ pub fn ChatPanel(
                 on:scroll=on_log_scroll
             >
                 <div class="chat-messages">
-                    {if log.is_empty() {
-                        view! { <div class="chat-empty">"no log entries"</div> }.into_any()
-                    } else {
-                        view! {
-                            <>
-                                {log.into_iter().map(|entry| {
-                                    view! {
-                                        <ChatBubble
-                                            entry=entry
-                                            expanded_json_entries=expanded_json_entries
-                                        />
-                                    }
-                                }).collect::<Vec<_>>()}
-                            </>
+                    <For
+                        each=move || entries.get()
+                        key=|entry| log_entry_key(entry)
+                        let(entry)
+                    >
+                        <ChatBubble
+                            entry=entry
+                            expanded_json_entries=expanded_json_entries
+                        />
+                    </For>
+                    {move || {
+                        if entries.with(|log| log.is_empty()) {
+                            view! { <div class="chat-empty">"no log entries"</div> }.into_any()
+                        } else {
+                            view! { <></> }.into_any()
                         }
-                        .into_any()
                     }}
                 </div>
                 <form class="topic-message-form" on:submit=on_send>
@@ -212,6 +217,28 @@ enum ScrollRestore {
     Bottom,
 }
 
+fn restore_saved_log_scroll(
+    agent_id: String,
+    scroll_positions: RwSignal<HashMap<String, i32>>,
+    scroll_restore_token: Arc<AtomicU64>,
+) {
+    let Some(scroll_top) =
+        scroll_positions.with_untracked(|positions| positions.get(&agent_id).copied())
+    else {
+        return;
+    };
+
+    let token = scroll_restore_token
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    restore_log_scroll(
+        agent_id,
+        Some(ScrollRestore::Top(scroll_top)),
+        token,
+        scroll_restore_token,
+    );
+}
+
 fn current_scroll_restore(
     agent_id: &str,
     scroll_positions: RwSignal<HashMap<String, i32>>,
@@ -233,12 +260,8 @@ fn current_scroll_restore(
             Some(ScrollRestore::Top(scroll_top))
         }
     } else {
-        scroll_positions.with_untracked(|positions| {
-            positions
-                .get(agent_id)
-                .copied()
-                .map(ScrollRestore::Top)
-        })
+        scroll_positions
+            .with_untracked(|positions| positions.get(agent_id).copied().map(ScrollRestore::Top))
     }
 }
 

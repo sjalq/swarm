@@ -226,7 +226,6 @@ html, body {
 .main-content {
     flex: 1;
     overflow-y: auto;
-    overflow-anchor: none;
     padding: 16px 20px;
 }
 
@@ -523,7 +522,6 @@ html, body {
     flex-direction: column;
     max-height: 400px;
     overflow-y: auto;
-    overflow-anchor: none;
 }
 
 .chat-messages {

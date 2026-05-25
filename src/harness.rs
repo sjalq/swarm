@@ -28,6 +28,10 @@ pub trait Harness: Send + Sync {
         env_extra: HashMap<String, String>,
         tx: mpsc::Sender<HarnessOutput>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+    fn min_run_grace(&self) -> Duration {
+        Duration::from_millis(25)
+    }
 }
 
 // -- Echo harness (testing) --------------------------------------------------
@@ -215,6 +219,13 @@ impl CliKind {
         matches!(self, Self::Codex)
     }
 
+    pub fn min_run_grace(&self) -> Duration {
+        match self {
+            Self::Grok | Self::CursorAgent => Duration::from_secs(15),
+            _ => Duration::from_millis(25),
+        }
+    }
+
     fn build_args(
         &self,
         prompt: &str,
@@ -258,6 +269,7 @@ impl CliKind {
                     "--sandbox".into(),
                     "disabled".into(),
                 ]);
+                args.push("--".into());
                 args.push(prompt.into());
                 args
             }
@@ -367,6 +379,10 @@ impl CliHarness {
 impl Harness for CliHarness {
     fn name(&self) -> &str {
         self.kind.default_binary()
+    }
+
+    fn min_run_grace(&self) -> Duration {
+        self.kind.min_run_grace()
     }
 
     fn run(
