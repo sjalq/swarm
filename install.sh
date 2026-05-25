@@ -90,7 +90,7 @@ checksum_cmd() {
     esac
 }
 
-print_path_hint() {
+ensure_on_path() {
     local os="$1"
     local bin_dir="${2:-$BIN_DIR}"
     local shell_name="${SHELL##*/}"
@@ -115,17 +115,29 @@ print_path_hint() {
             path_line="fish_add_path \"${bin_dir}\""
             ;;
         *)
-            rc_file="your shell startup file"
+            rc_file=""
             path_line="export PATH=\"${bin_dir}:\$PATH\""
             ;;
     esac
 
-    printf '\n'
-    info "WARNING: %s is not in your PATH." "$bin_dir"
-    info "Add this line to %s:" "$rc_file"
-    printf '\n  %s\n\n' "$path_line"
-    info "Then restart your shell, or run the line above in this terminal."
-    printf '\n'
+    if [ -z "$rc_file" ]; then
+        printf '\n'
+        info "WARNING: %s is not in your PATH." "$bin_dir"
+        info "Add this to your shell startup file:"
+        printf '\n  %s\n\n' "$path_line"
+        return
+    fi
+
+    touch "$rc_file"
+    if grep -qF "$bin_dir" "$rc_file" 2>/dev/null; then
+        info "%s already referenced in %s" "$bin_dir" "$rc_file"
+    else
+        printf '\n# Added by swarm installer\n%s\n' "$path_line" >> "$rc_file"
+        info "Added %s to %s" "$bin_dir" "$rc_file"
+    fi
+
+    export PATH="${bin_dir}:$PATH"
+    info "%s is now on your PATH (current session and future shells)." "$bin_dir"
 }
 
 fallback_to_source_install() {
@@ -153,7 +165,7 @@ fallback_to_source_install() {
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$cargo_bin_dir"; then
-        print_path_hint "$os" "$cargo_bin_dir"
+        ensure_on_path "$os" "$cargo_bin_dir"
     fi
 
     info "Done! Run '${BIN_NAME} --help' to get started."
@@ -227,7 +239,7 @@ main() {
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-        print_path_hint "$os" "$BIN_DIR"
+        ensure_on_path "$os" "$BIN_DIR"
     fi
 
     info "Done! Run '${BIN_NAME} --help' to get started."
