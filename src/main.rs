@@ -38,6 +38,7 @@ const DEFAULT_SWARM_PORT: u16 = 9800;
         LLM-first command order:\n  \
         Reply / receive:\n    \
         swarm send parent \"message\"   Reply to whoever started this topic\n    \
+        swarm send-family \"message\"   Broadcast to parent, siblings, and children\n    \
         swarm inbox --new --all       Read new direct messages\n    \
         swarm watch-inbox             Stream new direct messages\n    \
         swarm done \"summary\"          Pause current topic after handing off\n  \

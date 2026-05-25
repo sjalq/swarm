@@ -2328,8 +2328,50 @@ async fn broadcast_family_sends_to_parent_siblings_and_children() {
 
     for msg in &msgs {
         assert_eq!(msg.from_agent, sender.id);
-        assert_eq!(msg.content, "family update");
+        assert!(
+            msg.content.contains("[family broadcast to:"),
+            "message should be tagged as family broadcast"
+        );
+        assert!(
+            msg.content.contains("family update"),
+            "message should contain the original content"
+        );
     }
+}
+
+#[tokio::test]
+async fn broadcast_family_tags_messages_with_recipient_list() {
+    let (_dir, orch) = setup();
+
+    let parent = orch
+        .start_topic("parent", "echo", "", None, "mesh")
+        .unwrap();
+    let sender = orch
+        .start_topic("sender", "echo", "", Some(&parent.id), "mesh")
+        .unwrap();
+    let child = orch
+        .start_topic("child", "echo", "", Some(&sender.id), "mesh")
+        .unwrap();
+
+    let msgs = orch
+        .broadcast_family(&sender.id, "heads up")
+        .await
+        .unwrap();
+
+    assert_eq!(msgs.len(), 2);
+    let content = &msgs[0].content;
+    assert!(
+        content.contains(&parent.id),
+        "broadcast tag should list parent as recipient: {content}"
+    );
+    assert!(
+        content.contains(&child.id),
+        "broadcast tag should list child as recipient: {content}"
+    );
+    assert!(
+        content.ends_with("heads up"),
+        "original message should follow the tag: {content}"
+    );
 }
 
 #[tokio::test]

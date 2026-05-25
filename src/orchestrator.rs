@@ -1096,9 +1096,15 @@ impl Orchestrator {
             .map(|a| a.id.clone())
             .collect();
 
+        let tagged = format!(
+            "[family broadcast to: {}]\n{}",
+            targets.join(", "),
+            content
+        );
+
         let mut sent = Vec::with_capacity(targets.len());
         for target in targets {
-            match self.send_message(from, &target, content).await {
+            match self.send_message(from, &target, &tagged).await {
                 Ok(msg) => sent.push(msg),
                 Err(SwarmError::AgentNotFound(_)) => continue,
                 Err(e) => return Err(e),
