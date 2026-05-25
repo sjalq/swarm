@@ -42,14 +42,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross
+      - uses: taiki-e/install-action@v2
         if: matrix.use_cross
-        run: cargo install cross --locked
+        with:
+          tool: cross
 
-      - name: Install dashboard build tools
-        run: |
-          rustup target add wasm32-unknown-unknown
-          cargo install trunk --locked
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
 
       - name: Build dashboard
         working-directory: frontend
