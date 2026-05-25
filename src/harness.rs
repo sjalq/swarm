@@ -191,7 +191,13 @@ impl CliKind {
     }
 
     pub fn all_kinds() -> &'static [CliKind] {
-        &[Self::Claude, Self::CursorAgent, Self::Gemini, Self::Codex, Self::Grok]
+        &[
+            Self::Claude,
+            Self::CursorAgent,
+            Self::Gemini,
+            Self::Codex,
+            Self::Grok,
+        ]
     }
 
     pub fn from_harness_name(name: &str) -> Option<Self> {
@@ -658,7 +664,10 @@ mod tests {
     #[test]
     fn cli_kind_env_vars() {
         assert_eq!(CliKind::Claude.env_var_name(), "SWARM_CLAUDE_BIN");
-        assert_eq!(CliKind::CursorAgent.env_var_name(), "SWARM_CURSOR_AGENT_BIN");
+        assert_eq!(
+            CliKind::CursorAgent.env_var_name(),
+            "SWARM_CURSOR_AGENT_BIN"
+        );
         assert_eq!(CliKind::Codex.env_var_name(), "SWARM_CODEX_BIN");
         assert_eq!(CliKind::Gemini.env_var_name(), "SWARM_GEMINI_BIN");
         assert_eq!(CliKind::Grok.env_var_name(), "SWARM_GROK_BIN");
@@ -761,7 +770,10 @@ mod tests {
     #[test]
     fn api_key_env_names() {
         assert_eq!(CliKind::Claude.api_key_env_names(), &["ANTHROPIC_API_KEY"]);
-        assert_eq!(CliKind::CursorAgent.api_key_env_names(), &["CURSOR_API_KEY"]);
+        assert_eq!(
+            CliKind::CursorAgent.api_key_env_names(),
+            &["CURSOR_API_KEY"]
+        );
         assert!(CliKind::Codex
             .api_key_env_names()
             .contains(&"OPENAI_API_KEY"));
