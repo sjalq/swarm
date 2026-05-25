@@ -19,7 +19,7 @@ pub fn render_agent_node(
     log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
 ) -> AnyView {
     let Some(node) = node_signals.with_untracked(|signals| signals.get(&agent_id).copied()) else {
-        return view! { <></> }.into_any();
+        return view! { <div style="display:none"></div> }.into_any();
     };
 
     view! {

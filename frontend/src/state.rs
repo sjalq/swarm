@@ -273,10 +273,9 @@ pub fn build_tree(agents: &[Agent], activity_map: &HashMap<String, String>) -> V
 
     let root_ids: Vec<&str> = agents
         .iter()
-        .filter(|a| {
-            a.parent_id
-                .as_ref()
-                .map_or(true, |pid| !agent_map.contains_key(pid.as_str()))
+        .filter(|a| match a.parent_id.as_ref() {
+            Some(pid) => !agent_map.contains_key(pid.as_str()),
+            None => true,
         })
         .map(|a| a.id.as_str())
         .collect();

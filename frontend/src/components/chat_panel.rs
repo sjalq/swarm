@@ -160,7 +160,7 @@ pub fn ChatPanel(
                         if entries.with(|log| log.is_empty()) {
                             view! { <div class="chat-empty">"no log entries"</div> }.into_any()
                         } else {
-                            view! { <></> }.into_any()
+                            view! { <div style="display:none"></div> }.into_any()
                         }
                     }}
                 </div>

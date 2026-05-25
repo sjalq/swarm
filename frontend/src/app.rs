@@ -18,44 +18,35 @@ pub fn App() -> impl IntoView {
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
 
-    spawn_local({
-        let stats = stats;
-        let agents = agents;
-        let loading = loading;
-        let error = error;
-        async move {
-            loading.set(true);
-            stats.set(RemoteData::Loading);
+    spawn_local(async move {
+        loading.set(true);
+        stats.set(RemoteData::Loading);
 
-            match api::fetch_agents(true).await {
-                Ok(agent_list) => {
-                    agents.set(agent_list);
-                    error.set(None);
-                }
-                Err(e) => {
-                    error.set(Some(e));
-                }
+        match api::fetch_agents(true).await {
+            Ok(agent_list) => {
+                agents.set(agent_list);
+                error.set(None);
             }
-
-            match api::fetch_stats().await {
-                Ok(s) => stats.set(RemoteData::Success(s)),
-                Err(e) => stats.set(RemoteData::Failure(e)),
+            Err(e) => {
+                error.set(Some(e));
             }
-
-            loading.set(false);
         }
+
+        match api::fetch_stats().await {
+            Ok(s) => stats.set(RemoteData::Success(s)),
+            Err(e) => stats.set(RemoteData::Failure(e)),
+        }
+
+        loading.set(false);
     });
 
     api::connect_websocket(agents, activity_map, ws_state);
 
-    spawn_local({
-        let stats = stats;
-        async move {
-            loop {
-                gloo_timers::future::TimeoutFuture::new(5_000).await;
-                if let Ok(s) = api::fetch_stats().await {
-                    stats.set(RemoteData::Success(s));
-                }
+    spawn_local(async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(5_000).await;
+            if let Ok(s) = api::fetch_stats().await {
+                stats.set(RemoteData::Success(s));
             }
         }
     });

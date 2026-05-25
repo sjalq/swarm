@@ -58,7 +58,7 @@ pub fn TopicTree(
             if root_ids.with(|ids| ids.is_empty()) {
                 view! { <div class="tree-empty">"no agents"</div> }.into_any()
             } else {
-                view! { <></> }.into_any()
+                view! { <div style="display:none"></div> }.into_any()
             }
         };
 
