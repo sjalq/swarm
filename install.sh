@@ -149,6 +149,14 @@ fallback_to_source_install() {
         err "No prebuilt release found and cargo is not installed.\nEither retry after a GitHub release is published, or install Rust/Cargo from https://rustup.rs and run:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
     fi
 
+    info "Ensuring wasm32 target is installed..."
+    rustup target add wasm32-unknown-unknown 2>/dev/null || true
+
+    if ! command -v trunk >/dev/null 2>&1; then
+        info "Installing trunk (needed to build the dashboard)..."
+        cargo install trunk || err "Failed to install trunk. Install manually with: cargo install trunk"
+    fi
+
     info "No prebuilt release found. Falling back to cargo source install (this takes a few minutes)..."
     cargo install --git https://github.com/sjalq/swarm swarm-cli || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
 
