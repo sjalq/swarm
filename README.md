@@ -72,7 +72,7 @@ Set `SWARM_VERSION=v0.1.0` to pin a specific version. Set `BIN_DIR=~/.local/bin`
 ### From source
 
 ```bash
-cargo install --git https://github.com/sjalq/swarm --bin swarm
+cargo install --git https://github.com/sjalq/swarm swarm-cli
 ```
 
 ### From Homebrew (coming soon)

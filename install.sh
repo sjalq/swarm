@@ -134,11 +134,11 @@ fallback_to_source_install() {
 
     info "%s" "$reason"
     if ! command -v cargo >/dev/null 2>&1; then
-        err "No prebuilt release found and cargo is not installed.\nEither retry after a GitHub release is published, or install Rust/Cargo from https://rustup.rs and run:\n  cargo install --git https://github.com/sjalq/swarm --bin swarm"
+        err "No prebuilt release found and cargo is not installed.\nEither retry after a GitHub release is published, or install Rust/Cargo from https://rustup.rs and run:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
     fi
 
     info "No prebuilt release found. Falling back to cargo source install (this takes a few minutes)..."
-    cargo install --git https://github.com/sjalq/swarm --bin swarm || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/sjalq/swarm --bin swarm"
+    cargo install --git https://github.com/sjalq/swarm swarm-cli || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
 
     local cargo_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
     local installed_bin="${cargo_bin_dir}/${BIN_NAME}"
