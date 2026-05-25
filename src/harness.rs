@@ -221,7 +221,7 @@ impl CliKind {
 
     pub fn min_run_grace(&self) -> Duration {
         match self {
-            Self::Grok | Self::CursorAgent => Duration::from_secs(15),
+            Self::Grok | Self::CursorAgent | Self::Codex | Self::Gemini => Duration::from_secs(15),
             _ => Duration::from_millis(25),
         }
     }

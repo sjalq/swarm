@@ -126,20 +126,49 @@ pub struct LogEntry {
     pub kind: String,
     pub peer: String,
     pub content: String,
+    #[serde(default)]
+    pub broadcast_id: Option<String>,
+    #[serde(default)]
+    pub broadcast_count: Option<usize>,
 }
 
 impl LogEntry {
+    pub fn is_family_broadcast(&self) -> bool {
+        self.broadcast_id.is_some()
+    }
+
     pub fn bubble_class(&self) -> &str {
-        match self.kind.as_str() {
-            "recv" if self.peer == "user" => "chat-bubble incoming external",
-            "sent" if self.peer == "user" => "chat-bubble outgoing external",
-            "recv" => "chat-bubble incoming",
-            "sent" => "chat-bubble outgoing",
-            _ => "chat-bubble system",
+        if self.is_family_broadcast() {
+            match self.kind.as_str() {
+                "recv" => "chat-bubble incoming family",
+                "sent" => "chat-bubble outgoing family",
+                _ => "chat-bubble system",
+            }
+        } else {
+            match self.kind.as_str() {
+                "recv" if self.peer == "user" => "chat-bubble incoming external",
+                "sent" if self.peer == "user" => "chat-bubble outgoing external",
+                "recv" => "chat-bubble incoming",
+                "sent" => "chat-bubble outgoing",
+                _ => "chat-bubble system",
+            }
         }
     }
 
     pub fn label(&self) -> String {
+        if self.is_family_broadcast() {
+            return match self.kind.as_str() {
+                "recv" => format!("family broadcast from {}", self.peer),
+                "sent" => {
+                    if let Some(n) = self.broadcast_count {
+                        format!("sent to family ({n})")
+                    } else {
+                        "sent to family".into()
+                    }
+                }
+                _ => self.kind.clone(),
+            };
+        }
         match self.kind.as_str() {
             "recv" if self.peer.is_empty() => "received".into(),
             "recv" => format!("received from {}", self.peer),

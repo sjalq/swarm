@@ -233,6 +233,7 @@ async fn global_data_dir_scopes_agents_to_current_project() {
         content: "project a".into(),
         delivered: false,
         created_at: "2026-01-01T00:00:01Z".into(),
+        broadcast_id: None,
     })
     .unwrap();
     db.enqueue_message(&MessageRow {
@@ -242,6 +243,7 @@ async fn global_data_dir_scopes_agents_to_current_project() {
         content: "project b".into(),
         delivered: false,
         created_at: "2026-01-01T00:00:01Z".into(),
+        broadcast_id: None,
     })
     .unwrap();
 
@@ -853,6 +855,7 @@ async fn http_api_stats_returns_counts() {
         content: "queued for stats".into(),
         delivered: false,
         created_at: "2026-01-01T00:00:00Z".into(),
+        broadcast_id: None,
     })
     .unwrap();
     db.insert_output_log(&OutputLogRow {
@@ -1102,7 +1105,10 @@ async fn echo_agent_log_captures_received_and_sent_messages() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
+                Ok(SwarmEvent::AgentStatus {
+                    status: TopicStatus::Idle,
+                    ..
+                }) => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -1202,7 +1208,10 @@ async fn http_api_agent_log() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
+                Ok(SwarmEvent::AgentStatus {
+                    status: TopicStatus::Idle,
+                    ..
+                }) => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -1348,7 +1357,10 @@ async fn harness_error_surfaces_in_events_and_log() {
                     );
                     saw_error_event = true;
                 }
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Error => {
+                Ok(SwarmEvent::AgentStatus {
+                    status: TopicStatus::Error,
+                    ..
+                }) => {
                     saw_error_status = true;
                     if saw_error_event {
                         return;
@@ -1482,7 +1494,10 @@ async fn events_are_persisted_and_queryable() {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(SwarmEvent::AgentStatus { status, .. }) if status == TopicStatus::Idle => return,
+                Ok(SwarmEvent::AgentStatus {
+                    status: TopicStatus::Idle,
+                    ..
+                }) => return,
                 Err(_) => return,
                 _ => continue,
             }
@@ -2311,7 +2326,11 @@ async fn broadcast_family_sends_to_parent_siblings_and_children() {
         targets.contains(&child_b.id.as_str()),
         "should send to child b"
     );
-    assert_eq!(targets.len(), 4, "should send to exactly parent + sibling + 2 children");
+    assert_eq!(
+        targets.len(),
+        4,
+        "should send to exactly parent + sibling + 2 children"
+    );
 
     assert!(
         !targets.contains(&sender.id.as_str()),
@@ -2321,26 +2340,25 @@ async fn broadcast_family_sends_to_parent_siblings_and_children() {
         !targets.contains(&grandparent.id.as_str()),
         "should not send to grandparent"
     );
-    assert!(
-        !targets.contains(&"user"),
-        "should not send to user"
-    );
+    assert!(!targets.contains(&"user"), "should not send to user");
 
+    let broadcast_id = msgs[0]
+        .broadcast_id
+        .as_ref()
+        .expect("should have broadcast_id");
     for msg in &msgs {
         assert_eq!(msg.from_agent, sender.id);
-        assert!(
-            msg.content.contains("[family broadcast to:"),
-            "message should be tagged as family broadcast"
-        );
-        assert!(
-            msg.content.contains("family update"),
-            "message should contain the original content"
+        assert_eq!(msg.content, "family update");
+        assert_eq!(
+            msg.broadcast_id.as_ref(),
+            Some(broadcast_id),
+            "all messages in a broadcast should share the same broadcast_id"
         );
     }
 }
 
 #[tokio::test]
-async fn broadcast_family_tags_messages_with_recipient_list() {
+async fn broadcast_family_deduplicates_in_sender_log() {
     let (_dir, orch) = setup();
 
     let parent = orch
@@ -2349,28 +2367,31 @@ async fn broadcast_family_tags_messages_with_recipient_list() {
     let sender = orch
         .start_topic("sender", "echo", "", Some(&parent.id), "mesh")
         .unwrap();
-    let child = orch
+    let _child = orch
         .start_topic("child", "echo", "", Some(&sender.id), "mesh")
         .unwrap();
 
-    let msgs = orch
-        .broadcast_family(&sender.id, "heads up")
-        .await
-        .unwrap();
+    orch.broadcast_family(&sender.id, "heads up").await.unwrap();
 
-    assert_eq!(msgs.len(), 2);
-    let content = &msgs[0].content;
-    assert!(
-        content.contains(&parent.id),
-        "broadcast tag should list parent as recipient: {content}"
+    let log = orch
+        .get_agent_log(&sender.id, 50, LogFilter::Messages)
+        .unwrap();
+    let sent: Vec<_> = log.iter().filter(|e| e.kind == "sent").collect();
+    assert_eq!(
+        sent.len(),
+        1,
+        "broadcast should show as single entry in sender log, got {}",
+        sent.len()
     );
+    assert_eq!(sent[0].content, "heads up");
     assert!(
-        content.contains(&child.id),
-        "broadcast tag should list child as recipient: {content}"
+        sent[0].broadcast_id.is_some(),
+        "sent entry should have broadcast_id"
     );
-    assert!(
-        content.ends_with("heads up"),
-        "original message should follow the tag: {content}"
+    assert_eq!(
+        sent[0].broadcast_count,
+        Some(2),
+        "broadcast_count should reflect number of recipients"
     );
 }
 
@@ -2390,10 +2411,7 @@ async fn broadcast_family_excludes_done_agents() {
 
     orch.done_agent(&sibling.id, None).await.unwrap();
 
-    let msgs = orch
-        .broadcast_family(&sender.id, "update")
-        .await
-        .unwrap();
+    let msgs = orch.broadcast_family(&sender.id, "update").await.unwrap();
 
     let targets: Vec<&str> = msgs.iter().map(|m| m.to_agent.as_str()).collect();
     assert!(
@@ -2410,15 +2428,13 @@ async fn broadcast_family_excludes_done_agents() {
 async fn broadcast_family_returns_empty_for_isolated_agent() {
     let (_dir, orch) = setup();
 
-    let agent = orch
-        .start_topic("loner", "echo", "", None, "mesh")
-        .unwrap();
+    let agent = orch.start_topic("loner", "echo", "", None, "mesh").unwrap();
 
-    let msgs = orch
-        .broadcast_family(&agent.id, "hello?")
-        .await
-        .unwrap();
-    assert!(msgs.is_empty(), "isolated agent has no family to broadcast to");
+    let msgs = orch.broadcast_family(&agent.id, "hello?").await.unwrap();
+    assert!(
+        msgs.is_empty(),
+        "isolated agent has no family to broadcast to"
+    );
 }
 
 #[tokio::test]
@@ -2450,10 +2466,7 @@ async fn broadcast_family_http_endpoint() {
     let msgs: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert_eq!(msgs.len(), 2);
 
-    let targets: Vec<&str> = msgs
-        .iter()
-        .filter_map(|m| m["to_agent"].as_str())
-        .collect();
+    let targets: Vec<&str> = msgs.iter().filter_map(|m| m["to_agent"].as_str()).collect();
     assert!(targets.contains(&parent.id.as_str()));
     assert!(targets.contains(&child.id.as_str()));
 }

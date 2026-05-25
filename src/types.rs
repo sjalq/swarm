@@ -54,9 +54,10 @@ impl fmt::Display for TopicStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommsMode {
     #[serde(rename = "mesh")]
+    #[default]
     Mesh,
     #[serde(rename = "parent-only")]
     ParentOnly,
@@ -82,12 +83,6 @@ impl SqlEnum for CommsMode {
 impl fmt::Display for CommsMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_sql())
-    }
-}
-
-impl Default for CommsMode {
-    fn default() -> Self {
-        Self::Mesh
     }
 }
 
@@ -132,6 +127,8 @@ pub struct MessageRow {
     pub content: String,
     pub delivered: bool,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +159,10 @@ pub struct LogEntry {
     pub kind: String,
     pub peer: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast_count: Option<usize>,
 }
 
 pub enum LogFilter {

@@ -19,6 +19,7 @@
     --harness-codex: #a5d474;
     --harness-grok: #d474a5;
     --harness-echo: #888888;
+    --family-broadcast: #b48ade;
     --tree-line: #2a3a4a;
     --font-body: 'IBM Plex Sans', system-ui, sans-serif;
     --font-mono: 'IBM Plex Mono', 'Menlo', monospace;
@@ -573,6 +574,15 @@ html, body {
 
 .chat-bubble.external .bubble-label {
     color: var(--harness-claude);
+}
+
+.chat-bubble.family {
+    background: rgba(180, 138, 222, 0.08);
+    border-color: var(--family-broadcast);
+}
+
+.chat-bubble.family .bubble-label {
+    color: var(--family-broadcast);
 }
 
 .chat-bubble.system {

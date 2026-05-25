@@ -89,7 +89,7 @@ enum Commands {
             - `swarm watch-inbox` without a topic watches the current topic inbox inside swarm, or the user inbox outside swarm.\n\n\
             Key options and accepted values:\n  \
             --label <LABEL>       Human-readable prefix for the topic ID. Default: coordinator.\n  \
-            --harness <HARNESS>   One of: claude, cursor-agent, codex, gemini, grok, echo. Default: config default_harness, else echo.\n  \
+            --harness <HARNESS>   One of: claude, cursor-agent, codex, gemini, grok, echo. Default: config default_harness, else claude.\n  \
             --model <MODEL>       Free-form model string passed through to harnesses that support model selection.\n  \
             --comms <MODE>        One of: mesh, parent-only. Default: config default_comms, else mesh.\n  \
             --worktree            Give the topic an isolated git worktree and branch.\n  \
@@ -662,7 +662,7 @@ async fn main() {
                 config
                     .default_harness
                     .clone()
-                    .unwrap_or_else(|| "echo".into())
+                    .unwrap_or_else(|| "claude".into())
             });
             let comms = comms.unwrap_or_else(|| {
                 config
@@ -677,9 +677,17 @@ async fn main() {
             }
 
             let task_text = task.join(" ").trim().to_string();
-            let result = run_task_swarm(
-                daemon, harness, label, prompt, comms, model, worktree, task_text, detach,
-            )
+            let result = run_task_swarm(RunTaskSwarm {
+                daemon,
+                harness,
+                label,
+                prompt,
+                comms,
+                model,
+                worktree,
+                task: task_text,
+                detach,
+            })
             .await;
 
             if let Err(e) = result {
@@ -742,17 +750,17 @@ async fn main() {
             truncate,
         } => {
             let truncate = if raw { 0 } else { truncate.unwrap_or(0) };
-            if let Err(e) = cmd_inbox(
-                from.as_deref(),
+            if let Err(e) = cmd_inbox(InboxCommand {
+                from: from.as_deref(),
                 all,
-                to.as_deref(),
-                new,
-                since.as_deref(),
-                last,
+                to: to.as_deref(),
+                only_new: new,
+                since: since.as_deref(),
+                limit: last,
                 json,
                 truncate,
-                search.as_deref(),
-            )
+                search: search.as_deref(),
+            })
             .await
             {
                 eprintln!("error: {e}");
@@ -1029,7 +1037,7 @@ fn ensure_project_swarm_gitignored(
     Ok(())
 }
 
-async fn run_task_swarm(
+struct RunTaskSwarm {
     daemon: DaemonLaunch,
     harness: String,
     label: String,
@@ -1038,8 +1046,22 @@ async fn run_task_swarm(
     model: Option<String>,
     worktree: bool,
     task: String,
-    _detach: bool,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    detach: bool,
+}
+
+async fn run_task_swarm(args: RunTaskSwarm) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let RunTaskSwarm {
+        daemon,
+        harness,
+        label,
+        prompt,
+        comms,
+        model,
+        worktree,
+        task,
+        detach: _detach,
+    } = args;
+
     let task = if task.trim().is_empty() {
         prompt.trim().to_string()
     } else if prompt.trim().is_empty() {
@@ -1432,9 +1454,7 @@ async fn cmd_peers(
     Ok(())
 }
 
-fn grouped_peers<'a>(
-    agents: &'a [serde_json::Value],
-) -> Vec<(&'static str, Vec<&'a serde_json::Value>)> {
+fn grouped_peers(agents: &[serde_json::Value]) -> Vec<(&'static str, Vec<&serde_json::Value>)> {
     let mut active_user = Vec::new();
     let mut active_children = Vec::new();
     let mut stale_active = Vec::new();
@@ -1518,9 +1538,7 @@ async fn cmd_send(
     Ok(())
 }
 
-async fn cmd_send_family(
-    message: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn cmd_send_family(message: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let from = swarm_agent_id()
         .ok_or("send-family requires SWARM_AGENT_ID (only available inside a swarm topic)")?;
     let socket = api_socket().await?;
@@ -1536,14 +1554,15 @@ async fn cmd_send_family(
 
     if resp.status().is_success() {
         let msgs: Vec<serde_json::Value> = resp.json().await?;
-        let targets: Vec<&str> = msgs
-            .iter()
-            .filter_map(|m| m["to_agent"].as_str())
-            .collect();
+        let targets: Vec<&str> = msgs.iter().filter_map(|m| m["to_agent"].as_str()).collect();
         if targets.is_empty() {
             println!("no family members to send to");
         } else {
-            println!("sent to {} family member(s): {}", targets.len(), targets.join(", "));
+            println!(
+                "sent to {} family member(s): {}",
+                targets.len(),
+                targets.join(", ")
+            );
         }
     } else {
         return Err(response_error(resp).await);
@@ -1583,17 +1602,31 @@ fn resolve_inbox_target(
     }
 }
 
-async fn cmd_inbox(
-    from: Option<&str>,
+struct InboxCommand<'a> {
+    from: Option<&'a str>,
     all: bool,
-    to: Option<&str>,
+    to: Option<&'a str>,
     only_new: bool,
-    since: Option<&str>,
+    since: Option<&'a str>,
     limit: usize,
     json: bool,
     truncate: usize,
-    search: Option<&str>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    search: Option<&'a str>,
+}
+
+async fn cmd_inbox(args: InboxCommand<'_>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let InboxCommand {
+        from,
+        all,
+        to,
+        only_new,
+        since,
+        limit,
+        json,
+        truncate,
+        search,
+    } = args;
+
     let from_agent = if all {
         None
     } else {

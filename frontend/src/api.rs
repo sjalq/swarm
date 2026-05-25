@@ -133,6 +133,7 @@ async fn ws_connect_loop(
         let ws = match WebSocket::open(&url) {
             Ok(ws) => {
                 ws_state.set(WsState::Connected);
+                refresh_agents(agents).await;
                 ws
             }
             Err(e) => {
@@ -158,6 +159,10 @@ async fn ws_connect_loop(
                 Ok(WsMessage::Text(text)) => {
                     if let Ok(event) = serde_json::from_str::<SwarmEvent>(&text) {
                         apply_ws_event(agents, activity_map, event);
+                    } else {
+                        web_sys::console::error_1(
+                            &format!("failed to parse websocket event: {}", text).into(),
+                        );
                     }
                 }
                 Ok(WsMessage::Bytes(_)) => {}
@@ -184,11 +189,18 @@ fn apply_ws_event(
             mark_activity(activity_map, agent_id);
         }
         SwarmEvent::MessageRouted { from, to } => {
+            let should_refresh = agents.with(|agent_list| {
+                let knows = |id: &str| id == "user" || agent_list.iter().any(|a| a.id == id);
+                !knows(&from) || !knows(&to)
+            });
             let now = chrono::Utc::now().to_rfc3339();
             activity_map.update(|am| {
                 am.insert(from, now.clone());
                 am.insert(to, now);
             });
+            if should_refresh {
+                refresh_agents_soon(agents);
+            }
         }
         SwarmEvent::UserNotification { from, .. } => {
             mark_activity(activity_map, from);
@@ -207,5 +219,18 @@ fn mark_activity(activity_map: RwSignal<HashMap<String, String>>, agent_id: Stri
     let now = chrono::Utc::now().to_rfc3339();
     activity_map.update(|am| {
         am.insert(agent_id, now);
+    });
+}
+
+async fn refresh_agents(agents: RwSignal<Vec<Agent>>) {
+    match fetch_agents(true).await {
+        Ok(agent_list) => agents.set(agent_list),
+        Err(e) => web_sys::console::error_1(&format!("agent refresh failed: {}", e).into()),
+    }
+}
+
+fn refresh_agents_soon(agents: RwSignal<Vec<Agent>>) {
+    spawn_local(async move {
+        refresh_agents(agents).await;
     });
 }

@@ -4,6 +4,8 @@ set -euo pipefail
 REPO="sjalq/swarm"
 BIN_NAME="swarm"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+INSTALL_MODE="${SWARM_INSTALL:-auto}"
+SOURCE_DIR="${SWARM_SOURCE_DIR:-}"
 
 info() {
     local fmt="$1"
@@ -30,6 +32,65 @@ err() {
     exit 1
 }
 
+usage() {
+    cat <<'EOF'
+Install swarm.
+
+Usage:
+  install.sh [--release | --source | --local [PATH]] [--version vX.Y.Z] [--bin-dir PATH]
+
+Modes:
+  --release   Install a GitHub release only.
+  --source    Build the latest GitHub source with cargo.
+  --local     Build this checkout, or PATH when provided.
+
+Default mode uses a release when available and falls back to source.
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --release)
+                INSTALL_MODE="release"
+                ;;
+            --source)
+                INSTALL_MODE="source"
+                ;;
+            --local)
+                INSTALL_MODE="local"
+                if [ "${2:-}" != "" ] && [ "${2#-}" = "$2" ]; then
+                    SOURCE_DIR="$2"
+                    shift
+                fi
+                ;;
+            --version)
+                [ "${2:-}" != "" ] || err "--version requires a value"
+                SWARM_VERSION="$2"
+                shift
+                ;;
+            --bin-dir)
+                [ "${2:-}" != "" ] || err "--bin-dir requires a value"
+                BIN_DIR="$2"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                err "Unknown option: %s" "$1"
+                ;;
+        esac
+        shift
+    done
+
+    case "$INSTALL_MODE" in
+        auto|release|source|local) ;;
+        *) err "SWARM_INSTALL must be auto, release, source, or local" ;;
+    esac
+}
+
 detect_os() {
     case "$(uname -s)" in
         Linux*)  echo "linux" ;;
@@ -49,17 +110,28 @@ detect_arch() {
 resolve_target() {
     local os="$1"
     local arch="$2"
-    case "${os}-${arch}" in
-        linux-x86_64)   echo "x86_64-unknown-linux-gnu" ;;
-        linux-aarch64)  echo "aarch64-unknown-linux-gnu" ;;
-        darwin-x86_64)  echo "x86_64-apple-darwin" ;;
-        darwin-aarch64) echo "aarch64-apple-darwin" ;;
-        *)              return 1 ;;
+    local libc="${3:-gnu}"
+    case "${os}-${arch}-${libc}" in
+        linux-x86_64-gnu)    echo "x86_64-unknown-linux-gnu" ;;
+        linux-aarch64-gnu)   echo "aarch64-unknown-linux-gnu" ;;
+        linux-x86_64-musl)   echo "x86_64-unknown-linux-musl" ;;
+        darwin-x86_64-*)     echo "x86_64-apple-darwin" ;;
+        darwin-aarch64-*)    echo "aarch64-apple-darwin" ;;
+        *)                   return 1 ;;
     esac
 }
 
 is_musl_linux() {
     command -v ldd >/dev/null 2>&1 && ldd /bin/ls 2>&1 | grep -qi musl
+}
+
+detect_libc() {
+    local os="$1"
+    if [ "$os" = "linux" ] && is_musl_linux; then
+        echo "musl"
+    else
+        echo "gnu"
+    fi
 }
 
 resolve_version() {
@@ -140,56 +212,114 @@ ensure_on_path() {
     info "%s is now on your PATH (current session and future shells)." "$bin_dir"
 }
 
-fallback_to_source_install() {
+ensure_source_tools() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "Cargo is required for source installs. Install Rust/Cargo from https://rustup.rs and retry."
+    fi
+
+    info "Ensuring wasm32 target is installed..."
+    if command -v rustup >/dev/null 2>&1; then
+        rustup target add wasm32-unknown-unknown 2>/dev/null || true
+    else
+        info "rustup not found; assuming wasm32-unknown-unknown is already installed."
+    fi
+
+    if ! command -v trunk >/dev/null 2>&1; then
+        info "Installing trunk (needed to build the dashboard)..."
+        cargo install trunk --locked || err "Failed to install trunk. Install manually with: cargo install trunk --locked"
+    fi
+}
+
+verify_and_finish() {
+    local os="$1"
+    local bin_path="$2"
+
+    info "Verifying installed binary..."
+    if "$bin_path" --help >/dev/null 2>&1; then
+        info "Verified: swarm is installed at %s" "$bin_path"
+    else
+        err "Installed binary did not run successfully:\n  %s --help" "$bin_path"
+    fi
+
+    local bin_dir
+    bin_dir="$(dirname "$bin_path")"
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$bin_dir"; then
+        ensure_on_path "$os" "$bin_dir"
+    fi
+
+    info "Done! Run '${BIN_NAME} --help' to get started."
+}
+
+install_from_git_source() {
     local os="$1"
     local reason="$2"
 
     info "%s" "$reason"
-    if ! command -v cargo >/dev/null 2>&1; then
-        err "No prebuilt release found and cargo is not installed.\nEither retry after a GitHub release is published, or install Rust/Cargo from https://rustup.rs and run:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
-    fi
+    ensure_source_tools
 
-    info "Ensuring wasm32 target is installed..."
-    rustup target add wasm32-unknown-unknown 2>/dev/null || true
+    local tmp_root
+    tmp_root="$(mktemp -d)"
 
-    if ! command -v trunk >/dev/null 2>&1; then
-        info "Installing trunk (needed to build the dashboard)..."
-        cargo install trunk || err "Failed to install trunk. Install manually with: cargo install trunk"
-    fi
+    info "Building latest source from GitHub (this takes a few minutes)..."
+    cargo install --git "https://github.com/${REPO}" --locked --root "$tmp_root" swarm-cli \
+        || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/${REPO} --locked swarm-cli"
 
-    info "No prebuilt release found. Falling back to cargo source install (this takes a few minutes)..."
-    cargo install --git https://github.com/sjalq/swarm swarm-cli || err "Cargo source install failed.\nRetry manually with:\n  cargo install --git https://github.com/sjalq/swarm swarm-cli"
-
-    local cargo_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
-    local installed_bin="${cargo_bin_dir}/${BIN_NAME}"
-    local installed_version
-
-    if "$installed_bin" --help >/dev/null 2>&1; then
-        info "Verified: swarm is installed at %s" "$installed_bin"
-    elif command -v "$BIN_NAME" >/dev/null 2>&1 && "$BIN_NAME" --help >/dev/null 2>&1; then
-        info "Verified: swarm is installed and on PATH"
-    else
-        err "Source install finished, but the installed swarm binary could not be verified.\nCheck Cargo output and ensure %s is on your PATH." "$cargo_bin_dir"
-    fi
-
-    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$cargo_bin_dir"; then
-        ensure_on_path "$os" "$cargo_bin_dir"
-    fi
-
-    info "Done! Run '${BIN_NAME} --help' to get started."
+    mkdir -p "$BIN_DIR"
+    install -m 755 "${tmp_root}/bin/${BIN_NAME}" "${BIN_DIR}/${BIN_NAME}"
+    rm -rf "$tmp_root"
+    verify_and_finish "$os" "${BIN_DIR}/${BIN_NAME}"
     exit 0
 }
 
-main() {
-    local os arch target version
-    os="$(detect_os)"
-    arch="$(detect_arch)"
+install_from_local_source() {
+    local os="$1"
+    local source_dir="$SOURCE_DIR"
 
-    if [ "$os" = "linux" ] && is_musl_linux; then
-        fallback_to_source_install "$os" "musl Linux detected, but prebuilt musl binaries are not available yet."
+    if [ -z "$source_dir" ]; then
+        local script_path="${BASH_SOURCE[0]:-$0}"
+        source_dir="$(cd "$(dirname "$script_path")" && pwd)"
     fi
 
-    if ! target="$(resolve_target "$os" "$arch")"; then
+    [ -f "${source_dir}/Cargo.toml" ] || err "Local source directory does not contain Cargo.toml: %s" "$source_dir"
+    ensure_source_tools
+
+    info "Building local checkout at %s" "$source_dir"
+    (cd "$source_dir" && cargo build --release --locked) || err "Local cargo build failed."
+
+    mkdir -p "$BIN_DIR"
+    install -m 755 "${source_dir}/target/release/${BIN_NAME}" "${BIN_DIR}/${BIN_NAME}"
+    verify_and_finish "$os" "${BIN_DIR}/${BIN_NAME}"
+    exit 0
+}
+
+fallback_to_source_install() {
+    local os="$1"
+    local reason="$2"
+
+    if [ "$INSTALL_MODE" = "release" ]; then
+        err "%s" "$reason"
+    fi
+
+    install_from_git_source "$os" "$reason"
+}
+
+main() {
+    parse_args "$@"
+
+    local os arch libc target version
+    os="$(detect_os)"
+    arch="$(detect_arch)"
+    libc="$(detect_libc "$os")"
+
+    if [ "$INSTALL_MODE" = "local" ]; then
+        install_from_local_source "$os"
+    fi
+
+    if [ "$INSTALL_MODE" = "source" ]; then
+        install_from_git_source "$os" "Building from GitHub source because source mode was requested."
+    fi
+
+    if ! target="$(resolve_target "$os" "$arch" "$libc")"; then
         fallback_to_source_install "$os" "No prebuilt binary is available for ${os}/${arch}."
     fi
 
@@ -239,18 +369,7 @@ main() {
 
     info "Installed ${BIN_NAME} to ${BIN_DIR}/${BIN_NAME}"
 
-    info "Verifying installed binary..."
-    if "${BIN_DIR}/${BIN_NAME}" --help >/dev/null 2>&1; then
-        info "Verified: swarm is installed at %s" "${BIN_DIR}/${BIN_NAME}"
-    else
-        err "Installed binary did not run successfully:\n  %s --help" "${BIN_DIR}/${BIN_NAME}"
-    fi
-
-    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-        ensure_on_path "$os" "$BIN_DIR"
-    fi
-
-    info "Done! Run '${BIN_NAME} --help' to get started."
+    verify_and_finish "$os" "${BIN_DIR}/${BIN_NAME}"
 }
 
-main
+main "$@"

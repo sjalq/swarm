@@ -718,6 +718,7 @@ impl Orchestrator {
                 content: prompt.to_string(),
                 delivered: false,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                broadcast_id: None,
             };
             self.db.enqueue_message(&msg)?;
             self.notify_worker(&id, WorkerCmd::NewMessage)?;
@@ -962,6 +963,16 @@ impl Orchestrator {
     }
 
     pub async fn send_message(&self, from: &str, to: &str, content: &str) -> Result<MessageRow> {
+        self.send_message_inner(from, to, content, None).await
+    }
+
+    async fn send_message_inner(
+        &self,
+        from: &str,
+        to: &str,
+        content: &str,
+        broadcast_id: Option<&str>,
+    ) -> Result<MessageRow> {
         if to == USER_TOPIC_ID {
             let msg = MessageRow {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -970,6 +981,7 @@ impl Orchestrator {
                 content: content.to_string(),
                 delivered: true,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                broadcast_id: broadcast_id.map(str::to_string),
             };
 
             let db = self.db.clone();
@@ -1031,6 +1043,7 @@ impl Orchestrator {
             content: content.to_string(),
             delivered: false,
             created_at: chrono::Utc::now().to_rfc3339(),
+            broadcast_id: broadcast_id.map(str::to_string),
         };
 
         let db = self.db.clone();
@@ -1096,15 +1109,14 @@ impl Orchestrator {
             .map(|a| a.id.clone())
             .collect();
 
-        let tagged = format!(
-            "[family broadcast to: {}]\n{}",
-            targets.join(", "),
-            content
-        );
+        let broadcast_id = uuid::Uuid::new_v4().to_string();
 
         let mut sent = Vec::with_capacity(targets.len());
         for target in targets {
-            match self.send_message(from, &target, &tagged).await {
+            match self
+                .send_message_inner(from, &target, content, Some(&broadcast_id))
+                .await
+            {
                 Ok(msg) => sent.push(msg),
                 Err(SwarmError::AgentNotFound(_)) => continue,
                 Err(e) => return Err(e),

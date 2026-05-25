@@ -29,6 +29,8 @@ fn query_log_entries(conn: &Connection, sql: &str, params: &[&dyn ToSql]) -> Res
                 kind: row.get(1)?,
                 peer: row.get(2)?,
                 content: row.get(3)?,
+                broadcast_id: None,
+                broadcast_count: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -131,6 +133,7 @@ impl Db {
         Self::ensure_agents_column(&conn, "project_dir", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "user_launched", "INTEGER NOT NULL DEFAULT 0")?;
         Self::migrate_inbox_cursors(&conn)?;
+        Self::ensure_messages_broadcast_id(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_agents_status
                 ON agents(status, created_at);
@@ -207,6 +210,21 @@ impl Db {
             )?;
         }
 
+        Ok(())
+    }
+
+    fn ensure_messages_broadcast_id(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|c| c == "broadcast_id") {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN broadcast_id TEXT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_messages_broadcast
+                     ON messages(broadcast_id);",
+            )?;
+        }
         Ok(())
     }
 
@@ -550,8 +568,8 @@ impl Db {
     pub fn enqueue_message(&self, msg: &MessageRow) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at, broadcast_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 msg.id,
                 msg.from_agent,
@@ -559,6 +577,7 @@ impl Db {
                 msg.content,
                 msg.delivered as i32,
                 msg.created_at,
+                msg.broadcast_id,
             ],
         )?;
         Ok(())
@@ -581,8 +600,8 @@ impl Db {
         }
 
         tx.execute(
-            "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at, broadcast_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 msg.id,
                 msg.from_agent,
@@ -590,6 +609,7 @@ impl Db {
                 msg.content,
                 msg.delivered as i32,
                 msg.created_at,
+                msg.broadcast_id,
             ],
         )?;
         tx.commit()?;
@@ -713,37 +733,47 @@ impl Db {
     ) -> Result<Vec<LogEntry>> {
         let conn = self.conn()?;
 
+        let sent_subquery = "SELECT MIN(created_at) AS timestamp, 'sent' AS kind, \
+                 MIN(to_agent) AS peer, content, broadcast_id, COUNT(*) AS broadcast_count \
+             FROM messages WHERE from_agent = ?1 \
+             GROUP BY COALESCE(broadcast_id, id), content";
+
         let base = match filter {
             LogFilter::All => {
-                "SELECT timestamp, kind, peer, content FROM (
-                    SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
-                    FROM messages WHERE to_agent = ?1
-                    UNION ALL
-                    SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
-                    FROM messages WHERE from_agent = ?1
-                    UNION ALL
-                    SELECT created_at AS timestamp, kind, '' AS peer, content
-                    FROM output_log WHERE agent_id = ?1
-                )"
+                format!(
+                    "SELECT timestamp, kind, peer, content, broadcast_id, broadcast_count FROM (
+                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer,
+                            content, broadcast_id, 1 AS broadcast_count
+                        FROM messages WHERE to_agent = ?1
+                        UNION ALL
+                        {sent_subquery}
+                        UNION ALL
+                        SELECT created_at AS timestamp, kind, '' AS peer, content,
+                            NULL AS broadcast_id, NULL AS broadcast_count
+                        FROM output_log WHERE agent_id = ?1
+                    )"
+                )
             }
             LogFilter::Messages => {
-                "SELECT timestamp, kind, peer, content FROM (
-                    SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer, content
-                    FROM messages WHERE to_agent = ?1
-                    UNION ALL
-                    SELECT created_at AS timestamp, 'sent' AS kind, to_agent AS peer, content
-                    FROM messages WHERE from_agent = ?1
-                )"
+                format!(
+                    "SELECT timestamp, kind, peer, content, broadcast_id, broadcast_count FROM (
+                        SELECT created_at AS timestamp, 'recv' AS kind, from_agent AS peer,
+                            content, broadcast_id, 1 AS broadcast_count
+                        FROM messages WHERE to_agent = ?1
+                        UNION ALL
+                        {sent_subquery}
+                    )"
+                )
             }
             LogFilter::Output => {
-                "SELECT timestamp, kind, peer, content FROM (
+                "SELECT timestamp, kind, peer, content, NULL AS broadcast_id, NULL AS broadcast_count FROM (
                     SELECT created_at AS timestamp, kind, '' AS peer, content
                     FROM output_log WHERE agent_id = ?1
-                )"
+                )".to_string()
             }
         };
 
-        let mut sql = base.to_string();
+        let mut sql = base;
         let pattern = query.map(|q| format!("%{}%", escape_like(q)));
         if pattern.is_some() {
             sql.push_str(" WHERE LOWER(content) LIKE LOWER(?2) ESCAPE '\\'");
@@ -753,26 +783,23 @@ impl Db {
         }
 
         let mut stmt = conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let bc: Option<i64> = row.get(5)?;
+            Ok(LogEntry {
+                timestamp: row.get(0)?,
+                kind: row.get(1)?,
+                peer: row.get(2)?,
+                content: row.get(3)?,
+                broadcast_id: row.get(4)?,
+                broadcast_count: bc.map(|n| n as usize),
+            })
+        };
         let mut rows = if let Some(pattern) = pattern {
-            stmt.query_map(rusqlite::params![agent_id, pattern, limit], |row| {
-                Ok(LogEntry {
-                    timestamp: row.get(0)?,
-                    kind: row.get(1)?,
-                    peer: row.get(2)?,
-                    content: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(rusqlite::params![agent_id, pattern, limit], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(rusqlite::params![agent_id, limit], |row| {
-                Ok(LogEntry {
-                    timestamp: row.get(0)?,
-                    kind: row.get(1)?,
-                    peer: row.get(2)?,
-                    content: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(rusqlite::params![agent_id, limit], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
         rows.reverse();
         Ok(rows)
@@ -790,13 +817,15 @@ impl Db {
         }
 
         let conn = self.conn()?;
-        let base = "SELECT timestamp, kind, peer, content FROM (
-            SELECT m.created_at AS timestamp, 'recv' AS kind, m.from_agent AS peer, m.content
+        let base = "SELECT timestamp, kind, peer, content, broadcast_id FROM (
+            SELECT m.created_at AS timestamp, 'recv' AS kind, m.from_agent AS peer,
+                m.content, m.broadcast_id
             FROM messages m
             INNER JOIN agents a ON a.id = m.from_agent
             WHERE m.to_agent = 'user' AND a.project_dir = ?1
             UNION ALL
-            SELECT m.created_at AS timestamp, 'sent' AS kind, m.to_agent AS peer, m.content
+            SELECT m.created_at AS timestamp, 'sent' AS kind, m.to_agent AS peer,
+                m.content, m.broadcast_id
             FROM messages m
             INNER JOIN agents a ON a.id = m.to_agent
             WHERE m.from_agent = 'user' AND a.project_dir = ?1
@@ -812,26 +841,22 @@ impl Db {
         }
 
         let mut stmt = conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(LogEntry {
+                timestamp: row.get(0)?,
+                kind: row.get(1)?,
+                peer: row.get(2)?,
+                content: row.get(3)?,
+                broadcast_id: row.get(4)?,
+                broadcast_count: None,
+            })
+        };
         let mut rows = if let Some(pattern) = pattern {
-            stmt.query_map(rusqlite::params![project_dir, pattern, limit], |row| {
-                Ok(LogEntry {
-                    timestamp: row.get(0)?,
-                    kind: row.get(1)?,
-                    peer: row.get(2)?,
-                    content: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(rusqlite::params![project_dir, pattern, limit], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(rusqlite::params![project_dir, limit], |row| {
-                Ok(LogEntry {
-                    timestamp: row.get(0)?,
-                    kind: row.get(1)?,
-                    peer: row.get(2)?,
-                    content: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(rusqlite::params![project_dir, limit], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
         rows.reverse();
         Ok(rows)
@@ -972,7 +997,7 @@ impl Db {
         let tx = conn.transaction()?;
         let result = {
             let mut stmt = tx.prepare(
-                "SELECT id, from_agent, to_agent, content, delivered, created_at
+                "SELECT id, from_agent, to_agent, content, delivered, created_at, broadcast_id
                  FROM messages WHERE to_agent = ?1 AND delivered = 0
                  ORDER BY created_at LIMIT 1",
             )?;
@@ -984,6 +1009,7 @@ impl Db {
                     content: row.get(3)?,
                     delivered: row.get::<_, i32>(4)? != 0,
                     created_at: row.get(5)?,
+                    broadcast_id: row.get(6)?,
                 })
             })
         };
@@ -1236,6 +1262,7 @@ mod tests {
             content: "hello".into(),
             delivered: false,
             created_at: "2026-01-01T00:00:00Z".into(),
+            broadcast_id: None,
         };
         db.enqueue_message(&msg).unwrap();
 
@@ -1258,6 +1285,7 @@ mod tests {
                 content: format!("message {i}"),
                 delivered: false,
                 created_at: format!("2026-01-01T00:00:0{i}Z"),
+                broadcast_id: None,
             };
             db.enqueue_message(&msg).unwrap();
         }
@@ -1280,6 +1308,7 @@ mod tests {
             content: "do something".into(),
             delivered: false,
             created_at: "2026-01-01T00:00:01Z".into(),
+            broadcast_id: None,
         })
         .unwrap();
 
@@ -1299,6 +1328,7 @@ mod tests {
             content: "done".into(),
             delivered: false,
             created_at: "2026-01-01T00:00:03Z".into(),
+            broadcast_id: None,
         })
         .unwrap();
 
@@ -1344,6 +1374,7 @@ mod tests {
                 content: content.into(),
                 delivered: false,
                 created_at: created_at.into(),
+                broadcast_id: None,
             })
             .unwrap();
         }
@@ -1416,6 +1447,7 @@ mod tests {
             content: "hello?".into(),
             delivered: false,
             created_at: "2026-01-01T00:00:01Z".into(),
+            broadcast_id: None,
         };
         assert!(!db.enqueue_message_for_active_agent(&msg).unwrap());
         assert!(!db.has_pending_messages("done-agent").unwrap());
