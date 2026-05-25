@@ -144,10 +144,10 @@ fallback_to_source_install() {
     local installed_bin="${cargo_bin_dir}/${BIN_NAME}"
     local installed_version
 
-    if installed_version="$("$installed_bin" --version 2>&1)"; then
-        info "Verified: %s" "$installed_version"
-    elif command -v "$BIN_NAME" >/dev/null 2>&1 && installed_version="$("$BIN_NAME" --version 2>&1)"; then
-        info "Verified: %s" "$installed_version"
+    if "$installed_bin" --help >/dev/null 2>&1; then
+        info "Verified: swarm is installed at %s" "$installed_bin"
+    elif command -v "$BIN_NAME" >/dev/null 2>&1 && "$BIN_NAME" --help >/dev/null 2>&1; then
+        info "Verified: swarm is installed and on PATH"
     else
         err "Source install finished, but the installed swarm binary could not be verified.\nCheck Cargo output and ensure %s is on your PATH." "$cargo_bin_dir"
     fi
@@ -220,11 +220,10 @@ main() {
     info "Installed ${BIN_NAME} to ${BIN_DIR}/${BIN_NAME}"
 
     info "Verifying installed binary..."
-    local installed_version
-    if installed_version="$("${BIN_DIR}/${BIN_NAME}" --version 2>&1)"; then
-        info "Verified: %s" "$installed_version"
+    if "${BIN_DIR}/${BIN_NAME}" --help >/dev/null 2>&1; then
+        info "Verified: swarm is installed at %s" "${BIN_DIR}/${BIN_NAME}"
     else
-        err "Installed binary did not run successfully:\n  %s --version\n%s" "${BIN_DIR}/${BIN_NAME}" "$installed_version"
+        err "Installed binary did not run successfully:\n  %s --help" "${BIN_DIR}/${BIN_NAME}"
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
