@@ -145,7 +145,10 @@ async fn start_swarm() -> (tempfile::TempDir, SwarmRun, String, String) {
 
 fn run_swarm_json(args: &[&str], addr: &str, agent_id: Option<&str>) -> serde_json::Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
-    command.args(args).env("SWARM_SOCKET", addr);
+    command
+        .args(args)
+        .env("SWARM_SOCKET", addr)
+        .env("SWARM_ALLOW_PROJECT_MISMATCH", "1");
     if let Some(agent_id) = agent_id {
         command.env("SWARM_AGENT_ID", agent_id);
     } else {
@@ -171,7 +174,10 @@ fn run_swarm_json(args: &[&str], addr: &str, agent_id: Option<&str>) -> serde_js
 
 fn run_swarm_ok(args: &[&str], addr: &str, agent_id: Option<&str>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
-    command.args(args).env("SWARM_SOCKET", addr);
+    command
+        .args(args)
+        .env("SWARM_SOCKET", addr)
+        .env("SWARM_ALLOW_PROJECT_MISMATCH", "1");
     if let Some(agent_id) = agent_id {
         command.env("SWARM_AGENT_ID", agent_id);
     } else {
@@ -191,6 +197,7 @@ fn start_watch_until(args: &[&str], addr: &str, expected: &str) -> WatchRun {
     let mut child = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args(args)
         .env("SWARM_SOCKET", addr)
+        .env("SWARM_ALLOW_PROJECT_MISMATCH", "1")
         .env_remove("SWARM_AGENT_ID")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -269,12 +276,11 @@ async fn daemon_backed_commands_auto_start_local_socket() {
 }
 
 #[tokio::test]
-async fn run_reuses_existing_port_without_project_match_error() {
+async fn run_rejects_existing_port_with_project_mismatch() {
     let server_dir = tempfile::tempdir().unwrap();
     let server_data_dir = server_dir.path().join("data");
     std::fs::create_dir_all(&server_data_dir).unwrap();
     let port = free_port();
-    let addr = format!("http://127.0.0.1:{port}");
     let _server = start_serve_process(server_dir.path(), &server_data_dir, port).await;
 
     let other_dir = tempfile::tempdir().unwrap();
@@ -303,33 +309,19 @@ async fn run_reuses_existing_port_without_project_match_error() {
         .expect("failed to run swarm topic");
 
     assert!(
-        output.status.success(),
-        "swarm run should reuse the existing daemon: {}",
+        !output.status.success(),
+        "swarm run should reject a daemon from another project"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("serves project"),
+        "stderr should explain the project mismatch: {}",
         String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("topic: cross-project-"),
-        "stdout was: {stdout}"
-    );
-
-    let agents: Vec<serde_json::Value> = reqwest::get(format!("{addr}/api/agents"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent["label"].as_str() == Some("cross-project")),
-        "topic should be created on the existing daemon; agents were: {agents:?}"
     );
 }
 
 #[tokio::test]
 async fn run_prints_watch_inbox_hint_and_returns() {
-    let (_dir, _run, addr, _agent_id) = start_swarm().await;
+    let (dir, _run, addr, _agent_id) = start_swarm().await;
     let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
         .args([
             "run",
@@ -339,6 +331,7 @@ async fn run_prints_watch_inbox_hint_and_returns() {
             "watch-smoke",
             "inline watch smoke",
         ])
+        .current_dir(dir.path())
         .env("SWARM_SOCKET", &addr)
         .env_remove("SWARM_AGENT_ID")
         .stdout(Stdio::piped())

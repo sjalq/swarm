@@ -48,4 +48,10 @@ impl From<rusqlite::Error> for SwarmError {
     }
 }
 
+impl From<r2d2::Error> for SwarmError {
+    fn from(err: r2d2::Error) -> Self {
+        Self::Db(err.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, SwarmError>;

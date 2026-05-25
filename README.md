@@ -137,7 +137,7 @@ cargo install trunk --locked
 cargo build
 ```
 
-GitHub CI keeps this concise: Ubuntu runs fmt, clippy, tests, and the dashboard build path; macOS runs the test suite as a portability check. Release builds produce Linux and macOS archives plus `SHA256SUMS` for the installer.
+GitHub CI keeps this concise: Ubuntu runs fmt, clippy, tests, and the dashboard build path; macOS runs the test suite as a portability check. Release builds produce Linux and macOS archives, `SHA256SUMS`, and a generated Homebrew formula.
 
 ## License
 

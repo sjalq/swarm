@@ -84,11 +84,8 @@ fn main() {
             }
         }
         _ => {
-            println!(
-                "cargo:warning=trunk not found; dashboard will not be embedded. \
-                 Install with: cargo install trunk"
-            );
             clear_dist();
+            panic!("trunk not found; install with: cargo install trunk --locked");
         }
     }
 }

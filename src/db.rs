@@ -1,8 +1,10 @@
-use crate::error::{Result, SwarmError};
+use crate::error::Result;
 pub use crate::types::{
     AgentRow, CommsMode, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow,
     OutputLogRow, SqlEnum, TopicStatus,
 };
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, ToSql};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -10,7 +12,8 @@ use std::sync::{Mutex, MutexGuard};
 const AGENT_SELECT_COLUMNS: &str = "id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched";
 
 pub struct Db {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
+    write_lock: Mutex<()>,
 }
 
 fn escape_like(query: &str) -> String {
@@ -40,19 +43,35 @@ fn query_log_entries(conn: &Connection, sql: &str, params: &[&dyn ToSql]) -> Res
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        let is_memory = path == Path::new(":memory:");
+        if !is_memory {
+            let conn = Connection::open(path)?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        }
+
+        let manager = SqliteConnectionManager::file(path)
+            .with_init(|conn| conn.execute_batch("PRAGMA busy_timeout=5000;"));
+        let mut builder = Pool::builder().max_size(8);
+        if is_memory {
+            builder = builder.max_size(1);
+        }
+        let pool = builder.build(manager)?;
         let db = Self {
-            conn: Mutex::new(conn),
+            pool,
+            write_lock: Mutex::new(()),
         };
         db.init_tables()?;
         Ok(db)
     }
 
-    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn
+    fn conn(&self) -> Result<PooledConnection<SqliteConnectionManager>> {
+        Ok(self.pool.get()?)
+    }
+
+    fn write_guard(&self) -> Result<MutexGuard<'_, ()>> {
+        self.write_lock
             .lock()
-            .map_err(|_| SwarmError::Internal("database mutex poisoned".to_string()))
+            .map_err(|_| crate::error::SwarmError::Internal("database write lock poisoned".into()))
     }
 
     fn init_tables(&self) -> Result<()> {
@@ -85,10 +104,11 @@ impl Db {
                 to_agent TEXT NOT NULL,
                 content TEXT NOT NULL,
                 delivered INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                leased_at TEXT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_pending
-                ON messages(to_agent, delivered, created_at);
+                ON messages(to_agent, delivered, leased_at, created_at);
             CREATE TABLE IF NOT EXISTS output_log (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -134,6 +154,7 @@ impl Db {
         Self::ensure_agents_column(&conn, "user_launched", "INTEGER NOT NULL DEFAULT 0")?;
         Self::migrate_inbox_cursors(&conn)?;
         Self::ensure_messages_broadcast_id(&conn)?;
+        Self::ensure_messages_leased_at(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_agents_status
                 ON agents(status, created_at);
@@ -143,6 +164,9 @@ impl Db {
                 ON agents(project_dir, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_agents_project_user_created
                 ON agents(project_dir, user_launched, created_at);
+            DROP INDEX IF EXISTS idx_messages_pending;
+            CREATE INDEX IF NOT EXISTS idx_messages_pending
+                ON messages(to_agent, delivered, leased_at, created_at);
             DROP INDEX IF EXISTS idx_agents_project_run_status;
             DROP INDEX IF EXISTS idx_runs_project_created;
             DROP TABLE IF EXISTS runs;
@@ -214,10 +238,7 @@ impl Db {
     }
 
     fn ensure_messages_broadcast_id(conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-        let columns: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let columns = Self::message_column_names(conn)?;
         if !columns.iter().any(|c| c == "broadcast_id") {
             conn.execute_batch(
                 "ALTER TABLE messages ADD COLUMN broadcast_id TEXT NULL;
@@ -226,6 +247,24 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    fn ensure_messages_leased_at(conn: &Connection) -> Result<()> {
+        let columns = Self::message_column_names(conn)?;
+        if !columns.iter().any(|c| c == "leased_at") {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN leased_at TEXT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_messages_pending
+                     ON messages(to_agent, delivered, leased_at, created_at);",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn message_column_names(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn ensure_agents_column(conn: &Connection, column: &str, definition: &str) -> Result<()> {
@@ -279,6 +318,7 @@ impl Db {
     }
 
     pub fn assign_unscoped_agents_to_project(&self, project_dir: &str) -> Result<usize> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let count = conn.execute(
             "UPDATE agents SET project_dir = ?1 WHERE project_dir IS NULL",
@@ -288,6 +328,7 @@ impl Db {
     }
 
     pub fn insert_agent(&self, agent: &AgentRow) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO agents (id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched)
@@ -371,6 +412,7 @@ impl Db {
     }
 
     pub fn insert_event(&self, event: &EventRow) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO events (id, event_type, agent_id, payload, created_at)
@@ -507,7 +549,35 @@ impl Db {
         Ok(events)
     }
 
+    pub fn list_recent_events_for_project(
+        &self,
+        project_dir: &str,
+        limit: usize,
+    ) -> Result<Vec<EventRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event_type, agent_id, payload, created_at
+             FROM events
+             WHERE agent_id IN (SELECT id FROM agents WHERE project_dir = ?1)
+             ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let mut events = stmt
+            .query_map(rusqlite::params![project_dir, limit as i64], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    payload: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn reparent_children(&self, old_parent: &str, new_parent: Option<&str>) -> Result<usize> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let count = conn.execute(
             "UPDATE agents SET parent_id = ?1 WHERE parent_id = ?2 AND status != 'done'",
@@ -517,6 +587,7 @@ impl Db {
     }
 
     pub fn update_agent_status(&self, id: &str, status: TopicStatus) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let status_text = status.as_sql();
         let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
@@ -534,6 +605,7 @@ impl Db {
     }
 
     pub fn update_agent_status_if_active(&self, id: &str, status: TopicStatus) -> Result<bool> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let status_text = status.as_sql();
         let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
@@ -551,6 +623,7 @@ impl Db {
     }
 
     pub fn clear_agent_worktree_branch(&self, id: &str) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "UPDATE agents SET worktree_branch = NULL WHERE id = ?1",
@@ -560,12 +633,14 @@ impl Db {
     }
 
     pub fn delete_agent(&self, id: &str) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;
         Ok(())
     }
 
     pub fn enqueue_message(&self, msg: &MessageRow) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO messages (id, from_agent, to_agent, content, delivered, created_at, broadcast_id)
@@ -584,6 +659,7 @@ impl Db {
     }
 
     pub fn enqueue_message_for_active_agent(&self, msg: &MessageRow) -> Result<bool> {
+        let _write = self.write_guard()?;
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let is_active: bool = tx.query_row(
@@ -617,6 +693,7 @@ impl Db {
     }
 
     pub fn insert_output_log(&self, entry: &OutputLogRow) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO output_log (id, agent_id, content, kind, created_at)
@@ -633,6 +710,7 @@ impl Db {
     }
 
     pub fn insert_handover(&self, handover: &HandoverRow) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO handovers (
@@ -979,6 +1057,7 @@ impl Db {
     }
 
     pub fn set_inbox_cursor(&self, recipient: &str, last_seen_at: &str) -> Result<()> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let updated_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -993,12 +1072,15 @@ impl Db {
     }
 
     pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {
+        let _write = self.write_guard()?;
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
+        let leased_at = chrono::Utc::now().to_rfc3339();
         let result = {
             let mut stmt = tx.prepare(
                 "SELECT id, from_agent, to_agent, content, delivered, created_at, broadcast_id
-                 FROM messages WHERE to_agent = ?1 AND delivered = 0
+                 FROM messages
+                 WHERE to_agent = ?1 AND delivered = 0 AND leased_at IS NULL
                  ORDER BY created_at LIMIT 1",
             )?;
             stmt.query_row([agent_id], |row| {
@@ -1015,7 +1097,11 @@ impl Db {
         };
         match result {
             Ok(msg) => {
-                tx.execute("UPDATE messages SET delivered = 1 WHERE id = ?1", [&msg.id])?;
+                tx.execute(
+                    "UPDATE messages SET leased_at = ?1
+                     WHERE id = ?2 AND delivered = 0 AND leased_at IS NULL",
+                    rusqlite::params![leased_at, &msg.id],
+                )?;
                 tx.commit()?;
                 Ok(Some(msg))
             }
@@ -1024,10 +1110,69 @@ impl Db {
         }
     }
 
+    pub fn mark_messages_delivered(&self, message_ids: &[String]) -> Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let _write = self.write_guard()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut updated = 0;
+        for id in message_ids {
+            updated += tx.execute(
+                "UPDATE messages
+                 SET delivered = 1, leased_at = NULL
+                 WHERE id = ?1 AND delivered = 0",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    pub fn release_messages(&self, message_ids: &[String]) -> Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let _write = self.write_guard()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut updated = 0;
+        for id in message_ids {
+            updated += tx.execute(
+                "UPDATE messages
+                 SET leased_at = NULL
+                 WHERE id = ?1 AND delivered = 0",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    pub fn release_inflight_messages_for_project(&self, project_dir: &str) -> Result<usize> {
+        let _write = self.write_guard()?;
+        let conn = self.conn()?;
+        let count = conn.execute(
+            "UPDATE messages
+             SET leased_at = NULL
+             WHERE delivered = 0
+               AND leased_at IS NOT NULL
+               AND to_agent IN (
+                   SELECT id FROM agents WHERE project_dir = ?1
+               )",
+            [project_dir],
+        )?;
+        Ok(count)
+    }
+
     pub fn has_pending_messages(&self, agent_id: &str) -> Result<bool> {
         let conn = self.conn()?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE to_agent = ?1 AND delivered = 0",
+            "SELECT COUNT(*) FROM messages
+             WHERE to_agent = ?1 AND delivered = 0 AND leased_at IS NULL",
             [agent_id],
             |row| row.get(0),
         )?;
@@ -1035,6 +1180,7 @@ impl Db {
     }
 
     pub fn mark_unfinished_agents_done(&self) -> Result<usize> {
+        let _write = self.write_guard()?;
         let conn = self.conn()?;
         let ended_at = chrono::Utc::now().to_rfc3339();
         let count = conn.execute(
@@ -1164,6 +1310,11 @@ mod tests {
             .unwrap()
     }
 
+    fn message_columns(db: &Db) -> Vec<String> {
+        let conn = db.conn().unwrap();
+        Db::message_column_names(&conn).unwrap()
+    }
+
     #[test]
     fn initializes_agent_metadata_columns_and_indexes() {
         let db = test_db();
@@ -1173,6 +1324,7 @@ mod tests {
         assert!(columns.contains(&"worktree_branch".to_string()));
         assert!(columns.contains(&"project_dir".to_string()));
         assert!(columns.contains(&"user_launched".to_string()));
+        assert!(message_columns(&db).contains(&"leased_at".to_string()));
 
         let indexes = agent_indexes(&db);
         assert!(indexes.contains(&"idx_agents_status".to_string()));
@@ -1272,6 +1424,61 @@ mod tests {
 
         // Should be empty now
         assert!(db.dequeue_message("agent-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn message_leases_ack_and_release() {
+        let db = test_db();
+        let msg = MessageRow {
+            id: "msg-lease".into(),
+            from_agent: "user".into(),
+            to_agent: "agent-1".into(),
+            content: "lease me".into(),
+            delivered: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            broadcast_id: None,
+        };
+        db.enqueue_message(&msg).unwrap();
+
+        let first = db.dequeue_message("agent-1").unwrap().unwrap();
+        assert_eq!(first.id, "msg-lease");
+        assert!(!db.has_pending_messages("agent-1").unwrap());
+
+        db.release_messages(&[first.id]).unwrap();
+        assert!(db.has_pending_messages("agent-1").unwrap());
+
+        let second = db.dequeue_message("agent-1").unwrap().unwrap();
+        db.mark_messages_delivered(&[second.id]).unwrap();
+        assert!(!db.has_pending_messages("agent-1").unwrap());
+        assert!(db.dequeue_message("agent-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn project_resume_releases_inflight_messages() {
+        let db = test_db();
+        let mut agent = test_agent("agent-1", "working");
+        agent.project_dir = Some("/tmp/project".into());
+        db.insert_agent(&agent).unwrap();
+        db.enqueue_message(&MessageRow {
+            id: "msg-resume".into(),
+            from_agent: "user".into(),
+            to_agent: "agent-1".into(),
+            content: "resume me".into(),
+            delivered: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            broadcast_id: None,
+        })
+        .unwrap();
+
+        assert!(db.dequeue_message("agent-1").unwrap().is_some());
+        assert!(!db.has_pending_messages("agent-1").unwrap());
+
+        assert_eq!(
+            db.release_inflight_messages_for_project("/tmp/project")
+                .unwrap(),
+            1
+        );
+        assert!(db.has_pending_messages("agent-1").unwrap());
     }
 
     #[test]

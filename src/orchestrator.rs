@@ -226,6 +226,59 @@ impl Orchestrator {
         }
     }
 
+    async fn mark_messages_delivered_async(db: Arc<Db>, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = Self::blocking_db("mark messages delivered", move || {
+            db.mark_messages_delivered(&message_ids)
+        })
+        .await
+        {
+            tracing::error!("failed to mark messages delivered: {e}");
+        }
+    }
+
+    async fn release_messages_async(db: Arc<Db>, message_ids: Vec<String>) {
+        if message_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = Self::blocking_db("release leased messages", move || {
+            db.release_messages(&message_ids)
+        })
+        .await
+        {
+            tracing::error!("failed to release leased messages: {e}");
+        }
+    }
+
+    async fn persist_and_send_event(
+        db: Arc<Db>,
+        event_tx: broadcast::Sender<SwarmEvent>,
+        event: SwarmEvent,
+    ) {
+        let agent_id = Self::event_agent_id(&event);
+        let event_type = Self::event_type(&event);
+        if let Ok(payload) = serde_json::to_string(&event) {
+            let row = EventRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: event_type.to_string(),
+                agent_id,
+                payload,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let persist_db = db;
+            if let Err(e) = Self::blocking_db("persist worker event", move || {
+                persist_db.insert_event(&row)
+            })
+            .await
+            {
+                tracing::error!("failed to persist worker event: {e}");
+            }
+        }
+        let _ = event_tx.send(event);
+    }
+
     fn start_worker_for_agent(&self, agent: &AgentRow, resume_conversation: bool) -> Result<bool> {
         if self.workers()?.contains_key(&agent.id) {
             return Ok(false);
@@ -505,6 +558,11 @@ impl Orchestrator {
     ) -> Result<Vec<EventRow>> {
         self.db
             .list_events_for_project(&self.project_key, since, agent_id, limit)
+    }
+
+    pub fn list_recent_events(&self, limit: usize) -> Result<Vec<EventRow>> {
+        self.db
+            .list_recent_events_for_project(&self.project_key, limit)
     }
 
     pub fn stats(&self) -> Result<DbStats> {
@@ -798,6 +856,13 @@ impl Orchestrator {
     }
 
     pub fn resume_existing_workers(&self) -> Result<usize> {
+        let released = self
+            .db
+            .release_inflight_messages_for_project(&self.project_key)?;
+        if released > 0 {
+            tracing::info!("released {released} in-flight message(s) for replay after restart");
+        }
+
         let agents = self.list_agents()?;
         let mut resumed = 0;
 
@@ -822,6 +887,12 @@ impl Orchestrator {
 
             if self.db.has_pending_messages(&agent.id)? {
                 self.notify_worker(&agent.id, WorkerCmd::NewMessage)?;
+            } else if agent.status == TopicStatus::Working {
+                self.db.update_agent_status(&agent.id, TopicStatus::Idle)?;
+                self.emit_event(SwarmEvent::AgentStatus {
+                    agent_id: agent.id.clone(),
+                    status: TopicStatus::Idle,
+                });
             }
 
             resumed += 1;
@@ -1337,6 +1408,7 @@ impl Orchestrator {
             if messages.is_empty() {
                 continue;
             }
+            let message_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
 
             // Drain stale NewMessage notifications for messages we just batch-dequeued
             loop {
@@ -1349,10 +1421,15 @@ impl Orchestrator {
 
             Self::update_status_if_active_async(db.clone(), agent_id.clone(), TopicStatus::Working)
                 .await;
-            let _ = event_tx.send(SwarmEvent::AgentStatus {
-                agent_id: agent_id.clone(),
-                status: TopicStatus::Working,
-            });
+            Self::persist_and_send_event(
+                db.clone(),
+                event_tx.clone(),
+                SwarmEvent::AgentStatus {
+                    agent_id: agent_id.clone(),
+                    status: TopicStatus::Working,
+                },
+            )
+            .await;
 
             let is_first = first_message;
             let msg_parts: Vec<String> = messages
@@ -1416,17 +1493,25 @@ impl Orchestrator {
                             Some(HarnessOutput::Text(text)) => {
                                 accumulated_output.push_str(&text);
                                 accumulated_output.push('\n');
-                                let _ = event_tx.send(SwarmEvent::AgentOutput {
-                                    agent_id: agent_id.clone(),
-                                    text,
-                                });
+                                Self::persist_and_send_event(
+                                    db.clone(),
+                                    event_tx.clone(),
+                                    SwarmEvent::AgentOutput {
+                                        agent_id: agent_id.clone(),
+                                        text,
+                                    },
+                                ).await;
                             }
                             Some(HarnessOutput::Complete(text)) => {
                                 if !text.is_empty() {
-                                    let _ = event_tx.send(SwarmEvent::AgentOutput {
-                                        agent_id: agent_id.clone(),
-                                        text: text.clone(),
-                                    });
+                                    Self::persist_and_send_event(
+                                        db.clone(),
+                                        event_tx.clone(),
+                                        SwarmEvent::AgentOutput {
+                                            agent_id: agent_id.clone(),
+                                            text: text.clone(),
+                                        },
+                                    ).await;
                                 }
                                 Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
@@ -1438,10 +1523,14 @@ impl Orchestrator {
                             }
                             Some(HarnessOutput::Error(err)) => {
                                 had_error = true;
-                                let _ = event_tx.send(SwarmEvent::AgentError {
-                                    agent_id: agent_id.clone(),
-                                    error: err.clone(),
-                                });
+                                Self::persist_and_send_event(
+                                    db.clone(),
+                                    event_tx.clone(),
+                                    SwarmEvent::AgentError {
+                                        agent_id: agent_id.clone(),
+                                        error: err.clone(),
+                                    },
+                                ).await;
                                 Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     agent_id: agent_id.clone(),
@@ -1452,13 +1541,17 @@ impl Orchestrator {
                             }
                             Some(HarnessOutput::Timeout(partial)) => {
                                 had_error = true;
-                                let _ = event_tx.send(SwarmEvent::AgentError {
-                                    agent_id: agent_id.clone(),
-                                    error: format!(
-                                        "timeout, partial output: {} chars",
-                                        partial.len()
-                                    ),
-                                });
+                                Self::persist_and_send_event(
+                                    db.clone(),
+                                    event_tx.clone(),
+                                    SwarmEvent::AgentError {
+                                        agent_id: agent_id.clone(),
+                                        error: format!(
+                                            "timeout, partial output: {} chars",
+                                            partial.len()
+                                        ),
+                                    },
+                                ).await;
                                 Self::insert_output_log_async(db.clone(), OutputLogRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     agent_id: agent_id.clone(),
@@ -1485,10 +1578,12 @@ impl Orchestrator {
                             }
                             Some(WorkerCmd::Shutdown) => {
                                 harness_handle.abort();
+                                Self::release_messages_async(db.clone(), message_ids.clone()).await;
                                 return;
                             }
                             None => {
                                 harness_handle.abort();
+                                Self::release_messages_async(db.clone(), message_ids.clone()).await;
                                 Self::update_status_async(
                                     db.clone(),
                                     agent_id.clone(),
@@ -1503,6 +1598,7 @@ impl Orchestrator {
             }
 
             if interrupted {
+                Self::release_messages_async(db.clone(), message_ids).await;
                 if !accumulated_output.is_empty() {
                     Self::insert_output_log_async(
                         db.clone(),
@@ -1517,9 +1613,15 @@ impl Orchestrator {
                     )
                     .await;
                 }
-                was_interrupted = true;
+                if is_first {
+                    first_message = true;
+                } else {
+                    was_interrupted = true;
+                }
                 continue;
             }
+
+            Self::mark_messages_delivered_async(db.clone(), message_ids).await;
 
             let next_status = if had_error {
                 TopicStatus::Error
@@ -1527,10 +1629,15 @@ impl Orchestrator {
                 TopicStatus::Idle
             };
             Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status).await;
-            let _ = event_tx.send(SwarmEvent::AgentStatus {
-                agent_id: agent_id.clone(),
-                status: next_status,
-            });
+            Self::persist_and_send_event(
+                db.clone(),
+                event_tx.clone(),
+                SwarmEvent::AgentStatus {
+                    agent_id: agent_id.clone(),
+                    status: next_status,
+                },
+            )
+            .await;
 
             let pending_db = db.clone();
             let pending_agent_id = agent_id.clone();

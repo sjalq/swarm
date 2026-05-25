@@ -1033,14 +1033,16 @@ async fn http_api_send_to_done_agent_reactivates_it() {
 
 #[tokio::test]
 async fn cli_send_to_done_agent_succeeds() {
-    let (_dir, orch, addr) = setup_http_server().await;
+    let (dir, orch, addr) = setup_http_server().await;
     let agent = orch.start_topic("done", "echo", "", None, "mesh").unwrap();
     orch.done_agent(&agent.id, None).await.unwrap();
     let agent_id = agent.id.clone();
+    let project_dir = dir.path().to_path_buf();
 
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_swarm"))
             .env("SWARM_SOCKET", addr)
+            .env("SWARM_PROJECT_DIR", project_dir)
             .args(["send", &agent_id, "hello?"])
             .output()
             .unwrap()

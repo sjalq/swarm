@@ -1128,6 +1128,7 @@ struct DaemonLaunch {
 struct DaemonTarget {
     socket: String,
     launch_port: Option<u16>,
+    explicit_socket: bool,
 }
 
 fn build_daemon_launch(
@@ -1154,7 +1155,10 @@ fn build_daemon_launch(
 fn default_daemon_launch(
     no_gitignore: bool,
 ) -> std::result::Result<DaemonLaunch, Box<dyn std::error::Error>> {
-    build_daemon_launch(std::env::current_dir()?, None, None, no_gitignore, None)
+    let project_dir = std::env::var_os("SWARM_PROJECT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    build_daemon_launch(project_dir, None, None, no_gitignore, None)
 }
 
 fn daemon_target(
@@ -1167,6 +1171,7 @@ fn daemon_target(
             return Ok(DaemonTarget {
                 socket: socket.trim_end_matches('/').to_string(),
                 launch_port,
+                explicit_socket: true,
             });
         }
     }
@@ -1174,6 +1179,7 @@ fn daemon_target(
     Ok(DaemonTarget {
         socket: format!("http://127.0.0.1:{default_port}"),
         launch_port: Some(default_port),
+        explicit_socket: false,
     })
 }
 
@@ -1202,6 +1208,12 @@ async fn ensure_daemon(
     let target = daemon_target(launch.port)?;
     if let Some(health) = daemon_health(&target.socket).await {
         ensure_health_protocol(&target.socket, &health)?;
+        ensure_health_project(
+            &target.socket,
+            &health,
+            &launch.project_dir,
+            target.explicit_socket,
+        )?;
         return Ok(target.socket);
     }
 
@@ -1245,6 +1257,12 @@ async fn ensure_daemon(
     for _ in 0..80 {
         if let Some(health) = daemon_health(&target.socket).await {
             ensure_health_protocol(&target.socket, &health)?;
+            ensure_health_project(
+                &target.socket,
+                &health,
+                &launch.project_dir,
+                target.explicit_socket,
+            )?;
             return Ok(target.socket);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1279,6 +1297,42 @@ fn ensure_health_protocol(
         )
         .into())
     }
+}
+
+fn ensure_health_project(
+    socket: &str,
+    health: &serde_json::Value,
+    expected_project_dir: &std::path::Path,
+    explicit_socket: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("SWARM_ALLOW_PROJECT_MISMATCH").is_some() {
+        return Ok(());
+    }
+
+    let Some(actual) = health["project_dir"].as_str() else {
+        return Err(format!("daemon at {socket} did not report a project directory").into());
+    };
+
+    let actual_path = std::fs::canonicalize(actual).unwrap_or_else(|_| PathBuf::from(actual));
+    let expected_path = std::fs::canonicalize(expected_project_dir)
+        .unwrap_or_else(|_| expected_project_dir.to_path_buf());
+
+    if actual_path == expected_path {
+        return Ok(());
+    }
+
+    let hint = if explicit_socket {
+        "Set SWARM_PROJECT_DIR to that project, unset SWARM_SOCKET, or set SWARM_ALLOW_PROJECT_MISMATCH=1 if this cross-project target is intentional."
+    } else {
+        "Use --port for a different daemon, stop the existing daemon, or run from the daemon's project directory."
+    };
+
+    Err(format!(
+        "daemon at {socket} serves project {}, but this command targets {}. {hint}",
+        actual_path.display(),
+        expected_path.display()
+    )
+    .into())
 }
 
 async fn daemon_health(socket: &str) -> Option<serde_json::Value> {

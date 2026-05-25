@@ -21,6 +21,7 @@ struct DashboardAssets;
 
 type AppState = Arc<Orchestrator>;
 const PEERS_HINT: &str = "run swarm peers to list topics";
+const WS_REPLAY_LIMIT: usize = 1000;
 
 #[derive(Deserialize)]
 pub struct StartTopicRequest {
@@ -567,6 +568,9 @@ async fn not_found() -> impl IntoResponse {
 
 async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
     let mut rx = orch.subscribe();
+    if !replay_ws_events(&mut socket, orch.clone()).await {
+        return;
+    }
     loop {
         match rx.recv().await {
             Ok(event) => {
@@ -578,9 +582,38 @@ async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!("websocket skipped {skipped} lagged event(s)");
+                if !replay_ws_events(&mut socket, orch.clone()).await {
+                    break;
+                }
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn replay_ws_events(socket: &mut ws::WebSocket, orch: AppState) -> bool {
+    let events = match blocking_orchestrator("replay websocket events", move || {
+        orch.list_recent_events(WS_REPLAY_LIMIT)
+    })
+    .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::error!("failed to replay websocket events: {e}");
+            return true;
+        }
+    };
+
+    for event in events {
+        if socket
+            .send(ws::Message::Text(event.payload.into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    true
 }
