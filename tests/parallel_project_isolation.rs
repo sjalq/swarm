@@ -238,6 +238,9 @@ async fn stats_scoped_per_project() {
 async fn events_scoped_per_project() {
     let (_root, _db, projects) = setup_multi_project(2).await;
 
+    let mut rx0 = projects[0].orch.subscribe();
+    let mut rx1 = projects[1].orch.subscribe();
+
     let a0 = projects[0]
         .orch
         .start_topic("eventer", "echo", "task a", None, "mesh")
@@ -247,7 +250,22 @@ async fn events_scoped_per_project() {
         .start_topic("eventer", "echo", "task b", None, "mesh")
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for echo processing to complete (idle after working)
+    for (rx, agent_id) in [(&mut rx0, &a0.id), (&mut rx1, &a1.id)] {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(SwarmEvent::AgentStatus {
+                        agent_id: id,
+                        status: TopicStatus::Idle,
+                    }) if id == *agent_id => return,
+                    Err(_) => return,
+                    _ => continue,
+                }
+            }
+        })
+        .await;
+    }
 
     let events0 = projects[0].orch.list_events(None, None, 1000).unwrap();
     let events1 = projects[1].orch.list_events(None, None, 1000).unwrap();
@@ -295,22 +313,24 @@ async fn cross_project_message_send_fails() {
         .start_topic("sender", "echo", "", None, "mesh")
         .unwrap();
 
-    let result = projects[1]
+    let err = projects[1]
         .orch
         .send_message(&a1.id, &a0.id, "cross-project hack")
-        .await;
+        .await
+        .expect_err("sending from project 1 to project 0's agent should fail");
     assert!(
-        result.is_err(),
-        "sending from project 1 to project 0's agent should fail"
+        err.to_string().contains("not found"),
+        "error should be 'not found', got: {err}"
     );
 
-    let result = projects[0]
+    let err = projects[0]
         .orch
         .send_message("user", &a1.id, "cross-project inject")
-        .await;
+        .await
+        .expect_err("sending from project 0's user to project 1's agent should fail");
     assert!(
-        result.is_err(),
-        "sending from project 0's user to project 1's agent should fail"
+        err.to_string().contains("not found"),
+        "error should be 'not found', got: {err}"
     );
 }
 
@@ -359,10 +379,14 @@ async fn done_on_foreign_agent_fails() {
         .start_topic("worker", "echo", "", None, "mesh")
         .unwrap();
 
-    let result = projects[1].orch.done_agent(&a0.id, Some("hacked")).await;
+    let err = projects[1]
+        .orch
+        .done_agent(&a0.id, Some("hacked"))
+        .await
+        .expect_err("project 1 should not be able to mark project 0's agent as done");
     assert!(
-        result.is_err(),
-        "project 1 should not be able to mark project 0's agent as done"
+        err.to_string().contains("not found"),
+        "error should be 'not found', got: {err}"
     );
 
     let agent = projects[0].orch.get_agent(&a0.id).unwrap().unwrap();
@@ -584,10 +608,16 @@ async fn concurrent_full_lifecycle_across_four_projects() {
 
             orch.kill_agent(&parent.id).await.unwrap();
 
-            // The echo harness may have bounced the done message back to the
-            // child, reactivating it. Kill any remaining active agents.
-            for remaining in orch.list_agents().unwrap() {
-                orch.kill_agent(&remaining.id).await.unwrap();
+            // The echo harness may bounce the done message back to the
+            // child, reactivating it (at most 1 extra).
+            let remaining = orch.list_agents().unwrap();
+            assert!(
+                remaining.len() <= 1,
+                "project {project_idx}: at most 1 echo-reactivated agent expected, got {}",
+                remaining.len()
+            );
+            for agent in remaining {
+                orch.kill_agent(&agent.id).await.unwrap();
             }
 
             let stats = orch.stats().unwrap();
@@ -596,8 +626,8 @@ async fn concurrent_full_lifecycle_across_four_projects() {
                 "project {project_idx}: no alive agents after full lifecycle"
             );
             assert!(
-                stats.done >= 2,
-                "project {project_idx}: at least 2 done agents after full lifecycle, got {}",
+                stats.done >= 2 && stats.done <= 3,
+                "project {project_idx}: expected 2-3 done agents, got {}",
                 stats.done
             );
 
@@ -710,7 +740,8 @@ async fn same_label_agents_different_projects_are_independent() {
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn parallel_high_volume_messaging_across_projects() {
-    let (_root, _db, projects) = setup_multi_project(3).await;
+    let num_projects: usize = 3;
+    let (_root, _db, projects) = setup_multi_project(num_projects).await;
     let messages_per_project: usize = 10;
 
     let mut handles = Vec::new();
@@ -720,12 +751,11 @@ async fn parallel_high_volume_messaging_across_projects() {
         let project_idx = i;
         let msg_count = messages_per_project;
 
+        let mut rx = orch.subscribe();
         let handle = tokio::spawn(async move {
             let agent = orch
                 .start_topic("bulk-worker", "echo", "", None, "mesh")
                 .unwrap();
-
-            let mut rx = orch.subscribe();
 
             for j in 0..msg_count {
                 orch.send_message("user", &agent.id, &format!("p{project_idx}-msg-{j}"))
@@ -760,7 +790,7 @@ async fn parallel_high_volume_messaging_across_projects() {
                 );
             }
 
-            for other_p in 0..3usize {
+            for other_p in 0..num_projects {
                 if other_p == project_idx {
                     continue;
                 }
@@ -900,4 +930,77 @@ async fn swarm_brief_scoped_per_project() {
     let brief1_labels: Vec<&str> = brief1.agents.iter().map(|a| a.label.as_str()).collect();
     assert!(brief1_labels.contains(&"gamma"));
     assert!(!brief1_labels.contains(&"alpha"));
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: list_all_agents (including done) is scoped per project
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_all_agents_scoped_per_project() {
+    let (_root, _db, projects) = setup_multi_project(2).await;
+
+    let a0_alive = projects[0]
+        .orch
+        .start_topic("alive", "echo", "", None, "mesh")
+        .unwrap();
+    let a0_done = projects[0]
+        .orch
+        .start_topic("finished", "echo", "", None, "mesh")
+        .unwrap();
+    projects[0]
+        .orch
+        .done_agent(&a0_done.id, Some("complete"))
+        .await
+        .unwrap();
+
+    let a1 = projects[1]
+        .orch
+        .start_topic("other", "echo", "", None, "mesh")
+        .unwrap();
+
+    let all0 = projects[0].orch.list_all_agents().unwrap();
+    let all1 = projects[1].orch.list_all_agents().unwrap();
+
+    assert_eq!(all0.len(), 2, "project 0 should have 2 total agents (1 alive + 1 done)");
+    assert_eq!(all1.len(), 1, "project 1 should have 1 total agent");
+
+    let all0_ids: Vec<&str> = all0.iter().map(|a| a.id.as_str()).collect();
+    assert!(all0_ids.contains(&a0_alive.id.as_str()));
+    assert!(all0_ids.contains(&a0_done.id.as_str()));
+    assert!(!all0_ids.contains(&a1.id.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: get_agent_log rejects queries for foreign agents
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_agent_log_rejects_foreign_agents() {
+    let (_root, _db, projects) = setup_multi_project(2).await;
+
+    let a0 = projects[0]
+        .orch
+        .start_topic("logger", "echo", "", None, "mesh")
+        .unwrap();
+
+    projects[0]
+        .orch
+        .send_message("user", &a0.id, "test message")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let own_log = projects[0]
+        .orch
+        .get_agent_log(&a0.id, 50, LogFilter::All)
+        .unwrap();
+    assert!(!own_log.is_empty(), "own project should see the agent's log");
+
+    let err = projects[1]
+        .orch
+        .get_agent_log(&a0.id, 50, LogFilter::All)
+        .expect_err("foreign project should not be able to read agent log");
+    assert!(
+        err.to_string().contains("not found"),
+        "error should be 'not found', got: {err}"
+    );
 }
