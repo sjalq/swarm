@@ -189,12 +189,7 @@ fn run_swarm_json(
     })
 }
 
-fn run_swarm_ok(
-    args: &[&str],
-    addr: &str,
-    project_dir: &std::path::Path,
-    agent_id: Option<&str>,
-) {
+fn run_swarm_ok(args: &[&str], addr: &str, project_dir: &std::path::Path, agent_id: Option<&str>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
     command
         .args(args)

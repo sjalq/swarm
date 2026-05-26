@@ -5,8 +5,8 @@ use crate::orchestrator::{DoneReport, Orchestrator, OrchestratorRegistry, StartT
 use crate::types::{CommsMode, SqlEnum, SWARM_PROTOCOL_VERSION};
 use axum::extract::ws;
 use axum::extract::{FromRequestParts, Path, Query, State, WebSocketUpgrade};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,7 +22,11 @@ struct DashboardAssets;
 
 pub const PROJECT_HEADER: &str = "x-swarm-project";
 
-type AppState = Arc<OrchestratorRegistry>;
+#[derive(Clone)]
+struct AppState {
+    registry: Arc<OrchestratorRegistry>,
+    default_project: Option<String>,
+}
 const PEERS_HINT: &str = "run swarm peers to list topics";
 const WS_REPLAY_LIMIT: usize = 1000;
 
@@ -39,6 +43,7 @@ impl FromRequestParts<AppState> for Orch {
             .headers
             .get(PROJECT_HEADER)
             .and_then(|v| v.to_str().ok())
+            .or(state.default_project.as_deref())
             .ok_or_else(|| {
                 json_error(
                     StatusCode::BAD_REQUEST,
@@ -46,7 +51,7 @@ impl FromRequestParts<AppState> for Orch {
                     "set SWARM_PROJECT_DIR or pass --project-dir to the CLI",
                 )
             })?;
-        let orch = state.get_or_create(project).map_err(|e| {
+        let orch = state.registry.get_or_create(project).map_err(|e| {
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to initialize project orchestrator: {e}"),
@@ -175,6 +180,7 @@ struct HealthResponse {
     version: &'static str,
     pid: u32,
     data_dir: String,
+    project_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -239,11 +245,44 @@ where
         .map_err(|e| SwarmError::Internal(format!("{context} task failed: {e}")))?
 }
 
-pub fn router(state: AppState) -> Router {
-    router_with_dashboard(state, None)
+pub fn router(registry: Arc<OrchestratorRegistry>) -> Router {
+    router_from_state(
+        AppState {
+            registry,
+            default_project: None,
+        },
+        None,
+    )
 }
 
-pub fn router_with_dashboard(state: AppState, dashboard_dir: Option<PathBuf>) -> Router {
+pub fn router_with_dashboard(
+    registry: Arc<OrchestratorRegistry>,
+    dashboard_dir: Option<PathBuf>,
+) -> Router {
+    router_from_state(
+        AppState {
+            registry,
+            default_project: None,
+        },
+        dashboard_dir,
+    )
+}
+
+pub fn router_with_dashboard_project(
+    registry: Arc<OrchestratorRegistry>,
+    dashboard_dir: Option<PathBuf>,
+    default_project: PathBuf,
+) -> Router {
+    router_from_state(
+        AppState {
+            registry,
+            default_project: Some(default_project.to_string_lossy().to_string()),
+        },
+        dashboard_dir,
+    )
+}
+
+fn router_from_state(state: AppState, dashboard_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/brief", get(get_swarm_brief))
@@ -297,14 +336,15 @@ async fn serve_embedded(uri: axum::http::Uri) -> impl IntoResponse {
     }
 }
 
-async fn health(State(reg): State<AppState>) -> impl IntoResponse {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
         protocol: SWARM_PROTOCOL_VERSION,
-        uptime: reg.uptime_seconds(),
+        uptime: state.registry.uptime_seconds(),
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
-        data_dir: reg.data_dir().to_string_lossy().to_string(),
+        data_dir: state.registry.data_dir().to_string_lossy().to_string(),
+        project_dir: state.default_project,
     })
 }
 
@@ -578,23 +618,19 @@ pub struct WsQuery {
 }
 
 async fn ws_handler(
-    State(reg): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<WsQuery>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let project = params.project;
-    upgrade.on_upgrade(move |socket| handle_ws(socket, reg, project))
+    let project = params.project.or_else(|| state.default_project.clone());
+    upgrade.on_upgrade(move |socket| handle_ws(socket, state, project))
 }
 
 async fn not_found() -> impl IntoResponse {
     json_error(StatusCode::NOT_FOUND, "route not found", "run swarm --help")
 }
 
-async fn handle_ws(
-    mut socket: ws::WebSocket,
-    reg: AppState,
-    project: Option<String>,
-) {
+async fn handle_ws(mut socket: ws::WebSocket, state: AppState, project: Option<String>) {
     let Some(project) = project else {
         let _ = socket
             .send(ws::Message::Text(
@@ -603,13 +639,11 @@ async fn handle_ws(
             .await;
         return;
     };
-    let orch = match reg.get_or_create(&project) {
+    let orch = match state.registry.get_or_create(&project) {
         Ok(orch) => orch,
         Err(e) => {
             let _ = socket
-                .send(ws::Message::Text(
-                    format!(r#"{{"error":"{e}"}}"#).into(),
-                ))
+                .send(ws::Message::Text(format!(r#"{{"error":"{e}"}}"#).into()))
                 .await;
             return;
         }

@@ -8,7 +8,7 @@ use std::sync::{
 };
 use wasm_bindgen_futures::spawn_local;
 
-pub type NodeSignalMap = RwSignal<HashMap<String, RwSignal<AgentTreeNode>>>;
+pub type NodeSignalMap = RwSignal<HashMap<String, ArcRwSignal<AgentTreeNode>>>;
 
 pub fn render_agent_node(
     agent_id: String,
@@ -18,7 +18,7 @@ pub fn render_agent_node(
     log_scroll_positions: RwSignal<HashMap<String, i32>>,
     log_cache: RwSignal<HashMap<String, Vec<LogEntry>>>,
 ) -> AnyView {
-    let Some(node) = node_signals.with_untracked(|signals| signals.get(&agent_id).copied()) else {
+    let Some(node) = node_signals.with_untracked(|signals| signals.get(&agent_id).cloned()) else {
         return view! { <div style="display:none"></div> }.into_any();
     };
 
@@ -37,7 +37,7 @@ pub fn render_agent_node(
 
 #[component]
 pub fn AgentNode(
-    node: RwSignal<AgentTreeNode>,
+    node: ArcRwSignal<AgentTreeNode>,
     node_signals: NodeSignalMap,
     expanded_agents: RwSignal<HashSet<String>>,
     log_tabs: RwSignal<HashSet<String>>,
@@ -67,25 +67,37 @@ pub fn AgentNode(
         }
     });
 
-    let status_indicator_class =
-        move || node.with(|node| format!("agent-status-indicator {}", node.agent.status_class()));
+    let status_node = node.clone();
+    let status_indicator_class = move || {
+        status_node.with(|node| format!("agent-status-indicator {}", node.agent.status_class()))
+    };
 
+    let label_node = node.clone();
     let label_display = move || {
-        node.with(|node| {
+        label_node.with(|node| {
             let child_prefix = if node.children.is_empty() { "" } else { "^ " };
             format!("{}{}", child_prefix, node.agent.label)
         })
     };
 
-    let harness_badge_class =
-        move || node.with(|node| format!("badge badge-harness {}", node.agent.harness_class()));
-    let harness_display = move || node.with(|node| node.agent.harness.clone());
-    let model_display = move || node.with(|node| node.agent.display_model().to_string());
-    let created_display = move || node.with(|node| format_timestamp(&node.agent.created_at));
-    let last_activity_display = move || node.with(|node| format_timestamp(&node.last_activity));
+    let harness_class_node = node.clone();
+    let harness_badge_class = move || {
+        harness_class_node.with(|node| format!("badge badge-harness {}", node.agent.harness_class()))
+    };
+    let harness_display_node = node.clone();
+    let harness_display = move || harness_display_node.with(|node| node.agent.harness.clone());
+    let model_node = node.clone();
+    let model_display = move || model_node.with(|node| node.agent.display_model().to_string());
+    let created_node = node.clone();
+    let created_display =
+        move || created_node.with(|node| format_timestamp(&node.agent.created_at));
+    let last_activity_node = node.clone();
+    let last_activity_display =
+        move || last_activity_node.with(|node| format_timestamp(&node.last_activity));
+    let activity_node = node.clone();
     let activity_display = move || {
         activity_tick.get();
-        node.with(|node| format_relative_time(&node.last_activity))
+        activity_node.with(|node| format_relative_time(&node.last_activity))
     };
 
     let card_class = move || {
@@ -116,6 +128,7 @@ pub fn AgentNode(
     };
 
     let tab_agent_id = id.clone();
+    let detail_node = node.clone();
 
     let detail_view = move || {
         if !expanded.get() {
@@ -153,6 +166,7 @@ pub fn AgentNode(
         };
 
         let content_agent_id = tab_agent_id.clone();
+        let content_node = detail_node.clone();
         let content = move || {
             if show_chat.get() {
                 let aid = content_agent_id.clone();
@@ -165,7 +179,7 @@ pub fn AgentNode(
                 }
                 .into_any()
             } else {
-                let (status, comms, workdir, branch, prompt) = node.with(|node| {
+                let (status, comms, workdir, branch, prompt) = content_node.with(|node| {
                     (
                         node.agent.status.clone(),
                         node.agent.comms.clone(),
@@ -216,16 +230,18 @@ pub fn AgentNode(
         .into_any()
     };
 
+    let children_node = node.clone();
     let child_ids = move || {
-        node.with(|node| {
+        children_node.with(|node| {
             node.children
                 .iter()
                 .map(|child| child.agent.id.clone())
                 .collect::<Vec<_>>()
         })
     };
+    let children_style_node = node.clone();
     let children_style = move || {
-        if node.with(|node| node.children.is_empty()) {
+        if children_style_node.with(|node| node.children.is_empty()) {
             "display:none"
         } else {
             ""

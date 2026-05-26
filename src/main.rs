@@ -935,7 +935,8 @@ async fn run_orchestrator(
     }
 
     // Start HTTP server
-    let router = swarm::server::router_with_dashboard(reg.clone(), dashboard);
+    let router =
+        swarm::server::router_with_dashboard_project(reg.clone(), dashboard, project_dir.clone());
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 
@@ -1565,7 +1566,11 @@ async fn resolve_send_target(
         return Err("`parent` is only available inside a swarm topic".into());
     }
 
-    let resp = conn.client().get(format!("{}/api/agents/{from}", conn.socket)).send().await?;
+    let resp = conn
+        .client()
+        .get(format!("{}/api/agents/{from}", conn.socket))
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1736,8 +1741,7 @@ async fn watch_inbox_loop(
 
     loop {
         let entries =
-            fetch_inbox_entries(conn, target, from_agent, false, Some(&since), limit, None)
-                .await?;
+            fetch_inbox_entries(conn, target, from_agent, false, Some(&since), limit, None).await?;
         let mut new_entries = entries
             .into_iter()
             .filter(|entry| seen.insert(inbox_entry_key(entry)))
@@ -1765,7 +1769,11 @@ async fn watch_inbox_loop(
 async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
     let conn = api_conn().await?;
-    let resp = conn.client().get(format!("{}/api/agents/{agent_id}", conn.socket)).send().await?;
+    let resp = conn
+        .client()
+        .get(format!("{}/api/agents/{agent_id}", conn.socket))
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }

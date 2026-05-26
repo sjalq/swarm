@@ -23,9 +23,7 @@ fn test_client(project_dir: &std::path::Path) -> reqwest::Client {
         .unwrap()
 }
 
-async fn setup_multi_project(
-    n: usize,
-) -> (tempfile::TempDir, Arc<Db>, Vec<ProjectHarness>) {
+async fn setup_multi_project(n: usize) -> (tempfile::TempDir, Arc<Db>, Vec<ProjectHarness>) {
     let root = tempfile::tempdir().unwrap();
     let data_dir = root.path().join("shared-data");
     std::fs::create_dir_all(data_dir.join("agents")).unwrap();
@@ -55,7 +53,11 @@ async fn setup_multi_project(
             axum::serve(listener, router).await.unwrap();
         });
 
-        projects.push(ProjectHarness { orch, addr, project_dir });
+        projects.push(ProjectHarness {
+            orch,
+            addr,
+            project_dir,
+        });
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -83,9 +85,7 @@ async fn wait_for_user_notification(
     .ok()
 }
 
-async fn join_all_handles<T: Send + 'static>(
-    handles: Vec<tokio::task::JoinHandle<T>>,
-) -> Vec<T> {
+async fn join_all_handles<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
     let mut results = Vec::with_capacity(handles.len());
     for handle in handles {
         results.push(handle.await.unwrap());
@@ -169,8 +169,10 @@ async fn concurrent_echo_agents_across_projects_no_cross_contamination() {
                 .start_topic("echoer", "echo", "", None, "mesh")
                 .unwrap();
 
-            let unique_msg =
-                format!("project-{project_idx}-unique-payload-{}", uuid::Uuid::new_v4());
+            let unique_msg = format!(
+                "project-{project_idx}-unique-payload-{}",
+                uuid::Uuid::new_v4()
+            );
             orch.send_message("user", &agent.id, &unique_msg)
                 .await
                 .unwrap();
@@ -584,9 +586,7 @@ async fn concurrent_full_lifecycle_across_four_projects() {
                 .unwrap();
 
             let unique = format!("p{project_idx}-{}", uuid::Uuid::new_v4());
-            orch.send_message("user", &child.id, &unique)
-                .await
-                .unwrap();
+            orch.send_message("user", &child.id, &unique).await.unwrap();
 
             let reply = wait_for_user_notification(&mut rx, &child.id, 5).await;
             assert!(
@@ -783,9 +783,7 @@ async fn parallel_high_volume_messaging_across_projects() {
             let _ = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     match rx.recv().await {
-                        Ok(SwarmEvent::UserNotification { from, content })
-                            if from == agent.id =>
-                        {
+                        Ok(SwarmEvent::UserNotification { from, content }) if from == agent.id => {
                             replies.push(content);
                             if replies.len() >= msg_count {
                                 return;
@@ -977,7 +975,11 @@ async fn list_all_agents_scoped_per_project() {
     let all0 = projects[0].orch.list_all_agents().unwrap();
     let all1 = projects[1].orch.list_all_agents().unwrap();
 
-    assert_eq!(all0.len(), 2, "project 0 should have 2 total agents (1 alive + 1 done)");
+    assert_eq!(
+        all0.len(),
+        2,
+        "project 0 should have 2 total agents (1 alive + 1 done)"
+    );
     assert_eq!(all1.len(), 1, "project 1 should have 1 total agent");
 
     let all0_ids: Vec<&str> = all0.iter().map(|a| a.id.as_str()).collect();
@@ -1009,7 +1011,10 @@ async fn get_agent_log_rejects_foreign_agents() {
         .orch
         .get_agent_log(&a0.id, 50, LogFilter::All)
         .unwrap();
-    assert!(!own_log.is_empty(), "own project should see the agent's log");
+    assert!(
+        !own_log.is_empty(),
+        "own project should see the agent's log"
+    );
 
     let err = projects[1]
         .orch

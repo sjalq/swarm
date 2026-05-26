@@ -16,7 +16,7 @@ pub fn TopicTree(
     let log_tabs = RwSignal::new(HashSet::<String>::new());
     let log_scroll_positions = RwSignal::new(HashMap::<String, i32>::new());
     let log_cache = RwSignal::new(HashMap::<String, Vec<LogEntry>>::new());
-    let node_signals = RwSignal::new(HashMap::<String, RwSignal<AgentTreeNode>>::new());
+    let node_signals = RwSignal::new(HashMap::<String, ArcRwSignal<AgentTreeNode>>::new());
     let root_ids = RwSignal::new(Vec::<String>::new());
 
     Effect::new(move |_| {
@@ -98,13 +98,13 @@ fn sync_node_signals(node_signals: NodeSignalMap, nodes: &[AgentTreeNode]) -> Ve
         for (id, node) in &updates {
             signals
                 .entry(id.clone())
-                .or_insert_with(|| RwSignal::new(node.clone()));
+                .or_insert_with(|| ArcRwSignal::new(node.clone()));
         }
     });
 
     let signals = node_signals.get_untracked();
     for (id, node) in updates {
-        if let Some(signal) = signals.get(&id).copied() {
+        if let Some(signal) = signals.get(&id).cloned() {
             signal.maybe_update(move |current| {
                 if current == &node {
                     false

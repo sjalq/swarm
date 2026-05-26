@@ -900,6 +900,49 @@ async fn http_api_stats_returns_counts() {
 }
 
 #[tokio::test]
+async fn http_api_uses_served_project_without_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("swarm.db");
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+
+    let db = Arc::new(Db::open(&db_path).unwrap());
+    let orch = Arc::new(Orchestrator::new(
+        db,
+        HarnessRegistry::new(),
+        "http://127.0.0.1:0".to_string(),
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = format!("http://127.0.0.1:{port}");
+    let router = swarm::server::router_with_dashboard_project(
+        registry_for(orch.clone()),
+        None,
+        dir.path().to_path_buf(),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let agent = orch
+        .start_topic("dashboard", "echo", "", None, "mesh")
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .get(format!("{addr}/api/agents?all=true"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let agents: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], agent.id);
+}
+
+#[tokio::test]
 async fn http_api_agent_worktree_returns_git_details() {
     let (_dir, orch) = setup_with_git();
     let addr = start_http_server(orch.clone()).await;

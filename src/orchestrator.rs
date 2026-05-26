@@ -1406,8 +1406,8 @@ impl OrchestratorRegistry {
     }
 
     pub fn get_or_create(&self, project_dir: &str) -> Result<Arc<Orchestrator>> {
-        let canonical = std::fs::canonicalize(project_dir)
-            .unwrap_or_else(|_| PathBuf::from(project_dir));
+        let canonical =
+            std::fs::canonicalize(project_dir).unwrap_or_else(|_| PathBuf::from(project_dir));
         let key = canonical.to_string_lossy().to_string();
 
         let mut map = self.orchestrators.lock().map_err(|_| {
@@ -1417,7 +1417,11 @@ impl OrchestratorRegistry {
         // /private/var symlink and similar cases where the stored key
         // may not have been canonicalized).
         if let Some(orch) = map.get(&key).or_else(|| {
-            if key != project_dir { map.get(project_dir) } else { None }
+            if key != project_dir {
+                map.get(project_dir)
+            } else {
+                None
+            }
         }) {
             return Ok(orch.clone());
         }
