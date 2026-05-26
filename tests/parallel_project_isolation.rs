@@ -1,12 +1,26 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use swarm::db::{AgentRow, CommsMode, Db, LogFilter, TopicStatus};
 use swarm::harness::HarnessRegistry;
-use swarm::orchestrator::{Orchestrator, SwarmEvent};
+use swarm::orchestrator::{Orchestrator, OrchestratorRegistry, SwarmEvent};
 
 struct ProjectHarness {
     orch: Arc<Orchestrator>,
     addr: String,
+    project_dir: PathBuf,
+}
+
+fn test_client(project_dir: &std::path::Path) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        swarm::server::PROJECT_HEADER,
+        reqwest::header::HeaderValue::from_str(&project_dir.to_string_lossy()).unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }
 
 async fn setup_multi_project(
@@ -31,16 +45,17 @@ async fn setup_multi_project(
             db.clone(),
             HarnessRegistry::new(),
             addr.clone(),
-            project_dir,
+            project_dir.clone(),
             data_dir.clone(),
         ));
 
-        let router = swarm::server::router(orch.clone());
+        let registry_arc = Arc::new(OrchestratorRegistry::with_orchestrator(orch.clone()));
+        let router = swarm::server::router(registry_arc);
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
 
-        projects.push(ProjectHarness { orch, addr });
+        projects.push(ProjectHarness { orch, addr, project_dir });
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -470,9 +485,10 @@ async fn resume_only_resumes_own_projects_workers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_api_isolation_between_projects() {
     let (_root, _db, projects) = setup_multi_project(2).await;
-    let client = reqwest::Client::new();
+    let client0 = test_client(&projects[0].project_dir);
+    let client1 = test_client(&projects[1].project_dir);
 
-    let resp = client
+    let resp = client0
         .post(format!("{}/api/agents", projects[0].addr))
         .json(&serde_json::json!({
             "label": "http-agent",
@@ -487,7 +503,7 @@ async fn http_api_isolation_between_projects() {
     let agent0: serde_json::Value = resp.json().await.unwrap();
     let agent0_id = agent0["id"].as_str().unwrap();
 
-    let resp = client
+    let resp = client1
         .post(format!("{}/api/agents", projects[1].addr))
         .json(&serde_json::json!({
             "label": "http-agent",
@@ -502,7 +518,7 @@ async fn http_api_isolation_between_projects() {
     let agent1: serde_json::Value = resp.json().await.unwrap();
     let agent1_id = agent1["id"].as_str().unwrap();
 
-    let resp = client
+    let resp = client0
         .get(format!("{}/api/agents", projects[0].addr))
         .send()
         .await
@@ -511,7 +527,7 @@ async fn http_api_isolation_between_projects() {
     assert_eq!(agents0.len(), 1);
     assert_eq!(agents0[0]["id"].as_str().unwrap(), agent0_id);
 
-    let resp = client
+    let resp = client1
         .get(format!("{}/api/agents", projects[1].addr))
         .send()
         .await
@@ -520,7 +536,7 @@ async fn http_api_isolation_between_projects() {
     assert_eq!(agents1.len(), 1);
     assert_eq!(agents1[0]["id"].as_str().unwrap(), agent1_id);
 
-    let resp = client
+    let resp = client0
         .get(format!("{}/api/agents/{agent1_id}", projects[0].addr))
         .send()
         .await
@@ -531,7 +547,7 @@ async fn http_api_isolation_between_projects() {
         "project 0 should not serve project 1's agent"
     );
 
-    let resp = client
+    let resp = client1
         .get(format!("{}/api/agents/{agent0_id}", projects[1].addr))
         .send()
         .await
@@ -815,12 +831,11 @@ async fn parallel_high_volume_messaging_across_projects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_stats_isolation_under_concurrent_load() {
     let (_root, _db, projects) = setup_multi_project(3).await;
-    let client = reqwest::Client::new();
 
     let mut handles = Vec::new();
     for (i, p) in projects.iter().enumerate() {
         let addr = p.addr.clone();
-        let client = client.clone();
+        let client = test_client(&p.project_dir);
         let agent_count = i + 1;
 
         let handle = tokio::spawn(async move {
@@ -845,6 +860,7 @@ async fn http_stats_isolation_under_concurrent_load() {
     let created: Vec<(usize, usize)> = join_all_handles(handles).await;
 
     for (i, expected_count) in &created {
+        let client = test_client(&projects[*i].project_dir);
         let resp = client
             .get(format!("{}/api/stats", projects[*i].addr))
             .send()

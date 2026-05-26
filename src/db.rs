@@ -1263,6 +1263,17 @@ impl Db {
             errors: errors as u64,
         })
     }
+
+    pub fn list_active_project_dirs(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT project_dir FROM agents WHERE project_dir IS NOT NULL AND status != 'done'",
+        )?;
+        let dirs = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(dirs)
+    }
 }
 
 #[cfg(test)]

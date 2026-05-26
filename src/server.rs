@@ -1,11 +1,12 @@
 use crate::db::LogFilter;
 use crate::error::SwarmError;
 use crate::harness::CliKind;
-use crate::orchestrator::{DoneReport, Orchestrator, StartTopicOptions};
+use crate::orchestrator::{DoneReport, Orchestrator, OrchestratorRegistry, StartTopicOptions};
 use crate::types::{CommsMode, SqlEnum, SWARM_PROTOCOL_VERSION};
 use axum::extract::ws;
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{FromRequestParts, Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,9 +20,42 @@ use tower_http::services::{ServeDir, ServeFile};
 #[folder = "frontend/dist/"]
 struct DashboardAssets;
 
-type AppState = Arc<Orchestrator>;
+pub const PROJECT_HEADER: &str = "x-swarm-project";
+
+type AppState = Arc<OrchestratorRegistry>;
 const PEERS_HINT: &str = "run swarm peers to list topics";
 const WS_REPLAY_LIMIT: usize = 1000;
+
+struct Orch(Arc<Orchestrator>);
+
+impl FromRequestParts<AppState> for Orch {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let project = parts
+            .headers
+            .get(PROJECT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("missing {PROJECT_HEADER} header"),
+                    "set SWARM_PROJECT_DIR or pass --project-dir to the CLI",
+                )
+            })?;
+        let orch = state.get_or_create(project).map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to initialize project orchestrator: {e}"),
+                "check the project directory path",
+            )
+        })?;
+        Ok(Orch(orch))
+    }
+}
 
 #[derive(Deserialize)]
 pub struct StartTopicRequest {
@@ -141,7 +175,6 @@ struct HealthResponse {
     version: &'static str,
     pid: u32,
     data_dir: String,
-    project_dir: String,
 }
 
 #[derive(Serialize)]
@@ -264,29 +297,25 @@ async fn serve_embedded(uri: axum::http::Uri) -> impl IntoResponse {
     }
 }
 
-async fn health(State(orch): State<AppState>) -> impl IntoResponse {
+async fn health(State(reg): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok",
         protocol: SWARM_PROTOCOL_VERSION,
-        uptime: orch.uptime_seconds(),
+        uptime: reg.uptime_seconds(),
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
-        data_dir: orch.data_dir().to_string_lossy().to_string(),
-        project_dir: orch.project_dir().to_string_lossy().to_string(),
+        data_dir: reg.data_dir().to_string_lossy().to_string(),
     })
 }
 
-async fn get_stats(State(orch): State<AppState>) -> impl IntoResponse {
+async fn get_stats(Orch(orch): Orch) -> impl IntoResponse {
     match blocking_orchestrator("get stats", move || orch.stats()).await {
         Ok(stats) => Json(stats).into_response(),
         Err(e) => swarm_error_response(e),
     }
 }
 
-async fn get_swarm_brief(
-    State(orch): State<AppState>,
-    Query(params): Query<BriefQuery>,
-) -> impl IntoResponse {
+async fn get_swarm_brief(Orch(orch): Orch, Query(params): Query<BriefQuery>) -> impl IntoResponse {
     match blocking_orchestrator("get project brief", move || {
         orch.swarm_brief(params.limit, params.q.as_deref())
     })
@@ -297,10 +326,7 @@ async fn get_swarm_brief(
     }
 }
 
-async fn list_agents(
-    State(orch): State<AppState>,
-    Query(params): Query<ListQuery>,
-) -> impl IntoResponse {
+async fn list_agents(Orch(orch): Orch, Query(params): Query<ListQuery>) -> impl IntoResponse {
     if let Some(perspective) = params.perspective {
         match blocking_orchestrator("list agents", move || {
             orch.list_agents_with_perspective_all(&perspective, params.all)
@@ -326,7 +352,7 @@ async fn list_agents(
     }
 }
 
-async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn get_agent(Orch(orch): Orch, Path(id): Path<String>) -> impl IntoResponse {
     match blocking_orchestrator("get agent", {
         let id = id.clone();
         move || orch.get_agent(&id)
@@ -339,10 +365,7 @@ async fn get_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl
     }
 }
 
-async fn start_topic(
-    State(orch): State<AppState>,
-    Json(req): Json<StartTopicRequest>,
-) -> impl IntoResponse {
+async fn start_topic(Orch(orch): Orch, Json(req): Json<StartTopicRequest>) -> impl IntoResponse {
     let comms = match CommsMode::from_sql(&req.comms) {
         Ok(comms) => comms,
         Err(err) => return swarm_error_response(SwarmError::InvalidInput(err)),
@@ -374,10 +397,7 @@ async fn start_topic(
     }
 }
 
-async fn send_message(
-    State(orch): State<AppState>,
-    Json(req): Json<SendRequest>,
-) -> impl IntoResponse {
+async fn send_message(Orch(orch): Orch, Json(req): Json<SendRequest>) -> impl IntoResponse {
     match orch.send_message(&req.from, &req.to, &req.content).await {
         Ok(msg) => Json(msg).into_response(),
         Err(e) => swarm_error_response(e),
@@ -385,7 +405,7 @@ async fn send_message(
 }
 
 async fn broadcast_family(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Json(req): Json<FamilyBroadcastRequest>,
 ) -> impl IntoResponse {
     match orch.broadcast_family(&req.from, &req.content).await {
@@ -395,7 +415,7 @@ async fn broadcast_family(
 }
 
 async fn get_agent_log(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Path(id): Path<String>,
     Query(params): Query<LogQuery>,
 ) -> impl IntoResponse {
@@ -416,7 +436,7 @@ async fn get_agent_log(
 }
 
 async fn get_agent_inbox(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Path(id): Path<String>,
     Query(params): Query<InboxQuery>,
 ) -> impl IntoResponse {
@@ -441,7 +461,7 @@ async fn get_agent_inbox(
 }
 
 async fn get_agent_brief(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Path(id): Path<String>,
     Query(params): Query<BriefQuery>,
 ) -> impl IntoResponse {
@@ -456,10 +476,7 @@ async fn get_agent_brief(
     }
 }
 
-async fn get_agent_worktree(
-    State(orch): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_agent_worktree(Orch(orch): Orch, Path(id): Path<String>) -> impl IntoResponse {
     match blocking_orchestrator("get agent worktree", {
         let id = id.clone();
         move || orch.worktree_info(&id)
@@ -477,7 +494,7 @@ async fn get_agent_worktree(
 }
 
 async fn done_agent(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Path(id): Path<String>,
     Json(req): Json<DoneRequest>,
 ) -> impl IntoResponse {
@@ -496,7 +513,7 @@ async fn done_agent(
 }
 
 async fn cleanup_agent(
-    State(orch): State<AppState>,
+    Orch(orch): Orch,
     Path(id): Path<String>,
     Query(params): Query<CleanupQuery>,
 ) -> impl IntoResponse {
@@ -514,17 +531,14 @@ async fn cleanup_agent(
     }
 }
 
-async fn kill_agent(State(orch): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn kill_agent(Orch(orch): Orch, Path(id): Path<String>) -> impl IntoResponse {
     match orch.kill_agent(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => swarm_error_response(e),
     }
 }
 
-async fn list_events(
-    State(orch): State<AppState>,
-    Query(params): Query<EventQuery>,
-) -> impl IntoResponse {
+async fn list_events(Orch(orch): Orch, Query(params): Query<EventQuery>) -> impl IntoResponse {
     match blocking_orchestrator("list events", move || {
         orch.list_events(
             params.since.as_deref(),
@@ -558,15 +572,49 @@ async fn list_models() -> impl IntoResponse {
     Json(models)
 }
 
-async fn ws_handler(State(orch): State<AppState>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| handle_ws(socket, orch))
+#[derive(Deserialize)]
+pub struct WsQuery {
+    pub project: Option<String>,
+}
+
+async fn ws_handler(
+    State(reg): State<AppState>,
+    Query(params): Query<WsQuery>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let project = params.project;
+    upgrade.on_upgrade(move |socket| handle_ws(socket, reg, project))
 }
 
 async fn not_found() -> impl IntoResponse {
     json_error(StatusCode::NOT_FOUND, "route not found", "run swarm --help")
 }
 
-async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
+async fn handle_ws(
+    mut socket: ws::WebSocket,
+    reg: AppState,
+    project: Option<String>,
+) {
+    let Some(project) = project else {
+        let _ = socket
+            .send(ws::Message::Text(
+                r#"{"error":"missing ?project= query parameter"}"#.into(),
+            ))
+            .await;
+        return;
+    };
+    let orch = match reg.get_or_create(&project) {
+        Ok(orch) => orch,
+        Err(e) => {
+            let _ = socket
+                .send(ws::Message::Text(
+                    format!(r#"{{"error":"{e}"}}"#).into(),
+                ))
+                .await;
+            return;
+        }
+    };
+
     let mut rx = orch.subscribe();
     if !replay_ws_events(&mut socket, orch.clone()).await {
         return;
@@ -592,7 +640,7 @@ async fn handle_ws(mut socket: ws::WebSocket, orch: AppState) {
     }
 }
 
-async fn replay_ws_events(socket: &mut ws::WebSocket, orch: AppState) -> bool {
+async fn replay_ws_events(socket: &mut ws::WebSocket, orch: Arc<Orchestrator>) -> bool {
     let events = match blocking_orchestrator("replay websocket events", move || {
         orch.list_recent_events(WS_REPLAY_LIMIT)
     })

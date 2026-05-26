@@ -1352,7 +1352,125 @@ impl Orchestrator {
 
         Ok(())
     }
+}
 
+pub struct OrchestratorRegistry {
+    db: Arc<Db>,
+    harness_registry: HarnessRegistry,
+    orchestrators: Mutex<HashMap<String, Arc<Orchestrator>>>,
+    addr: String,
+    data_dir: PathBuf,
+    start_time: Instant,
+}
+
+impl OrchestratorRegistry {
+    pub fn new(
+        db: Arc<Db>,
+        harness_registry: HarnessRegistry,
+        addr: String,
+        data_dir: PathBuf,
+    ) -> Self {
+        Self {
+            db,
+            harness_registry,
+            orchestrators: Mutex::new(HashMap::new()),
+            addr,
+            data_dir,
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn with_orchestrator(orch: Arc<Orchestrator>) -> Self {
+        let db = orch.db.clone();
+        let addr = orch.addr.clone();
+        let data_dir = orch.data_dir.clone();
+        let raw_key = orch.project_key.clone();
+        let canonical_key = std::fs::canonicalize(&raw_key)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| raw_key.clone());
+        let mut map = HashMap::new();
+        map.insert(canonical_key.clone(), orch.clone());
+        // Also store under the raw key so lookups with non-canonical
+        // paths (e.g. /var vs /private/var on macOS) still match.
+        if canonical_key != raw_key {
+            map.insert(raw_key, orch);
+        }
+        Self {
+            db,
+            harness_registry: HarnessRegistry::new(),
+            orchestrators: Mutex::new(map),
+            addr,
+            data_dir,
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn get_or_create(&self, project_dir: &str) -> Result<Arc<Orchestrator>> {
+        let canonical = std::fs::canonicalize(project_dir)
+            .unwrap_or_else(|_| PathBuf::from(project_dir));
+        let key = canonical.to_string_lossy().to_string();
+
+        let mut map = self.orchestrators.lock().map_err(|_| {
+            SwarmError::Internal("orchestrator registry mutex poisoned".to_string())
+        })?;
+        // Try canonical key first, then raw key (handles macOS /var vs
+        // /private/var symlink and similar cases where the stored key
+        // may not have been canonicalized).
+        if let Some(orch) = map.get(&key).or_else(|| {
+            if key != project_dir { map.get(project_dir) } else { None }
+        }) {
+            return Ok(orch.clone());
+        }
+
+        let orch = Arc::new(Orchestrator::new(
+            self.db.clone(),
+            self.harness_registry.clone(),
+            self.addr.clone(),
+            canonical,
+            self.data_dir.clone(),
+        ));
+        map.insert(key, orch.clone());
+        Ok(orch)
+    }
+
+    pub fn resume_all_projects(&self) -> Result<usize> {
+        let dirs = self.db.list_active_project_dirs()?;
+        let mut total = 0;
+        for dir in dirs {
+            let orch = self.get_or_create(&dir)?;
+            total += orch.resume_existing_workers()?;
+        }
+        Ok(total)
+    }
+
+    pub async fn shutdown_all(&self) -> Result<()> {
+        let orchestrators: Vec<Arc<Orchestrator>> = {
+            let map = self.orchestrators.lock().map_err(|_| {
+                SwarmError::Internal("orchestrator registry mutex poisoned".to_string())
+            })?;
+            map.values().cloned().collect()
+        };
+        for orch in orchestrators {
+            orch.shutdown_all().await?;
+        }
+        Ok(())
+    }
+
+    pub fn subscribe_all(&self) -> Vec<broadcast::Receiver<SwarmEvent>> {
+        let map = self.orchestrators.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().map(|orch| orch.subscribe()).collect()
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+}
+
+impl Orchestrator {
     async fn agent_worker_loop(
         config: WorkerConfig,
         mut cmd_rx: mpsc::UnboundedReceiver<WorkerCmd>,

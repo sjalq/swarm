@@ -7,8 +7,24 @@ use std::time::Duration;
 use swarm::db::{AgentRow, CommsMode, Db, LogFilter, MessageRow, OutputLogRow, TopicStatus};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
-use swarm::orchestrator::{DoneReport, Orchestrator, SwarmEvent};
+use swarm::orchestrator::{DoneReport, Orchestrator, OrchestratorRegistry, SwarmEvent};
 use tokio::sync::mpsc;
+
+fn registry_for(orch: Arc<Orchestrator>) -> Arc<OrchestratorRegistry> {
+    Arc::new(OrchestratorRegistry::with_orchestrator(orch))
+}
+
+fn test_client(project_dir: &std::path::Path) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        swarm::server::PROJECT_HEADER,
+        reqwest::header::HeaderValue::from_str(&project_dir.to_string_lossy()).unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
 
 struct ResumeProbeHarness;
 
@@ -76,7 +92,7 @@ async fn setup_http_server() -> (tempfile::TempDir, Arc<Orchestrator>, String) {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch.clone());
+    let router = swarm::server::router(registry_for(orch.clone()));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -89,7 +105,7 @@ async fn start_http_server(orch: Arc<Orchestrator>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let addr = format!("http://127.0.0.1:{port}");
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -723,7 +739,7 @@ async fn http_api_start_topic_and_list() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -731,7 +747,7 @@ async fn http_api_start_topic_and_list() {
     // Give server a moment to start
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     // Start topic via HTTP
     let resp = client
@@ -813,7 +829,7 @@ async fn http_api_start_topic_and_list() {
 #[tokio::test]
 async fn http_api_health_returns_status_uptime_and_version() {
     let (_dir, _orch, addr) = setup_http_server().await;
-    let client = reqwest::Client::new();
+    let client = test_client(_dir.path());
 
     let resp = client
         .get(format!("{addr}/api/health"))
@@ -867,7 +883,7 @@ async fn http_api_stats_returns_counts() {
     })
     .unwrap();
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
     let resp = client
         .get(format!("{addr}/api/stats"))
         .send()
@@ -896,7 +912,7 @@ async fn http_api_agent_worktree_returns_git_details() {
         .unwrap()
         .expect("worktree should exist");
 
-    let client = reqwest::Client::new();
+    let client = test_client(&_dir.path().join("project"));
     let resp = client
         .get(format!("{addr}/api/agents/{}/worktree", agent.id))
         .send()
@@ -970,13 +986,13 @@ async fn http_api_missing_agent_returns_json_error() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
     let resp = client
         .get(format!("{addr}/api/agents/missing-agent"))
         .send()
@@ -992,7 +1008,7 @@ async fn http_api_missing_agent_returns_json_error() {
 #[tokio::test]
 async fn http_api_agent_not_found_returns_json_error() {
     let (_dir, _orch, addr) = setup_http_server().await;
-    let client = reqwest::Client::new();
+    let client = test_client(_dir.path());
 
     let resp = client
         .get(format!("{addr}/api/agents/missing-agent"))
@@ -1009,7 +1025,7 @@ async fn http_api_agent_not_found_returns_json_error() {
 #[tokio::test]
 async fn http_api_send_to_done_agent_reactivates_it() {
     let (_dir, orch, addr) = setup_http_server().await;
-    let client = reqwest::Client::new();
+    let client = test_client(_dir.path());
 
     let done_agent = orch.start_topic("done", "echo", "", None, "mesh").unwrap();
     orch.done_agent(&done_agent.id, None).await.unwrap();
@@ -1172,13 +1188,13 @@ async fn http_api_agent_log() {
     ));
 
     let mut rx = orch.subscribe();
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     // Start topic
     let resp = client
@@ -1557,13 +1573,13 @@ async fn http_api_models_endpoint() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     let resp = client
         .get(format!("{addr}/api/models"))
@@ -1600,13 +1616,13 @@ async fn http_api_events_endpoint() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch.clone());
+    let router = swarm::server::router(registry_for(orch.clone()));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     // Start a topic to generate events
     client
@@ -1662,13 +1678,13 @@ async fn http_api_start_topic_with_model() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch);
+    let router = swarm::server::router(registry_for(orch));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     let resp = client
         .post(format!("{addr}/api/agents"))
@@ -1708,13 +1724,13 @@ async fn http_api_perspective_query() {
         dir.path().to_path_buf(),
     ));
 
-    let router = swarm::server::router(orch.clone());
+    let router = swarm::server::router(registry_for(orch.clone()));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client(dir.path());
 
     // Start parent and child topics
     let resp = client
@@ -2442,7 +2458,7 @@ async fn broadcast_family_returns_empty_for_isolated_agent() {
 #[tokio::test]
 async fn broadcast_family_http_endpoint() {
     let (_dir, orch, addr) = setup_http_server().await;
-    let client = reqwest::Client::new();
+    let client = test_client(_dir.path());
 
     let parent = orch
         .start_topic("parent", "echo", "", None, "mesh")

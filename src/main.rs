@@ -10,7 +10,8 @@ use swarm::config::SwarmConfig;
 use swarm::db::Db;
 use swarm::guidance::{HELP_DISCOVERY_HINT, PARENT_REPLY_HINT};
 use swarm::harness::{CliKind, HarnessRegistry};
-use swarm::orchestrator::{Orchestrator, SwarmEvent};
+use swarm::orchestrator::OrchestratorRegistry;
+use swarm::server::PROJECT_HEADER;
 use swarm::types::{SWARM_PROTOCOL_VERSION, USER_TOPIC_ID};
 
 const CLI_ENTRY_SEPARATOR: &str = "------------";
@@ -920,22 +921,21 @@ async fn run_orchestrator(
     }
 
     let db = Arc::new(Db::open(&data_dir.join("swarm.db"))?);
-    let registry = HarnessRegistry::new();
+    let harness_registry = HarnessRegistry::new();
     let addr = format!("http://127.0.0.1:{port}");
-    let orch = Arc::new(Orchestrator::new(
+    let reg = Arc::new(OrchestratorRegistry::new(
         db,
-        registry,
+        harness_registry,
         addr.clone(),
-        project_dir,
         data_dir,
     ));
-    let resumed = orch.resume_existing_workers()?;
+    let resumed = reg.resume_all_projects()?;
     if resumed > 0 {
         tracing::info!("resumed {resumed} existing topic worker(s)");
     }
 
     // Start HTTP server
-    let router = swarm::server::router_with_dashboard(orch.clone(), dashboard);
+    let router = swarm::server::router_with_dashboard(reg.clone(), dashboard);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     tracing::info!("swarm orchestrator listening on {addr}");
 
@@ -945,63 +945,14 @@ async fn run_orchestrator(
         }
     });
 
-    // Stream events to stdout
-    let mut rx = orch.subscribe();
-    let event_loop = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => match &event {
-                    SwarmEvent::AgentOutput { agent_id, text } => {
-                        println!("[{agent_id}] {text}");
-                    }
-                    SwarmEvent::AgentError { agent_id, error } => {
-                        eprintln!("[{agent_id}] ERROR: {error}");
-                    }
-                    SwarmEvent::TopicStarted { agent } => {
-                        println!(
-                            "[swarm] topic: {} ({}, {})",
-                            agent.id, agent.harness, agent.label
-                        );
-                    }
-                    SwarmEvent::AgentDone { agent_id, message } => {
-                        if let Some(msg) = message {
-                            println!("[swarm] done: {agent_id} - {msg}");
-                        } else {
-                            println!("[swarm] done: {agent_id}");
-                        }
-                    }
-                    SwarmEvent::AgentKilled { agent_id } => {
-                        println!("[swarm] stopped: {agent_id}");
-                    }
-                    SwarmEvent::AgentStatus { agent_id, status } => {
-                        println!("[swarm] {agent_id} -> {status}");
-                    }
-                    SwarmEvent::MessageRouted { from, to } => {
-                        println!("[swarm] message: {from} -> {to}");
-                    }
-                    SwarmEvent::UserNotification { from, content } => {
-                        println!("[NOTIFY {from}] {content}");
-                    }
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("[swarm] warning: skipped {skipped} lagged event(s)");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
-            }
-        }
-    });
-
     tokio::select! {
         _ = server_handle => {}
-        _ = event_loop => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
         }
     }
 
-    orch.shutdown_all().await?;
+    reg.shutdown_all().await?;
 
     Ok(())
 }
@@ -1075,9 +1026,14 @@ async fn run_task_swarm(args: RunTaskSwarm) -> std::result::Result<(), Box<dyn s
 
     let parent_id = runtime_parent_id();
     let user_launched = parent_id == USER_TOPIC_ID;
+    let project_dir = daemon.project_dir.to_string_lossy().to_string();
     let socket = ensure_daemon(daemon).await?;
+    let conn = ApiConn {
+        socket: socket.clone(),
+        project_dir,
+    };
     let topic = create_topic_http(
-        &socket,
+        &conn,
         CreateTopicHttpRequest {
             label: &label,
             harness: &harness,
@@ -1096,7 +1052,7 @@ async fn run_task_swarm(args: RunTaskSwarm) -> std::result::Result<(), Box<dyn s
         .to_string();
 
     let topic_prompt = topic_prompt(&task, &topic_id, &parent_id);
-    send_message_http(&socket, &parent_id, &topic_id, &topic_prompt).await?;
+    send_message_http(&conn, &parent_id, &topic_id, &topic_prompt).await?;
 
     println!("topic: {topic_id}");
     println!("parent: {parent_id}");
@@ -1128,7 +1084,6 @@ struct DaemonLaunch {
 struct DaemonTarget {
     socket: String,
     launch_port: Option<u16>,
-    explicit_socket: bool,
 }
 
 fn build_daemon_launch(
@@ -1171,7 +1126,6 @@ fn daemon_target(
             return Ok(DaemonTarget {
                 socket: socket.trim_end_matches('/').to_string(),
                 launch_port,
-                explicit_socket: true,
             });
         }
     }
@@ -1179,7 +1133,6 @@ fn daemon_target(
     Ok(DaemonTarget {
         socket: format!("http://127.0.0.1:{default_port}"),
         launch_port: Some(default_port),
-        explicit_socket: false,
     })
 }
 
@@ -1198,8 +1151,34 @@ fn local_http_port(socket: &str) -> std::result::Result<Option<u16>, Box<dyn std
     Ok(url.port_or_known_default())
 }
 
-async fn api_socket() -> std::result::Result<String, Box<dyn std::error::Error>> {
-    ensure_daemon(default_daemon_launch(true)?).await
+struct ApiConn {
+    socket: String,
+    project_dir: String,
+}
+
+impl ApiConn {
+    fn client(&self) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            PROJECT_HEADER,
+            reqwest::header::HeaderValue::from_str(&self.project_dir)
+                .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+}
+
+async fn api_conn() -> std::result::Result<ApiConn, Box<dyn std::error::Error>> {
+    let launch = default_daemon_launch(true)?;
+    let project_dir = launch.project_dir.to_string_lossy().to_string();
+    let socket = ensure_daemon(launch).await?;
+    Ok(ApiConn {
+        socket,
+        project_dir,
+    })
 }
 
 async fn ensure_daemon(
@@ -1208,12 +1187,6 @@ async fn ensure_daemon(
     let target = daemon_target(launch.port)?;
     if let Some(health) = daemon_health(&target.socket).await {
         ensure_health_protocol(&target.socket, &health)?;
-        ensure_health_project(
-            &target.socket,
-            &health,
-            &launch.project_dir,
-            target.explicit_socket,
-        )?;
         return Ok(target.socket);
     }
 
@@ -1232,8 +1205,6 @@ async fn ensure_daemon(
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve")
-        .arg("--project-dir")
-        .arg(&launch.project_dir)
         .arg("--port")
         .arg(port.to_string())
         .arg("--data-dir")
@@ -1257,12 +1228,6 @@ async fn ensure_daemon(
     for _ in 0..80 {
         if let Some(health) = daemon_health(&target.socket).await {
             ensure_health_protocol(&target.socket, &health)?;
-            ensure_health_project(
-                &target.socket,
-                &health,
-                &launch.project_dir,
-                target.explicit_socket,
-            )?;
             return Ok(target.socket);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1299,42 +1264,6 @@ fn ensure_health_protocol(
     }
 }
 
-fn ensure_health_project(
-    socket: &str,
-    health: &serde_json::Value,
-    expected_project_dir: &std::path::Path,
-    explicit_socket: bool,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("SWARM_ALLOW_PROJECT_MISMATCH").is_some() {
-        return Ok(());
-    }
-
-    let Some(actual) = health["project_dir"].as_str() else {
-        return Err(format!("daemon at {socket} did not report a project directory").into());
-    };
-
-    let actual_path = std::fs::canonicalize(actual).unwrap_or_else(|_| PathBuf::from(actual));
-    let expected_path = std::fs::canonicalize(expected_project_dir)
-        .unwrap_or_else(|_| expected_project_dir.to_path_buf());
-
-    if actual_path == expected_path {
-        return Ok(());
-    }
-
-    let hint = if explicit_socket {
-        "Set SWARM_PROJECT_DIR to that project, unset SWARM_SOCKET, or set SWARM_ALLOW_PROJECT_MISMATCH=1 if this cross-project target is intentional."
-    } else {
-        "Use --port for a different daemon, stop the existing daemon, or run from the daemon's project directory."
-    };
-
-    Err(format!(
-        "daemon at {socket} serves project {}, but this command targets {}. {hint}",
-        actual_path.display(),
-        expected_path.display()
-    )
-    .into())
-}
-
 async fn daemon_health(socket: &str) -> Option<serde_json::Value> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(400))
@@ -1366,12 +1295,12 @@ struct CreateTopicHttpRequest<'a> {
 }
 
 async fn create_topic_http(
-    socket: &str,
+    conn: &ApiConn,
     req: CreateTopicHttpRequest<'_>,
 ) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+    let client = conn.client();
     let resp = client
-        .post(format!("{socket}/api/agents"))
+        .post(format!("{}/api/agents", conn.socket))
         .json(&serde_json::json!({
             "label": req.label,
             "harness": req.harness,
@@ -1391,14 +1320,14 @@ async fn create_topic_http(
 }
 
 async fn send_message_http(
-    socket: &str,
+    conn: &ApiConn,
     from: &str,
     to: &str,
     content: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+    let client = conn.client();
     let resp = client
-        .post(format!("{socket}/api/messages"))
+        .post(format!("{}/api/messages", conn.socket))
         .json(&serde_json::json!({
             "from": from,
             "to": to,
@@ -1444,8 +1373,8 @@ async fn cmd_peers(
     include_all: bool,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = api_socket().await?;
-    let mut url = format!("{socket}/api/agents");
+    let conn = api_conn().await?;
+    let mut url = format!("{}/api/agents", conn.socket);
     let mut params = Vec::new();
     if let Some(agent_id) = swarm_agent_id() {
         params.push(format!("perspective={agent_id}"));
@@ -1458,7 +1387,7 @@ async fn cmd_peers(
         url.push_str(&params.join("&"));
     }
 
-    let resp = reqwest::get(&url).await?;
+    let resp = conn.client().get(&url).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1571,11 +1500,11 @@ async fn cmd_send(
     if target == "parent" && from == "user" {
         return Err("`parent` is only available inside a swarm topic".into());
     }
-    let socket = api_socket().await?;
-    let target = resolve_send_target(&socket, target, &from).await?;
-    let client = reqwest::Client::new();
+    let conn = api_conn().await?;
+    let target = resolve_send_target(&conn, target, &from).await?;
+    let client = conn.client();
     let resp = client
-        .post(format!("{socket}/api/messages"))
+        .post(format!("{}/api/messages", conn.socket))
         .json(&serde_json::json!({
             "from": from,
             "to": target,
@@ -1595,10 +1524,10 @@ async fn cmd_send(
 async fn cmd_send_family(message: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let from = swarm_agent_id()
         .ok_or("send-family requires SWARM_AGENT_ID (only available inside a swarm topic)")?;
-    let socket = api_socket().await?;
-    let client = reqwest::Client::new();
+    let conn = api_conn().await?;
+    let client = conn.client();
     let resp = client
-        .post(format!("{socket}/api/messages/family"))
+        .post(format!("{}/api/messages/family", conn.socket))
         .json(&serde_json::json!({
             "from": from,
             "content": message,
@@ -1625,7 +1554,7 @@ async fn cmd_send_family(message: &str) -> std::result::Result<(), Box<dyn std::
 }
 
 async fn resolve_send_target(
-    socket: &str,
+    conn: &ApiConn,
     target: &str,
     from: &str,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
@@ -1636,7 +1565,7 @@ async fn resolve_send_target(
         return Err("`parent` is only available inside a swarm topic".into());
     }
 
-    let resp = reqwest::get(format!("{socket}/api/agents/{from}")).await?;
+    let resp = conn.client().get(format!("{}/api/agents/{from}", conn.socket)).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1687,9 +1616,9 @@ async fn cmd_inbox(args: InboxCommand<'_>) -> std::result::Result<(), Box<dyn st
         Some(from.ok_or("pass a source topic id, or use --all to read all inbox messages")?)
     };
     let target = resolve_inbox_target(to)?;
-    let socket = api_socket().await?;
+    let conn = api_conn().await?;
     let resp =
-        fetch_inbox_entries(&socket, &target, from_agent, only_new, since, limit, search).await?;
+        fetch_inbox_entries(&conn, &target, from_agent, only_new, since, limit, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
@@ -1707,7 +1636,7 @@ async fn cmd_inbox(args: InboxCommand<'_>) -> std::result::Result<(), Box<dyn st
 }
 
 async fn fetch_inbox_entries(
-    socket: &str,
+    conn: &ApiConn,
     target: &str,
     from_agent: Option<&str>,
     only_new: bool,
@@ -1715,7 +1644,7 @@ async fn fetch_inbox_entries(
     limit: usize,
     search: Option<&str>,
 ) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/inbox"))?;
+    let mut url = reqwest::Url::parse(&format!("{}/api/agents/{target}/inbox", conn.socket))?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("n", &limit.to_string());
@@ -1733,7 +1662,7 @@ async fn fetch_inbox_entries(
         }
     }
 
-    let resp = reqwest::get(url).await?;
+    let resp = conn.client().get(url).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1741,13 +1670,13 @@ async fn fetch_inbox_entries(
 }
 
 async fn fetch_log_entries(
-    socket: &str,
+    conn: &ApiConn,
     target: &str,
     limit: usize,
     filter: &str,
     search: Option<&str>,
 ) -> std::result::Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let mut url = reqwest::Url::parse(&format!("{socket}/api/agents/{target}/log"))?;
+    let mut url = reqwest::Url::parse(&format!("{}/api/agents/{target}/log", conn.socket))?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("n", &limit.to_string());
@@ -1758,7 +1687,7 @@ async fn fetch_log_entries(
             query.append_pair("q", search);
         }
     }
-    let resp = reqwest::get(url).await?;
+    let resp = conn.client().get(url).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1789,12 +1718,12 @@ async fn cmd_watch_inbox(
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let target = resolve_inbox_target(target)?;
-    let socket = api_socket().await?;
-    watch_inbox_loop(&socket, &target, from_agent, limit, interval_ms, json).await
+    let conn = api_conn().await?;
+    watch_inbox_loop(&conn, &target, from_agent, limit, interval_ms, json).await
 }
 
 async fn watch_inbox_loop(
-    socket: &str,
+    conn: &ApiConn,
     target: &str,
     from_agent: Option<&str>,
     limit: usize,
@@ -1807,7 +1736,7 @@ async fn watch_inbox_loop(
 
     loop {
         let entries =
-            fetch_inbox_entries(socket, target, from_agent, false, Some(&since), limit, None)
+            fetch_inbox_entries(conn, target, from_agent, false, Some(&since), limit, None)
                 .await?;
         let mut new_entries = entries
             .into_iter()
@@ -1835,8 +1764,8 @@ async fn watch_inbox_loop(
 
 async fn cmd_status(json: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
-    let socket = api_socket().await?;
-    let resp = reqwest::get(format!("{socket}/api/agents/{agent_id}")).await?;
+    let conn = api_conn().await?;
+    let resp = conn.client().get(format!("{}/api/agents/{agent_id}", conn.socket)).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -1917,8 +1846,8 @@ async fn cmd_log(
     truncate: usize,
     search: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = api_socket().await?;
-    let resp = fetch_log_entries(&socket, target, limit, filter, search).await?;
+    let conn = api_conn().await?;
+    let resp = fetch_log_entries(&conn, target, limit, filter, search).await?;
 
     if wants_json(json) {
         return print_json(&resp);
@@ -1965,11 +1894,11 @@ async fn cmd_brief(
     search: Option<&str>,
     json: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = api_socket().await?;
+    let conn = api_conn().await?;
     let endpoint = if let Some(target) = target {
-        format!("{socket}/api/agents/{target}/brief")
+        format!("{}/api/agents/{target}/brief", conn.socket)
     } else {
-        format!("{socket}/api/brief")
+        format!("{}/api/brief", conn.socket)
     };
     let mut url = reqwest::Url::parse(&endpoint)?;
     {
@@ -1980,7 +1909,7 @@ async fn cmd_brief(
         }
     }
 
-    let resp = reqwest::get(url).await?;
+    let resp = conn.client().get(url).send().await?;
     if !resp.status().is_success() {
         return Err(response_error(resp).await);
     }
@@ -2108,9 +2037,9 @@ async fn cmd_cleanup(
     target: &str,
     delete_branch: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = api_socket().await?;
-    let client = reqwest::Client::new();
-    let mut url = format!("{socket}/api/agents/{target}/cleanup");
+    let conn = api_conn().await?;
+    let client = conn.client();
+    let mut url = format!("{}/api/agents/{target}/cleanup", conn.socket);
     if delete_branch {
         url.push_str("?delete_branch=true");
     }
@@ -2133,10 +2062,10 @@ async fn cmd_done(
     next_action: Option<&str>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let agent_id = swarm_agent_id().ok_or("SWARM_AGENT_ID not set")?;
-    let socket = api_socket().await?;
-    let client = reqwest::Client::new();
+    let conn = api_conn().await?;
+    let client = conn.client();
     let resp = client
-        .post(format!("{socket}/api/agents/{agent_id}/done"))
+        .post(format!("{}/api/agents/{agent_id}/done", conn.socket))
         .json(&serde_json::json!({
             "message": message,
             "outcome": outcome,
@@ -2157,10 +2086,10 @@ async fn cmd_done(
 }
 
 async fn cmd_kill(target: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let socket = api_socket().await?;
-    let client = reqwest::Client::new();
+    let conn = api_conn().await?;
+    let client = conn.client();
     let resp = client
-        .delete(format!("{socket}/api/agents/{target}"))
+        .delete(format!("{}/api/agents/{target}", conn.socket))
         .send()
         .await?;
 

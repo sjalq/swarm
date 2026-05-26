@@ -60,7 +60,20 @@ impl Harness for EchoHarness {
             let Some(agent_id) = env.get("SWARM_AGENT_ID").cloned() else {
                 return Ok(());
             };
-            let client = reqwest::Client::new();
+            let client = {
+                let mut headers = reqwest::header::HeaderMap::new();
+                if let Some(project_dir) = env.get("SWARM_PROJECT_DIR") {
+                    headers.insert(
+                        crate::server::PROJECT_HEADER,
+                        reqwest::header::HeaderValue::from_str(project_dir)
+                            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+                    );
+                }
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            };
             for (sender, content) in messages {
                 let Some(response) = echo_response(&content) else {
                     continue;
@@ -595,6 +608,7 @@ fn which_binary(binary: &str) -> bool {
 
 // -- Registry ----------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct HarnessRegistry {
     harnesses: HashMap<String, Arc<dyn Harness>>,
 }
