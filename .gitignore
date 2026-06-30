@@ -6,3 +6,4 @@ frontend/dist/
 frontend/target/
 .playwright-mcp/
 .claude/
+scripts/temp/
