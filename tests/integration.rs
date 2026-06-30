@@ -237,6 +237,8 @@ async fn global_data_dir_scopes_agents_to_current_project() {
             comms: CommsMode::Mesh,
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
+            terminal_cause: None,
+            error_reason: None,
             worktree_branch: None,
             project_dir: Some(project_dir.to_string_lossy().to_string()),
             user_launched: false,
@@ -1444,6 +1446,13 @@ async fn harness_error_surfaces_in_events_and_log() {
         saw_error_status,
         "agent status should transition to 'error'"
     );
+    let failed_agent = orch.get_agent(&agent.id).unwrap().unwrap();
+    assert_eq!(failed_agent.status, TopicStatus::Error);
+    assert!(failed_agent
+        .error_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("harness failed")));
+    assert_eq!(failed_agent.terminal_cause, None);
 
     // Error should appear in agent log
     let log = orch.get_agent_log(&agent.id, 50, LogFilter::All).unwrap();

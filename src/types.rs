@@ -19,6 +19,42 @@ pub enum TopicStatus {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCause {
+    LoopExit,
+    Done,
+    Killed,
+    DaemonShutdown,
+    Disconnected,
+    StartupGc,
+}
+
+impl SqlEnum for TerminalCause {
+    fn as_sql(&self) -> &'static str {
+        match self {
+            Self::LoopExit => "loop_exit",
+            Self::Done => "done",
+            Self::Killed => "killed",
+            Self::DaemonShutdown => "daemon_shutdown",
+            Self::Disconnected => "disconnected",
+            Self::StartupGc => "startup_gc",
+        }
+    }
+
+    fn from_sql(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "loop_exit" => Ok(Self::LoopExit),
+            "done" => Ok(Self::Done),
+            "killed" => Ok(Self::Killed),
+            "daemon_shutdown" => Ok(Self::DaemonShutdown),
+            "disconnected" => Ok(Self::Disconnected),
+            "startup_gc" => Ok(Self::StartupGc),
+            other => Err(format!("unknown terminal cause: {other}")),
+        }
+    }
+}
+
 impl TopicStatus {
     pub fn is_active(self) -> bool {
         !matches!(self, Self::Paused)
@@ -99,6 +135,10 @@ pub struct AgentRow {
     pub comms: CommsMode,
     pub created_at: String,
     pub ended_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cause: Option<TerminalCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
     pub worktree_branch: Option<String>,
     pub project_dir: Option<String>,
     pub user_launched: bool,

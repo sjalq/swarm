@@ -3,8 +3,8 @@ use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use crate::types::{
     AgentBrief, AgentBriefSummary, AgentRow, AgentView, BriefLogEntry, CommsMode, DbStats,
-    HandoverRow, LogEntry, MessageState, SqlEnum, SwarmBrief, TopicStatus, WorktreeInfo,
-    USER_TOPIC_ID,
+    HandoverRow, LogEntry, MessageState, SqlEnum, SwarmBrief, TerminalCause, TopicStatus,
+    WorktreeInfo, USER_TOPIC_ID,
 };
 pub use crate::types::{DoneReport, StartTopicOptions, SwarmEvent};
 use std::collections::HashMap;
@@ -96,21 +96,30 @@ struct WorkerPrompt {
     continue_conversation: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RunCompletion {
     Clean,
-    Error,
+    Error { reason: String },
 }
 
 impl RunCompletion {
-    fn mark_error(&mut self) {
-        *self = Self::Error;
+    fn mark_error(&mut self, reason: impl Into<String>) {
+        *self = Self::Error {
+            reason: reason.into(),
+        };
     }
 
-    fn next_status(self) -> TopicStatus {
+    fn next_status(&self) -> TopicStatus {
         match self {
             Self::Clean => TopicStatus::Idle,
-            Self::Error => TopicStatus::Error,
+            Self::Error { .. } => TopicStatus::Error,
+        }
+    }
+
+    fn error_reason(&self) -> Option<&str> {
+        match self {
+            Self::Clean => None,
+            Self::Error { reason } => Some(reason),
         }
     }
 }
@@ -294,13 +303,23 @@ impl Orchestrator {
         }
     }
 
-    async fn update_status_async(db: Arc<Db>, agent_id: String, status: TopicStatus) {
-        if let Err(e) = Self::blocking_db("update agent status", move || {
-            db.update_agent_status(&agent_id, status)
+    async fn update_status_if_active_error_async(db: Arc<Db>, agent_id: String, reason: String) {
+        if let Err(e) = Self::blocking_db("update agent error status", move || {
+            db.update_agent_status_if_active_error(&agent_id, reason)
         })
         .await
         {
-            tracing::error!("failed to update agent status: {e}");
+            tracing::error!("failed to update agent error status: {e}");
+        }
+    }
+
+    async fn update_terminal_status_async(db: Arc<Db>, agent_id: String, cause: TerminalCause) {
+        if let Err(e) = Self::blocking_db("update terminal agent status", move || {
+            db.update_agent_status_terminal(&agent_id, cause)
+        })
+        .await
+        {
+            tracing::error!("failed to update terminal agent status: {e}");
         }
     }
 
@@ -816,6 +835,8 @@ impl Orchestrator {
             comms: options.comms,
             created_at: now,
             ended_at: None,
+            terminal_cause: None,
+            error_reason: None,
             worktree_branch,
             project_dir: Some(self.project_dir.to_string_lossy().to_string()),
             user_launched: options.user_launched,
@@ -956,7 +977,10 @@ impl Orchestrator {
             }
 
             if self.registry.get(&agent.harness).is_none() {
-                self.db.update_agent_status(&agent.id, TopicStatus::Error)?;
+                self.db.update_agent_status_error(
+                    &agent.id,
+                    format!("unknown harness: {}", agent.harness),
+                )?;
                 tracing::error!(
                     "cannot resume agent {}: unknown harness {}",
                     agent.id,
@@ -1361,7 +1385,7 @@ impl Orchestrator {
         let db = self.db.clone();
         let agent_id = id.to_string();
         Self::blocking_db("mark agent done", move || {
-            db.update_agent_status(&agent_id, TopicStatus::Paused)
+            db.update_agent_status_terminal(&agent_id, TerminalCause::Done)
         })
         .await?;
 
@@ -1394,7 +1418,7 @@ impl Orchestrator {
         let db = self.db.clone();
         let agent_id = id.to_string();
         Self::blocking_db("mark agent killed", move || {
-            db.update_agent_status(&agent_id, TopicStatus::Paused)
+            db.update_agent_status_terminal(&agent_id, TerminalCause::Killed)
         })
         .await?;
 
@@ -1420,8 +1444,8 @@ impl Orchestrator {
         for (agent_id, worker) in workers {
             let db = self.db.clone();
             let status_agent_id = agent_id.clone();
-            Self::blocking_db("mark agent done", move || {
-                db.update_agent_status(&status_agent_id, TopicStatus::Paused)
+            Self::blocking_db("mark agent shutdown", move || {
+                db.update_agent_status_terminal(&status_agent_id, TerminalCause::DaemonShutdown)
             })
             .await?;
             if worker.cmd_tx.send(WorkerCmd::Shutdown).is_err() {
@@ -1726,7 +1750,7 @@ impl Orchestrator {
                                 }, "failed to persist output log").await;
                             }
                             Some(HarnessOutput::Error(err)) => {
-                                completion.mark_error();
+                                completion.mark_error(err.clone());
                                 Self::persist_and_send_event(
                                     db.clone(),
                                     event_tx.clone(),
@@ -1744,7 +1768,10 @@ impl Orchestrator {
                                 }, "failed to persist error log").await;
                             }
                             Some(HarnessOutput::Timeout(partial)) => {
-                                completion.mark_error();
+                                completion.mark_error(format!(
+                                    "timeout, partial output: {} chars",
+                                    partial.len()
+                                ));
                                 Self::persist_and_send_event(
                                     db.clone(),
                                     event_tx.clone(),
@@ -1818,15 +1845,32 @@ impl Orchestrator {
                 }
                 RunOutcome::Disconnected => {
                     Self::release_messages_async(db.clone(), messages).await;
-                    Self::update_status_async(db.clone(), agent_id.clone(), TopicStatus::Paused)
-                        .await;
+                    Self::update_terminal_status_async(
+                        db.clone(),
+                        agent_id.clone(),
+                        TerminalCause::Disconnected,
+                    )
+                    .await;
                     return;
                 }
                 RunOutcome::Completed(completion) => {
                     Self::mark_messages_delivered_async(db.clone(), messages).await;
                     let next_status = completion.next_status();
-                    Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status)
+                    if let Some(reason) = completion.error_reason() {
+                        Self::update_status_if_active_error_async(
+                            db.clone(),
+                            agent_id.clone(),
+                            reason.to_string(),
+                        )
                         .await;
+                    } else {
+                        Self::update_status_if_active_async(
+                            db.clone(),
+                            agent_id.clone(),
+                            next_status,
+                        )
+                        .await;
+                    }
                     Self::persist_and_send_event(
                         db.clone(),
                         event_tx.clone(),
@@ -1852,6 +1896,7 @@ impl Orchestrator {
             }
         }
 
-        Self::update_status_async(db.clone(), agent_id.clone(), TopicStatus::Paused).await;
+        Self::update_terminal_status_async(db.clone(), agent_id.clone(), TerminalCause::LoopExit)
+            .await;
     }
 }

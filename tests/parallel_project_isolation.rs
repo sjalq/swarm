@@ -451,6 +451,8 @@ async fn resume_only_resumes_own_projects_workers() {
             comms: CommsMode::Mesh,
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
+            terminal_cause: None,
+            error_reason: None,
             worktree_branch: None,
             project_dir: Some(project_dir.to_string_lossy().to_string()),
             user_launched: true,

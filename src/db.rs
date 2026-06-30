@@ -1,7 +1,8 @@
 use crate::error::Result;
 pub use crate::types::{
     AgentRow, CommsMode, DbStats, EventRow, HandoverRow, LeasedMessage, LeasedMessageBatch,
-    LogEntry, LogFilter, MessageRow, MessageState, OutputLogRow, SqlEnum, TopicStatus,
+    LogEntry, LogFilter, MessageRow, MessageState, OutputLogRow, SqlEnum, TerminalCause,
+    TopicStatus,
 };
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -9,7 +10,7 @@ use rusqlite::{Connection, ToSql};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-const AGENT_SELECT_COLUMNS: &str = "id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched";
+const AGENT_SELECT_COLUMNS: &str = "id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, terminal_cause, error_reason, worktree_branch, project_dir, user_launched";
 
 pub struct Db {
     pool: Pool<SqliteConnectionManager>,
@@ -89,6 +90,8 @@ impl Db {
                 comms TEXT NOT NULL DEFAULT 'mesh',
                 created_at TEXT NOT NULL,
                 ended_at TEXT NULL,
+                terminal_cause TEXT NULL,
+                error_reason TEXT NULL,
                 worktree_branch TEXT NULL,
                 project_dir TEXT NULL,
                 user_launched INTEGER NOT NULL DEFAULT 0
@@ -149,6 +152,8 @@ impl Db {
         )?;
         Self::migrate_agent_label_column(&conn)?;
         Self::ensure_agents_column(&conn, "ended_at", "TEXT NULL")?;
+        Self::ensure_agents_column(&conn, "terminal_cause", "TEXT NULL")?;
+        Self::ensure_agents_column(&conn, "error_reason", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "worktree_branch", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "project_dir", "TEXT NULL")?;
         Self::ensure_agents_column(&conn, "user_launched", "INTEGER NOT NULL DEFAULT 0")?;
@@ -175,7 +180,9 @@ impl Db {
                     ended_at = COALESCE(
                         ended_at,
                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    )
+                    ),
+                    terminal_cause = COALESCE(terminal_cause, 'startup_gc'),
+                    error_reason = NULL
                 WHERE status = 'dead';",
         )?;
         Ok(())
@@ -299,6 +306,18 @@ impl Db {
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
             )
         })?;
+        let terminal_cause_text: Option<String> = row.get(11)?;
+        let terminal_cause = terminal_cause_text
+            .as_deref()
+            .map(TerminalCause::from_sql)
+            .transpose()
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })?;
         Ok(AgentRow {
             id: row.get(0)?,
             label: row.get(1)?,
@@ -311,9 +330,11 @@ impl Db {
             comms,
             created_at: row.get(9)?,
             ended_at: row.get(10)?,
-            worktree_branch: row.get(11)?,
-            project_dir: row.get(12)?,
-            user_launched: row.get::<_, bool>(13)?,
+            terminal_cause,
+            error_reason: row.get(12)?,
+            worktree_branch: row.get(13)?,
+            project_dir: row.get(14)?,
+            user_launched: row.get::<_, bool>(15)?,
         })
     }
 
@@ -331,8 +352,8 @@ impl Db {
         let _write = self.write_guard()?;
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO agents (id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, worktree_branch, project_dir, user_launched)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO agents (id, label, harness, model, status, parent_id, system_prompt, work_dir, comms, created_at, ended_at, terminal_cause, error_reason, worktree_branch, project_dir, user_launched)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 agent.id,
                 agent.label,
@@ -345,6 +366,8 @@ impl Db {
                 agent.comms.as_sql(),
                 agent.created_at,
                 agent.ended_at,
+                agent.terminal_cause.map(|cause| cause.as_sql()),
+                agent.error_reason,
                 agent.worktree_branch,
                 agent.project_dir,
                 agent.user_launched as i32,
@@ -587,37 +610,123 @@ impl Db {
     }
 
     pub fn update_agent_status(&self, id: &str, status: TopicStatus) -> Result<()> {
-        let _write = self.write_guard()?;
-        let conn = self.conn()?;
-        let status_text = status.as_sql();
-        let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
-        conn.execute(
-            "UPDATE agents
-                SET status = ?1,
-                    ended_at = CASE
-                        WHEN ?1 = 'done' THEN COALESCE(ended_at, ?3)
-                        ELSE NULL
-                    END
-                WHERE id = ?2",
-            rusqlite::params![status_text, id, ended_at],
-        )?;
-        Ok(())
+        self.update_agent_status_with_details(
+            id,
+            status,
+            Self::default_terminal_cause(status),
+            None,
+        )
+        .map(|_| ())
     }
 
-    pub fn update_agent_status_if_active(&self, id: &str, status: TopicStatus) -> Result<bool> {
+    pub fn update_agent_status_error(&self, id: &str, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        self.update_agent_status_with_details(id, TopicStatus::Error, None, Some(reason.as_str()))
+            .map(|_| ())
+    }
+
+    pub fn update_agent_status_terminal(&self, id: &str, cause: TerminalCause) -> Result<()> {
+        self.update_agent_status_with_details(id, TopicStatus::Paused, Some(cause), None)
+            .map(|_| ())
+    }
+
+    fn default_terminal_cause(status: TopicStatus) -> Option<TerminalCause> {
+        (!status.is_active()).then_some(TerminalCause::LoopExit)
+    }
+
+    fn update_agent_status_with_details(
+        &self,
+        id: &str,
+        status: TopicStatus,
+        terminal_cause: Option<TerminalCause>,
+        error_reason: Option<&str>,
+    ) -> Result<bool> {
         let _write = self.write_guard()?;
         let conn = self.conn()?;
         let status_text = status.as_sql();
         let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
+        let terminal_cause = terminal_cause.map(|cause| cause.as_sql());
         let updated = conn.execute(
             "UPDATE agents
                 SET status = ?1,
                     ended_at = CASE
                         WHEN ?1 = 'done' THEN COALESCE(ended_at, ?3)
                         ELSE NULL
+                    END,
+                    terminal_cause = CASE
+                        WHEN ?1 = 'done' THEN ?4
+                        ELSE NULL
+                    END,
+                    error_reason = CASE
+                        WHEN ?1 = 'error' THEN ?5
+                        ELSE NULL
+                    END
+                WHERE id = ?2",
+            rusqlite::params![status_text, id, ended_at, terminal_cause, error_reason],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn update_agent_status_if_active(&self, id: &str, status: TopicStatus) -> Result<bool> {
+        self.update_agent_status_if_active_with_details(
+            id,
+            status,
+            Self::default_terminal_cause(status),
+            None,
+        )
+    }
+
+    pub fn update_agent_status_if_active_error(
+        &self,
+        id: &str,
+        reason: impl Into<String>,
+    ) -> Result<bool> {
+        let reason = reason.into();
+        self.update_agent_status_if_active_with_details(
+            id,
+            TopicStatus::Error,
+            None,
+            Some(reason.as_str()),
+        )
+    }
+
+    pub fn update_agent_status_if_active_terminal(
+        &self,
+        id: &str,
+        cause: TerminalCause,
+    ) -> Result<bool> {
+        self.update_agent_status_if_active_with_details(id, TopicStatus::Paused, Some(cause), None)
+    }
+
+    fn update_agent_status_if_active_with_details(
+        &self,
+        id: &str,
+        status: TopicStatus,
+        terminal_cause: Option<TerminalCause>,
+        error_reason: Option<&str>,
+    ) -> Result<bool> {
+        let _write = self.write_guard()?;
+        let conn = self.conn()?;
+        let status_text = status.as_sql();
+        let ended_at = (!status.is_active()).then(|| chrono::Utc::now().to_rfc3339());
+        let terminal_cause = terminal_cause.map(|cause| cause.as_sql());
+        let updated = conn.execute(
+            "UPDATE agents
+                SET status = ?1,
+                    ended_at = CASE
+                        WHEN ?1 = 'done' THEN COALESCE(ended_at, ?3)
+                        ELSE NULL
+                    END,
+                    terminal_cause = CASE
+                        WHEN ?1 = 'done' THEN ?4
+                        ELSE NULL
+                    END,
+                    error_reason = CASE
+                        WHEN ?1 = 'error' THEN ?5
+                        ELSE NULL
                     END
                 WHERE id = ?2 AND status != 'done'",
-            rusqlite::params![status_text, id, ended_at],
+            rusqlite::params![status_text, id, ended_at, terminal_cause, error_reason],
         )?;
         Ok(updated > 0)
     }
@@ -1206,7 +1315,9 @@ impl Db {
         let count = conn.execute(
             "UPDATE agents
                 SET status = 'done',
-                    ended_at = COALESCE(ended_at, ?1)
+                    ended_at = COALESCE(ended_at, ?1),
+                    terminal_cause = COALESCE(terminal_cause, 'startup_gc'),
+                    error_reason = NULL
                 WHERE status != 'done'",
             [ended_at],
         )?;
@@ -1317,6 +1428,8 @@ mod tests {
             comms: CommsMode::Mesh,
             created_at: "2026-01-01T00:00:00Z".into(),
             ended_at: None,
+            terminal_cause: None,
+            error_reason: None,
             worktree_branch: None,
             project_dir: None,
             user_launched: false,
@@ -1702,6 +1815,8 @@ mod tests {
             .unwrap();
         let done_agent = db.get_agent("agent-1").unwrap().unwrap();
         assert_eq!(done_agent.status, TopicStatus::Paused);
+        assert_eq!(done_agent.terminal_cause, Some(TerminalCause::LoopExit));
+        assert_eq!(done_agent.error_reason, None);
         assert!(
             done_agent.ended_at.is_some(),
             "done transition should set ended_at"
@@ -1712,5 +1827,7 @@ mod tests {
         let active_agent = db.get_agent("agent-1").unwrap().unwrap();
         assert_eq!(active_agent.status, TopicStatus::Idle);
         assert_eq!(active_agent.ended_at, None);
+        assert_eq!(active_agent.terminal_cause, None);
+        assert_eq!(active_agent.error_reason, None);
     }
 }
