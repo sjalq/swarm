@@ -38,6 +38,89 @@ struct AgentWorker {
     _handle: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerWake {
+    Wait,
+    DrainNow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerPhase {
+    FirstPrompt,
+    Continuing,
+    ResumingInterrupted,
+}
+
+impl WorkerPhase {
+    fn prompt(
+        self,
+        agent_id: &str,
+        topic_label: &str,
+        parent_id: &str,
+        project_dir: &Path,
+        msg_block: &str,
+    ) -> WorkerPrompt {
+        match self {
+            Self::FirstPrompt => WorkerPrompt {
+                text: format!(
+                    "{SWARM_PREAMBLE}\n\n--- SWARM CONTEXT ---\nTopic ID: {agent_id}\nLabel: {topic_label}\nParent: {parent_id}\nProject directory: {}\n\n--- TASK / INCOMING MESSAGES ---\n{}",
+                    project_dir.display(), msg_block
+                ),
+                continue_conversation: false,
+            },
+            Self::ResumingInterrupted => WorkerPrompt {
+                text: format!(
+                    "[system: your previous response was interrupted by incoming messages]\n\n--- INCOMING MESSAGES ---\n{}",
+                    msg_block
+                ),
+                continue_conversation: true,
+            },
+            Self::Continuing => WorkerPrompt {
+                text: format!("--- INCOMING MESSAGES ---\n{msg_block}"),
+                continue_conversation: true,
+            },
+        }
+    }
+
+    fn after_interruption(self) -> Self {
+        match self {
+            Self::FirstPrompt => Self::FirstPrompt,
+            Self::Continuing | Self::ResumingInterrupted => Self::ResumingInterrupted,
+        }
+    }
+}
+
+struct WorkerPrompt {
+    text: String,
+    continue_conversation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunCompletion {
+    Clean,
+    Error,
+}
+
+impl RunCompletion {
+    fn mark_error(&mut self) {
+        *self = Self::Error;
+    }
+
+    fn next_status(self) -> TopicStatus {
+        match self {
+            Self::Clean => TopicStatus::Idle,
+            Self::Error => TopicStatus::Error,
+        }
+    }
+}
+
+enum RunOutcome {
+    Completed(RunCompletion),
+    Interrupted { accumulated_output: String },
+    Shutdown,
+    Disconnected,
+}
+
 struct WorkerConfig {
     db: Arc<Db>,
     harness: Arc<dyn Harness>,
@@ -1493,12 +1576,15 @@ impl Orchestrator {
             resume_conversation,
             min_run_grace,
         } = config;
-        let mut first_message = !resume_conversation;
-        let mut has_pending = false;
-        let mut was_interrupted = false;
+        let mut phase = if resume_conversation {
+            WorkerPhase::Continuing
+        } else {
+            WorkerPhase::FirstPrompt
+        };
+        let mut wake = WorkerWake::Wait;
 
         loop {
-            if !has_pending {
+            if wake == WorkerWake::Wait {
                 let cmd = match cmd_rx.recv().await {
                     Some(cmd) => cmd,
                     None => break,
@@ -1508,7 +1594,7 @@ impl Orchestrator {
                     WorkerCmd::NewMessage => {}
                 }
             }
-            has_pending = false;
+            wake = WorkerWake::Wait;
 
             let mut messages = Vec::new();
             loop {
@@ -1553,28 +1639,21 @@ impl Orchestrator {
             )
             .await;
 
-            let is_first = first_message;
             let msg_parts: Vec<String> = messages
                 .iter()
                 .map(|m| format!("[from: {}]\n{}", m.from_agent, m.content))
                 .collect();
             let msg_block = msg_parts.join("\n\n");
 
-            let prompt = if first_message {
-                first_message = false;
-                format!(
-                    "{SWARM_PREAMBLE}\n\n--- SWARM CONTEXT ---\nTopic ID: {agent_id}\nLabel: {topic_label}\nParent: {parent_id}\nProject directory: {}\n\n--- TASK / INCOMING MESSAGES ---\n{}",
-                    project_dir.display(), msg_block
-                )
-            } else if was_interrupted {
-                format!(
-                    "[system: your previous response was interrupted by incoming messages]\n\n--- INCOMING MESSAGES ---\n{}",
-                    msg_block
-                )
-            } else {
-                format!("--- INCOMING MESSAGES ---\n{msg_block}")
-            };
-            was_interrupted = false;
+            let active_phase = phase;
+            let prompt = active_phase.prompt(
+                &agent_id,
+                &topic_label,
+                &parent_id,
+                &project_dir,
+                &msg_block,
+            );
+            phase = WorkerPhase::Continuing;
 
             let mut env = HashMap::new();
             env.insert("SWARM_AGENT_ID".to_string(), agent_id.clone());
@@ -1588,11 +1667,19 @@ impl Orchestrator {
             let td = topic_dir.clone();
             let err_tx = tx.clone();
             let model_ref = model.clone();
-            let continue_conv = !is_first;
+            let continue_conv = prompt.continue_conversation;
+            let prompt_text = prompt.text;
 
             let harness_handle = tokio::spawn(async move {
                 if let Err(e) = h
-                    .run(&prompt, model_ref.as_deref(), continue_conv, &td, env, tx)
+                    .run(
+                        &prompt_text,
+                        model_ref.as_deref(),
+                        continue_conv,
+                        &td,
+                        env,
+                        tx,
+                    )
                     .await
                 {
                     tracing::error!("harness error: {e}");
@@ -1602,12 +1689,11 @@ impl Orchestrator {
                 }
             });
 
-            let mut had_error = false;
+            let mut completion = RunCompletion::Clean;
             let mut accumulated_output = String::new();
-            let mut interrupted = false;
             let run_started = tokio::time::Instant::now();
 
-            loop {
+            let outcome = loop {
                 tokio::select! {
                     biased;
                     output = rx.recv() => {
@@ -1644,7 +1730,7 @@ impl Orchestrator {
                                 }, "failed to persist output log").await;
                             }
                             Some(HarnessOutput::Error(err)) => {
-                                had_error = true;
+                                completion.mark_error();
                                 Self::persist_and_send_event(
                                     db.clone(),
                                     event_tx.clone(),
@@ -1662,7 +1748,7 @@ impl Orchestrator {
                                 }, "failed to persist error log").await;
                             }
                             Some(HarnessOutput::Timeout(partial)) => {
-                                had_error = true;
+                                completion.mark_error();
                                 Self::persist_and_send_event(
                                     db.clone(),
                                     event_tx.clone(),
@@ -1682,84 +1768,80 @@ impl Orchestrator {
                                     created_at: chrono::Utc::now().to_rfc3339(),
                                 }, "failed to persist timeout log").await;
                             }
-                            None => break,
+                            None => break RunOutcome::Completed(completion),
                         }
                     }
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(WorkerCmd::NewMessage) => {
                                 if run_started.elapsed() < min_run_grace {
-                                    has_pending = true;
+                                    wake = WorkerWake::DrainNow;
                                     continue;
                                 }
                                 tracing::info!("agent {} interrupted by new message", agent_id);
                                 harness_handle.abort();
-                                interrupted = true;
-                                has_pending = true;
-                                break;
+                                wake = WorkerWake::DrainNow;
+                                break RunOutcome::Interrupted { accumulated_output };
                             }
                             Some(WorkerCmd::Shutdown) => {
                                 harness_handle.abort();
-                                Self::release_messages_async(db.clone(), message_ids.clone()).await;
-                                return;
+                                break RunOutcome::Shutdown;
                             }
                             None => {
                                 harness_handle.abort();
-                                Self::release_messages_async(db.clone(), message_ids.clone()).await;
-                                Self::update_status_async(
-                                    db.clone(),
-                                    agent_id.clone(),
-                                    TopicStatus::Paused,
-                                )
-                                .await;
-                                return;
+                                break RunOutcome::Disconnected;
                             }
                         }
                     }
                 }
-            }
+            };
 
-            if interrupted {
-                Self::release_messages_async(db.clone(), message_ids).await;
-                if !accumulated_output.is_empty() {
-                    Self::insert_output_log_async(
+            match outcome {
+                RunOutcome::Interrupted { accumulated_output } => {
+                    Self::release_messages_async(db.clone(), message_ids).await;
+                    if !accumulated_output.is_empty() {
+                        Self::insert_output_log_async(
+                            db.clone(),
+                            OutputLogRow {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                agent_id: agent_id.clone(),
+                                content: accumulated_output,
+                                kind: "interrupted".to_string(),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                            "failed to persist interrupted log",
+                        )
+                        .await;
+                    }
+                    phase = active_phase.after_interruption();
+                    continue;
+                }
+                RunOutcome::Shutdown => {
+                    Self::release_messages_async(db.clone(), message_ids).await;
+                    return;
+                }
+                RunOutcome::Disconnected => {
+                    Self::release_messages_async(db.clone(), message_ids).await;
+                    Self::update_status_async(db.clone(), agent_id.clone(), TopicStatus::Paused)
+                        .await;
+                    return;
+                }
+                RunOutcome::Completed(completion) => {
+                    Self::mark_messages_delivered_async(db.clone(), message_ids).await;
+                    let next_status = completion.next_status();
+                    Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status)
+                        .await;
+                    Self::persist_and_send_event(
                         db.clone(),
-                        OutputLogRow {
-                            id: uuid::Uuid::new_v4().to_string(),
+                        event_tx.clone(),
+                        SwarmEvent::AgentStatus {
                             agent_id: agent_id.clone(),
-                            content: accumulated_output,
-                            kind: "interrupted".to_string(),
-                            created_at: chrono::Utc::now().to_rfc3339(),
+                            status: next_status,
                         },
-                        "failed to persist interrupted log",
                     )
                     .await;
                 }
-                if is_first {
-                    first_message = true;
-                } else {
-                    was_interrupted = true;
-                }
-                continue;
             }
-
-            Self::mark_messages_delivered_async(db.clone(), message_ids).await;
-
-            let next_status = if had_error {
-                TopicStatus::Error
-            } else {
-                TopicStatus::Idle
-            };
-            Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status).await;
-            Self::persist_and_send_event(
-                db.clone(),
-                event_tx.clone(),
-                SwarmEvent::AgentStatus {
-                    agent_id: agent_id.clone(),
-                    status: next_status,
-                },
-            )
-            .await;
 
             let pending_db = db.clone();
             let pending_agent_id = agent_id.clone();
@@ -1768,7 +1850,7 @@ impl Orchestrator {
             })
             .await
             {
-                Ok(true) => has_pending = true,
+                Ok(true) => wake = WorkerWake::DrainNow,
                 Ok(false) => {}
                 Err(e) => tracing::error!("failed to check pending messages: {e}"),
             }
