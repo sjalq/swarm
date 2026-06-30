@@ -39,6 +39,56 @@ struct AgentWorker {
     _handle: JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct WorkerRegistryState {
+    workers: HashMap<String, AgentWorker>,
+}
+
+impl WorkerRegistryState {
+    fn contains(&self, agent_id: &str) -> bool {
+        self.workers.contains_key(agent_id)
+    }
+
+    fn get(&self, agent_id: &str) -> Option<&AgentWorker> {
+        self.workers.get(agent_id)
+    }
+
+    fn insert(&mut self, agent_id: String, worker: AgentWorker) {
+        self.workers.insert(agent_id, worker);
+    }
+
+    fn remove(&mut self, agent_id: &str) -> Option<AgentWorker> {
+        self.workers.remove(agent_id)
+    }
+
+    fn drain(&mut self) -> Vec<(String, AgentWorker)> {
+        self.workers.drain().collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAgent {
+    row: AgentRow,
+}
+
+impl ActiveAgent {
+    fn from_row(row: AgentRow) -> Option<Self> {
+        row.status.is_active().then_some(Self { row })
+    }
+
+    fn from_ref(row: &AgentRow) -> Option<Self> {
+        row.status.is_active().then(|| Self { row: row.clone() })
+    }
+}
+
+impl std::ops::Deref for ActiveAgent {
+    type Target = AgentRow;
+
+    fn deref(&self) -> &Self::Target {
+        &self.row
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerWake {
     Wait,
@@ -149,7 +199,7 @@ struct WorkerConfig {
 pub struct Orchestrator {
     db: Arc<Db>,
     registry: HarnessRegistry,
-    workers: Mutex<HashMap<String, AgentWorker>>,
+    workers: Mutex<WorkerRegistryState>,
     event_tx: broadcast::Sender<SwarmEvent>,
     addr: String,
     project_dir: PathBuf,
@@ -174,7 +224,7 @@ impl Orchestrator {
         Self {
             db,
             registry,
-            workers: Mutex::new(HashMap::new()),
+            workers: Mutex::new(WorkerRegistryState::default()),
             event_tx,
             addr,
             project_dir,
@@ -188,7 +238,7 @@ impl Orchestrator {
         self.event_tx.subscribe()
     }
 
-    fn workers(&self) -> Result<MutexGuard<'_, HashMap<String, AgentWorker>>> {
+    fn workers(&self) -> Result<MutexGuard<'_, WorkerRegistryState>> {
         self.workers
             .lock()
             .map_err(|_| SwarmError::Internal("worker registry mutex poisoned".to_string()))
@@ -261,7 +311,7 @@ impl Orchestrator {
     }
 
     fn has_worker(&self, agent_id: &str) -> Result<bool> {
-        Ok(self.workers()?.contains_key(agent_id))
+        Ok(self.workers()?.contains(agent_id))
     }
 
     fn git_output(current_dir: &Path, args: &[&str]) -> Result<String> {
@@ -382,8 +432,12 @@ impl Orchestrator {
         let _ = event_tx.send(event);
     }
 
-    fn start_worker_for_agent(&self, agent: &AgentRow, resume_conversation: bool) -> Result<bool> {
-        if self.workers()?.contains_key(&agent.id) {
+    fn start_worker_for_agent(
+        &self,
+        agent: &ActiveAgent,
+        resume_conversation: bool,
+    ) -> Result<bool> {
+        if self.workers()?.contains(&agent.id) {
             return Ok(false);
         }
 
@@ -423,7 +477,7 @@ impl Orchestrator {
         ));
 
         let mut workers = self.workers()?;
-        if workers.contains_key(&agent.id) {
+        if workers.contains(&agent.id) {
             if cmd_tx.send(WorkerCmd::Shutdown).is_err() {
                 tracing::debug!("duplicate worker already stopped: {}", agent.id);
             }
@@ -445,13 +499,21 @@ impl Orchestrator {
             return Ok(());
         }
 
-        self.start_worker_for_agent(agent, true)?;
         let db = self.db.clone();
         let agent_id = agent.id.clone();
         Self::blocking_db("reactivate agent", move || {
             db.update_agent_status(&agent_id, TopicStatus::Idle)
         })
         .await?;
+        let mut active_agent = agent.clone();
+        active_agent.status = TopicStatus::Idle;
+        active_agent.ended_at = None;
+        active_agent.terminal_cause = None;
+        active_agent.error_reason = None;
+        let active_agent = ActiveAgent::from_row(active_agent).ok_or_else(|| {
+            SwarmError::Internal(format!("reactivated topic is not active: {}", agent.id))
+        })?;
+        self.start_worker_for_agent(&active_agent, true)?;
         self.emit_event_async(SwarmEvent::AgentStatus {
             agent_id: agent.id.clone(),
             status: TopicStatus::Idle,
@@ -853,7 +915,10 @@ impl Orchestrator {
             return Err(e);
         }
 
-        if let Err(e) = self.start_worker_for_agent(&agent, false) {
+        let active_agent = ActiveAgent::from_ref(&agent).ok_or_else(|| {
+            SwarmError::Internal(format!("new topic is not active: {}", agent.id))
+        })?;
+        if let Err(e) = self.start_worker_for_agent(&active_agent, false) {
             if options.use_worktree {
                 if let Err(cleanup_err) = self.cleanup_agent(&id, true) {
                     tracing::error!(
@@ -972,7 +1037,7 @@ impl Orchestrator {
         let mut resumed = 0;
 
         for agent in agents {
-            if self.workers()?.contains_key(&agent.id) {
+            if self.workers()?.contains(&agent.id) {
                 continue;
             }
 
@@ -989,7 +1054,10 @@ impl Orchestrator {
                 continue;
             }
 
-            if !self.start_worker_for_agent(&agent, true)? {
+            let Some(active_agent) = ActiveAgent::from_row(agent.clone()) else {
+                continue;
+            };
+            if !self.start_worker_for_agent(&active_agent, true)? {
                 continue;
             }
 
@@ -1438,7 +1506,7 @@ impl Orchestrator {
     pub async fn shutdown_all(&self) -> Result<()> {
         let workers = {
             let mut workers = self.workers()?;
-            workers.drain().collect::<Vec<_>>()
+            workers.drain()
         };
 
         for (agent_id, worker) in workers {
