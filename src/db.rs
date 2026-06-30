@@ -1,7 +1,7 @@
 use crate::error::Result;
 pub use crate::types::{
-    AgentRow, CommsMode, DbStats, EventRow, HandoverRow, LogEntry, LogFilter, MessageRow,
-    OutputLogRow, SqlEnum, TopicStatus,
+    AgentRow, CommsMode, DbStats, EventRow, HandoverRow, LeasedMessage, LeasedMessageBatch,
+    LogEntry, LogFilter, MessageRow, MessageState, OutputLogRow, SqlEnum, TopicStatus,
 };
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -650,7 +650,7 @@ impl Db {
                 msg.from_agent,
                 msg.to_agent,
                 msg.content,
-                msg.delivered as i32,
+                msg.state.delivered_sql(),
                 msg.created_at,
                 msg.broadcast_id,
             ],
@@ -683,7 +683,7 @@ impl Db {
                 msg.from_agent,
                 msg.to_agent,
                 msg.content,
-                msg.delivered as i32,
+                msg.state.delivered_sql(),
                 msg.created_at,
                 msg.broadcast_id,
             ],
@@ -1071,7 +1071,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<MessageRow>> {
+    pub fn dequeue_message_batch(&self, agent_id: &str) -> Result<LeasedMessageBatch> {
+        let mut messages = Vec::new();
+        while let Some(message) = self.dequeue_message(agent_id)? {
+            messages.push(message);
+        }
+        Ok(LeasedMessageBatch::new(messages))
+    }
+
+    pub fn dequeue_message(&self, agent_id: &str) -> Result<Option<LeasedMessage>> {
         let _write = self.write_guard()?;
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
@@ -1089,7 +1097,11 @@ impl Db {
                     from_agent: row.get(1)?,
                     to_agent: row.get(2)?,
                     content: row.get(3)?,
-                    delivered: row.get::<_, i32>(4)? != 0,
+                    state: if row.get::<_, i32>(4)? != 0 {
+                        MessageState::delivered()
+                    } else {
+                        MessageState::pending()
+                    },
                     created_at: row.get(5)?,
                     broadcast_id: row.get(6)?,
                 })
@@ -1103,15 +1115,23 @@ impl Db {
                     rusqlite::params![leased_at, &msg.id],
                 )?;
                 tx.commit()?;
-                Ok(Some(msg))
+                Ok(Some(LeasedMessage {
+                    id: msg.id,
+                    from_agent: msg.from_agent,
+                    to_agent: msg.to_agent,
+                    content: msg.content,
+                    created_at: msg.created_at,
+                    leased_at,
+                    broadcast_id: msg.broadcast_id,
+                }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn mark_messages_delivered(&self, message_ids: &[String]) -> Result<usize> {
-        if message_ids.is_empty() {
+    pub fn mark_messages_delivered(&self, messages: &LeasedMessageBatch) -> Result<usize> {
+        if messages.is_empty() {
             return Ok(0);
         }
 
@@ -1119,20 +1139,20 @@ impl Db {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let mut updated = 0;
-        for id in message_ids {
+        for message in messages.iter() {
             updated += tx.execute(
                 "UPDATE messages
                  SET delivered = 1, leased_at = NULL
-                 WHERE id = ?1 AND delivered = 0",
-                [id],
+                 WHERE id = ?1 AND delivered = 0 AND leased_at = ?2",
+                rusqlite::params![message.id(), message.leased_at],
             )?;
         }
         tx.commit()?;
         Ok(updated)
     }
 
-    pub fn release_messages(&self, message_ids: &[String]) -> Result<usize> {
-        if message_ids.is_empty() {
+    pub fn release_messages(&self, messages: &LeasedMessageBatch) -> Result<usize> {
+        if messages.is_empty() {
             return Ok(0);
         }
 
@@ -1140,12 +1160,12 @@ impl Db {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let mut updated = 0;
-        for id in message_ids {
+        for message in messages.iter() {
             updated += tx.execute(
                 "UPDATE messages
                  SET leased_at = NULL
-                 WHERE id = ?1 AND delivered = 0",
-                [id],
+                 WHERE id = ?1 AND delivered = 0 AND leased_at = ?2",
+                rusqlite::params![message.id(), message.leased_at],
             )?;
         }
         tx.commit()?;
@@ -1423,7 +1443,7 @@ mod tests {
             from_agent: "user".into(),
             to_agent: "agent-1".into(),
             content: "hello".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:00Z".into(),
             broadcast_id: None,
         };
@@ -1445,7 +1465,7 @@ mod tests {
             from_agent: "user".into(),
             to_agent: "agent-1".into(),
             content: "lease me".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:00Z".into(),
             broadcast_id: None,
         };
@@ -1455,11 +1475,13 @@ mod tests {
         assert_eq!(first.id, "msg-lease");
         assert!(!db.has_pending_messages("agent-1").unwrap());
 
-        db.release_messages(&[first.id]).unwrap();
+        db.release_messages(&LeasedMessageBatch::new(vec![first]))
+            .unwrap();
         assert!(db.has_pending_messages("agent-1").unwrap());
 
         let second = db.dequeue_message("agent-1").unwrap().unwrap();
-        db.mark_messages_delivered(&[second.id]).unwrap();
+        db.mark_messages_delivered(&LeasedMessageBatch::new(vec![second]))
+            .unwrap();
         assert!(!db.has_pending_messages("agent-1").unwrap());
         assert!(db.dequeue_message("agent-1").unwrap().is_none());
     }
@@ -1475,7 +1497,7 @@ mod tests {
             from_agent: "user".into(),
             to_agent: "agent-1".into(),
             content: "resume me".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:00Z".into(),
             broadcast_id: None,
         })
@@ -1501,7 +1523,7 @@ mod tests {
                 from_agent: "user".into(),
                 to_agent: "agent-1".into(),
                 content: format!("message {i}"),
-                delivered: false,
+                state: MessageState::pending(),
                 created_at: format!("2026-01-01T00:00:0{i}Z"),
                 broadcast_id: None,
             };
@@ -1524,7 +1546,7 @@ mod tests {
             from_agent: "user".into(),
             to_agent: "agent-1".into(),
             content: "do something".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:01Z".into(),
             broadcast_id: None,
         })
@@ -1544,7 +1566,7 @@ mod tests {
             from_agent: "agent-1".into(),
             to_agent: "user".into(),
             content: "done".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:03Z".into(),
             broadcast_id: None,
         })
@@ -1590,7 +1612,7 @@ mod tests {
                 from_agent: "user".into(),
                 to_agent: "agent-1".into(),
                 content: content.into(),
-                delivered: false,
+                state: MessageState::pending(),
                 created_at: created_at.into(),
                 broadcast_id: None,
             })
@@ -1663,7 +1685,7 @@ mod tests {
             from_agent: "user".into(),
             to_agent: "done-agent".into(),
             content: "hello?".into(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: "2026-01-01T00:00:01Z".into(),
             broadcast_id: None,
         };

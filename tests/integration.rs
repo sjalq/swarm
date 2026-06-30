@@ -4,7 +4,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use swarm::db::{AgentRow, CommsMode, Db, LogFilter, MessageRow, OutputLogRow, TopicStatus};
+use swarm::db::{
+    AgentRow, CommsMode, Db, LogFilter, MessageRow, MessageState, OutputLogRow, TopicStatus,
+};
 use swarm::error::Result as SwarmResult;
 use swarm::harness::{CliHarness, CliKind, Harness, HarnessOutput, HarnessRegistry};
 use swarm::orchestrator::{DoneReport, Orchestrator, OrchestratorRegistry, SwarmEvent};
@@ -247,7 +249,7 @@ async fn global_data_dir_scopes_agents_to_current_project() {
         from_agent: "user".into(),
         to_agent: "worker-a".into(),
         content: "project a".into(),
-        delivered: false,
+        state: MessageState::pending(),
         created_at: "2026-01-01T00:00:01Z".into(),
         broadcast_id: None,
     })
@@ -257,7 +259,7 @@ async fn global_data_dir_scopes_agents_to_current_project() {
         from_agent: "user".into(),
         to_agent: "worker-b".into(),
         content: "project b".into(),
-        delivered: false,
+        state: MessageState::pending(),
         created_at: "2026-01-01T00:00:01Z".into(),
         broadcast_id: None,
     })
@@ -554,7 +556,7 @@ async fn user_is_valid_message_target_for_direct_messages() {
     assert_eq!(msg.from_agent, agent.id);
     assert_eq!(msg.to_agent, "user");
     assert_eq!(msg.content, "user heads up");
-    assert!(msg.delivered);
+    assert_eq!(msg.state, MessageState::Delivered);
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -869,7 +871,7 @@ async fn http_api_stats_returns_counts() {
         from_agent: "user".into(),
         to_agent: alive.id.clone(),
         content: "queued for stats".into(),
-        delivered: false,
+        state: MessageState::pending(),
         created_at: "2026-01-01T00:00:00Z".into(),
         broadcast_id: None,
     })

@@ -125,10 +125,76 @@ pub struct MessageRow {
     pub from_agent: String,
     pub to_agent: String,
     pub content: String,
-    pub delivered: bool,
+    pub state: MessageState,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MessageState {
+    Pending,
+    Leased { leased_at: String },
+    Delivered,
+}
+
+impl MessageState {
+    pub fn pending() -> Self {
+        Self::Pending
+    }
+
+    pub fn delivered() -> Self {
+        Self::Delivered
+    }
+
+    pub fn delivered_sql(&self) -> i32 {
+        matches!(self, Self::Delivered) as i32
+    }
+
+    pub fn leased_at(&self) -> Option<&str> {
+        match self {
+            Self::Leased { leased_at } => Some(leased_at),
+            Self::Pending | Self::Delivered => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeasedMessage {
+    pub id: String,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub content: String,
+    pub created_at: String,
+    pub leased_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broadcast_id: Option<String>,
+}
+
+impl LeasedMessage {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LeasedMessageBatch {
+    messages: Vec<LeasedMessage>,
+}
+
+impl LeasedMessageBatch {
+    pub fn new(messages: Vec<LeasedMessage>) -> Self {
+        Self { messages }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, LeasedMessage> {
+        self.messages.iter()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,9 +1,10 @@
-use crate::db::{Db, EventRow, LogFilter, MessageRow, OutputLogRow};
+use crate::db::{Db, EventRow, LeasedMessageBatch, LogFilter, MessageRow, OutputLogRow};
 use crate::error::{Result, SwarmError};
 use crate::harness::{Harness, HarnessOutput, HarnessRegistry};
 use crate::types::{
     AgentBrief, AgentBriefSummary, AgentRow, AgentView, BriefLogEntry, CommsMode, DbStats,
-    HandoverRow, LogEntry, SqlEnum, SwarmBrief, TopicStatus, WorktreeInfo, USER_TOPIC_ID,
+    HandoverRow, LogEntry, MessageState, SqlEnum, SwarmBrief, TopicStatus, WorktreeInfo,
+    USER_TOPIC_ID,
 };
 pub use crate::types::{DoneReport, StartTopicOptions, SwarmEvent};
 use std::collections::HashMap;
@@ -309,12 +310,12 @@ impl Orchestrator {
         }
     }
 
-    async fn mark_messages_delivered_async(db: Arc<Db>, message_ids: Vec<String>) {
-        if message_ids.is_empty() {
+    async fn mark_messages_delivered_async(db: Arc<Db>, messages: LeasedMessageBatch) {
+        if messages.is_empty() {
             return;
         }
         if let Err(e) = Self::blocking_db("mark messages delivered", move || {
-            db.mark_messages_delivered(&message_ids)
+            db.mark_messages_delivered(&messages)
         })
         .await
         {
@@ -322,12 +323,12 @@ impl Orchestrator {
         }
     }
 
-    async fn release_messages_async(db: Arc<Db>, message_ids: Vec<String>) {
-        if message_ids.is_empty() {
+    async fn release_messages_async(db: Arc<Db>, messages: LeasedMessageBatch) {
+        if messages.is_empty() {
             return;
         }
         if let Err(e) = Self::blocking_db("release leased messages", move || {
-            db.release_messages(&message_ids)
+            db.release_messages(&messages)
         })
         .await
         {
@@ -857,7 +858,7 @@ impl Orchestrator {
                 from_agent: from.clone(),
                 to_agent: id.clone(),
                 content: prompt.to_string(),
-                delivered: false,
+                state: MessageState::pending(),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 broadcast_id: None,
             };
@@ -1133,7 +1134,7 @@ impl Orchestrator {
                 from_agent: from.to_string(),
                 to_agent: to.to_string(),
                 content: content.to_string(),
-                delivered: true,
+                state: MessageState::delivered(),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 broadcast_id: broadcast_id.map(str::to_string),
             };
@@ -1195,7 +1196,7 @@ impl Orchestrator {
             from_agent: from.to_string(),
             to_agent: to.to_string(),
             content: content.to_string(),
-            delivered: false,
+            state: MessageState::pending(),
             created_at: chrono::Utc::now().to_rfc3339(),
             broadcast_id: broadcast_id.map(str::to_string),
         };
@@ -1596,27 +1597,22 @@ impl Orchestrator {
             }
             wake = WorkerWake::Wait;
 
-            let mut messages = Vec::new();
-            loop {
-                let dequeue_db = db.clone();
-                let dequeue_agent_id = agent_id.clone();
-                match Self::blocking_db("dequeue message", move || {
-                    dequeue_db.dequeue_message(&dequeue_agent_id)
-                })
-                .await
-                {
-                    Ok(Some(msg)) => messages.push(msg),
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("failed to dequeue message: {e}");
-                        break;
-                    }
+            let dequeue_db = db.clone();
+            let dequeue_agent_id = agent_id.clone();
+            let messages = match Self::blocking_db("dequeue message batch", move || {
+                dequeue_db.dequeue_message_batch(&dequeue_agent_id)
+            })
+            .await
+            {
+                Ok(messages) => messages,
+                Err(e) => {
+                    tracing::error!("failed to dequeue messages: {e}");
+                    continue;
                 }
-            }
+            };
             if messages.is_empty() {
                 continue;
             }
-            let message_ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
 
             // Drain stale NewMessage notifications for messages we just batch-dequeued
             loop {
@@ -1798,7 +1794,7 @@ impl Orchestrator {
 
             match outcome {
                 RunOutcome::Interrupted { accumulated_output } => {
-                    Self::release_messages_async(db.clone(), message_ids).await;
+                    Self::release_messages_async(db.clone(), messages).await;
                     if !accumulated_output.is_empty() {
                         Self::insert_output_log_async(
                             db.clone(),
@@ -1817,17 +1813,17 @@ impl Orchestrator {
                     continue;
                 }
                 RunOutcome::Shutdown => {
-                    Self::release_messages_async(db.clone(), message_ids).await;
+                    Self::release_messages_async(db.clone(), messages).await;
                     return;
                 }
                 RunOutcome::Disconnected => {
-                    Self::release_messages_async(db.clone(), message_ids).await;
+                    Self::release_messages_async(db.clone(), messages).await;
                     Self::update_status_async(db.clone(), agent_id.clone(), TopicStatus::Paused)
                         .await;
                     return;
                 }
                 RunOutcome::Completed(completion) => {
-                    Self::mark_messages_delivered_async(db.clone(), message_ids).await;
+                    Self::mark_messages_delivered_async(db.clone(), messages).await;
                     let next_status = completion.next_status();
                     Self::update_status_if_active_async(db.clone(), agent_id.clone(), next_status)
                         .await;
