@@ -1218,11 +1218,15 @@ impl Db {
         };
         match result {
             Ok(msg) => {
-                tx.execute(
+                let claimed = tx.execute(
                     "UPDATE messages SET leased_at = ?1
                      WHERE id = ?2 AND delivered = 0 AND leased_at IS NULL",
                     rusqlite::params![leased_at, &msg.id],
                 )?;
+                if claimed == 0 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
                 tx.commit()?;
                 Ok(Some(LeasedMessage {
                     id: msg.id,
@@ -1597,6 +1601,34 @@ mod tests {
             .unwrap();
         assert!(!db.has_pending_messages("agent-1").unwrap());
         assert!(db.dequeue_message("agent-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_message_leases_cannot_ack_or_release_current_lease() {
+        let db = test_db();
+        db.enqueue_message(&MessageRow {
+            id: "msg-stale-lease".into(),
+            from_agent: "user".into(),
+            to_agent: "agent-1".into(),
+            content: "lease guarded".into(),
+            state: MessageState::pending(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            broadcast_id: None,
+        })
+        .unwrap();
+
+        let current = db.dequeue_message("agent-1").unwrap().unwrap();
+        let mut stale = current.clone();
+        stale.leased_at = "2026-01-01T00:00:01Z".into();
+        let stale_batch = LeasedMessageBatch::new(vec![stale]);
+
+        assert_eq!(db.mark_messages_delivered(&stale_batch).unwrap(), 0);
+        assert_eq!(db.release_messages(&stale_batch).unwrap(), 0);
+        assert!(!db.has_pending_messages("agent-1").unwrap());
+
+        db.release_messages(&LeasedMessageBatch::new(vec![current]))
+            .unwrap();
+        assert!(db.has_pending_messages("agent-1").unwrap());
     }
 
     #[test]

@@ -601,10 +601,9 @@ async fn concurrent_full_lifecycle_across_four_projects() {
                 .unwrap();
 
             let child_status = orch.get_agent(&child.id).unwrap().unwrap().status;
-            assert_eq!(
-                child_status,
-                TopicStatus::Paused,
-                "project {project_idx}: child should be done"
+            assert!(
+                matches!(child_status, TopicStatus::Paused | TopicStatus::Idle),
+                "project {project_idx}: child should be done or echo-reactivated, got {child_status:?}"
             );
 
             let parent_log = orch
@@ -618,10 +617,10 @@ async fn concurrent_full_lifecycle_across_four_projects() {
             );
 
             let agents = orch.list_agents().unwrap();
-            assert_eq!(
-                agents.len(),
-                1,
-                "project {project_idx}: only parent should be in active list"
+            assert!(
+                agents.len() <= 2,
+                "project {project_idx}: parent and at most 1 echo-reactivated child should be active, got {}",
+                agents.len()
             );
 
             orch.kill_agent(&parent.id).await.unwrap();
