@@ -786,7 +786,10 @@ async fn parallel_high_volume_messaging_across_projects() {
                     match rx.recv().await {
                         Ok(SwarmEvent::UserNotification { from, content }) if from == agent.id => {
                             replies.push(content);
-                            if replies.len() >= msg_count {
+                            let all_text = replies.join(" ");
+                            let saw_all_project_messages = (0..msg_count)
+                                .all(|j| all_text.contains(&format!("p{project_idx}-msg-{j}")));
+                            if saw_all_project_messages {
                                 return;
                             }
                         }
